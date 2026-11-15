@@ -65,7 +65,8 @@ pub fn guest_basename(guest_path: &str) -> Result<String> {
     Ok(name)
 }
 
-fn write_file(path: &Path, contents: &str, mode: u32) -> Result<()> {
+/// Write a file with `mode` into an exported tree, creating its parents.
+pub(crate) fn write_file(path: &Path, contents: &str, mode: u32) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::internal(format!("mkdir {}: {e}", parent.display())))?;
@@ -277,10 +278,24 @@ pub async fn cat(image: &Path, guest_path: &str) -> Result<Option<String>> {
 }
 
 /// True when the guest path exists in the image.
-#[cfg(test)]
 pub async fn exists(image: &Path, guest_path: &str) -> Result<bool> {
     let (_, stderr) = debugfs(image, false, &format!("stat {guest_path}")).await?;
     Ok(!is_not_found(&debugfs_errors(&stderr)))
+}
+
+/// Permission bits of a guest path (`Mode:  0755` in `debugfs stat`), or
+/// `None` when it does not exist.
+#[cfg(test)]
+pub async fn stat_mode(image: &Path, guest_path: &str) -> Result<Option<u32>> {
+    let (stdout, stderr) = debugfs(image, false, &format!("stat {guest_path}")).await?;
+    if is_not_found(&debugfs_errors(&stderr)) {
+        return Ok(None);
+    }
+    Ok(stdout
+        .split("Mode:")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|m| u32::from_str_radix(m, 8).ok()))
 }
 
 /// Replace (or create) a regular file inside the image with `contents` and

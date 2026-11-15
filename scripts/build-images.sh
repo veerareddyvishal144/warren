@@ -67,11 +67,11 @@ if [ "$builds_base" = 1 ]; then
         log "reusing staged gateway at $STAGED"
     else
         command -v cargo >/dev/null 2>&1 || die "cargo not found; source scripts/env.sh or set WARREN_GATEWAY_BIN"
-        log "building warren-gateway (release) into $CARGO_TARGET_DIR"
-        (cd "$ROOT" && cargo build --release --locked -p warren-gateway)
+        log "building warren-gateway (release, static musl) into $CARGO_TARGET_DIR"
+        (cd "$ROOT" && CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --locked -p warren-gateway --target x86_64-unknown-linux-musl)
         # The crate's [[bin]] may be named warren-gateway or gateway; accept either.
         built=""
-        for candidate in "$CARGO_TARGET_DIR/release/warren-gateway" "$CARGO_TARGET_DIR/release/gateway"; do
+        for candidate in "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/warren-gateway" "$CARGO_TARGET_DIR/release/warren-gateway"; do
             if [ -f "$candidate" ] && [ -x "$candidate" ]; then
                 built="$candidate"
                 break

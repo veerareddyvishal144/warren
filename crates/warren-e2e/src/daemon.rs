@@ -30,6 +30,16 @@ pub const METER_INTERVAL: Duration = Duration::from_secs(2);
 pub const MIN_IDLE_SECONDS: u32 = 5;
 /// How long the daemon may take to answer its health endpoint after spawn.
 pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
+/// Where `cargo build --target x86_64-unknown-linux-musl` puts the static gateway,
+/// relative to a target directory.
+pub const MUSL_GATEWAY_REL: &str = "x86_64-unknown-linux-musl/release/warren-gateway";
+/// Static gateway binaries tried, relative to the repository, when
+/// `WARREN_GATEWAY_BIN` is unset: the shared target directory (`make gateway`,
+/// `make build`), then the `target-musl` directory a parallel gateway build uses.
+pub const DEFAULT_GATEWAY_BINS: [&str; 2] = [
+    "target/x86_64-unknown-linux-musl/release/warren-gateway",
+    "target-musl/x86_64-unknown-linux-musl/release/warren-gateway",
+];
 
 /// Sandbox API base URL (`http://api.<base>:<port>/v1`).
 pub fn api_url_for(base_domain: &str, port: u16) -> String {
@@ -58,25 +68,70 @@ pub fn instance_url_for(
     )
 }
 
-/// Resolve the `warrend` binary: `WARREN_BIN` wins; otherwise
-/// `<repo>/target/release/warrend`, then `$CARGO_TARGET_DIR/release/warrend`.
-pub fn binary_path_from(
+/// The repository root, from this crate's manifest directory.
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// How to get a `warrend` binary, appended to the not-found error.
+const WARREND_HINT: &str = "Build it with `cargo build --release -p warrend` (or `make build`, or `scripts/e2e.sh` \
+                            which builds everything) or point WARREN_BIN at a warrend binary.";
+/// How to get the static gateway, appended to the not-found error.
+const GATEWAY_HINT: &str = "The daemon injects it into registered images, so the templates scenario needs it. \
+                            Build it with `make gateway` (once: `make musl-setup`; `make build` and `scripts/e2e.sh` \
+                            build it too) or point WARREN_GATEWAY_BIN at a static x86_64-unknown-linux-musl \
+                            warren-gateway binary.";
+
+/// Candidate `warrend` binaries in order: the override (`WARREN_BIN`) alone when
+/// set; else `<repo>/target/release/warrend`, then `$CARGO_TARGET_DIR/release/warrend`.
+fn warrend_candidates(
+    repo: &Path,
     override_path: Option<OsString>,
     cargo_target_dir: Option<OsString>,
-) -> Result<PathBuf> {
-    let mut candidates: Vec<(PathBuf, &str)> = Vec::new();
+) -> Vec<(PathBuf, String)> {
     if let Some(p) = override_path {
-        candidates.push((PathBuf::from(p), "WARREN_BIN"));
-    } else {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/warrend");
-        candidates.push((repo, "<repo>/target/release/warrend"));
-        if let Some(t) = cargo_target_dir {
-            candidates.push((
-                PathBuf::from(t).join("release/warrend"),
-                "$CARGO_TARGET_DIR/release/warrend",
-            ));
-        }
+        return vec![(PathBuf::from(p), "WARREN_BIN".into())];
     }
+    let mut candidates = vec![(
+        repo.join("target/release/warrend"),
+        "<repo>/target/release/warrend".to_string(),
+    )];
+    if let Some(t) = cargo_target_dir {
+        candidates.push((
+            PathBuf::from(t).join("release/warrend"),
+            "$CARGO_TARGET_DIR/release/warrend".into(),
+        ));
+    }
+    candidates
+}
+
+/// Candidate static gateways in order: the override (`WARREN_GATEWAY_BIN`) alone
+/// when set; else [`DEFAULT_GATEWAY_BINS`] under `repo`, then
+/// [`MUSL_GATEWAY_REL`] under `$CARGO_TARGET_DIR`.
+fn gateway_candidates(
+    repo: &Path,
+    override_path: Option<OsString>,
+    cargo_target_dir: Option<OsString>,
+) -> Vec<(PathBuf, String)> {
+    if let Some(p) = override_path {
+        return vec![(PathBuf::from(p), "WARREN_GATEWAY_BIN".into())];
+    }
+    let mut candidates: Vec<(PathBuf, String)> = DEFAULT_GATEWAY_BINS
+        .iter()
+        .map(|rel| (repo.join(rel), format!("<repo>/{rel}")))
+        .collect();
+    if let Some(t) = cargo_target_dir {
+        candidates.push((
+            PathBuf::from(t).join(MUSL_GATEWAY_REL),
+            format!("$CARGO_TARGET_DIR/{MUSL_GATEWAY_REL}"),
+        ));
+    }
+    candidates
+}
+
+/// The first existing file among `candidates` (path, why it was tried), or an
+/// error listing every path tried followed by `hint`.
+fn first_existing(what: &str, candidates: &[(PathBuf, String)], hint: &str) -> Result<PathBuf> {
     if let Some((p, _)) = candidates.iter().find(|(p, _)| p.is_file()) {
         return Ok(p.clone());
     }
@@ -85,10 +140,40 @@ pub fn binary_path_from(
         .map(|(p, why)| format!("{} ({why})", p.display()))
         .collect();
     Err(fail(format!(
-        "warrend binary not found; tried {}. Build it with `cargo build --release -p warrend` (or `make build`, or \
-         `scripts/e2e.sh` which builds everything) or point WARREN_BIN at a warrend binary.",
+        "{what} not found; tried {}. {hint}",
         tried.join(", ")
     )))
+}
+
+/// Resolve the `warrend` binary: `WARREN_BIN` wins; otherwise
+/// `<repo>/target/release/warrend`, then `$CARGO_TARGET_DIR/release/warrend`.
+pub fn binary_path_from(
+    override_path: Option<OsString>,
+    cargo_target_dir: Option<OsString>,
+) -> Result<PathBuf> {
+    first_existing(
+        "warrend binary",
+        &warrend_candidates(&repo_root(), override_path, cargo_target_dir),
+        WARREND_HINT,
+    )
+}
+
+/// Resolve the static (musl) `warren-gateway` the daemon injects into registered
+/// images: `WARREN_GATEWAY_BIN` wins; otherwise
+/// `<repo>/target/x86_64-unknown-linux-musl/release/warren-gateway`, then
+/// `<repo>/target-musl/x86_64-unknown-linux-musl/release/warren-gateway`, then
+/// the same path under `$CARGO_TARGET_DIR`. Every daemon the harness starts gets
+/// it as `--gateway-bin`; without one the templates scenario cannot pass, so a
+/// missing binary is an error that says how to build it.
+pub fn gateway_bin_path_from(
+    override_path: Option<OsString>,
+    cargo_target_dir: Option<OsString>,
+) -> Result<PathBuf> {
+    first_existing(
+        "static warren-gateway binary",
+        &gateway_candidates(&repo_root(), override_path, cargo_target_dir),
+        GATEWAY_HINT,
+    )
 }
 
 /// A running `warrend` process owned by one test.
@@ -97,6 +182,7 @@ pub struct Daemon {
     base_domain: String,
     data_dir: PathBuf,
     log_path: PathBuf,
+    gateway_bin: PathBuf,
     child: Mutex<Option<Child>>,
     clients: Mutex<HashMap<String, reqwest::Client>>,
     raw_clients: Mutex<HashMap<String, reqwest::Client>>,
@@ -122,11 +208,22 @@ impl Daemon {
         )
     }
 
-    /// Spawn `warrend --dev` on a free port with a fresh data directory, capture
-    /// its output to `warrend.log` in the temp directory and wait for
-    /// `GET /v1/health`. On failure the log tail is printed and the error says why.
+    /// Where the static gateway the daemon injects is (see
+    /// [`gateway_bin_path_from`]); an empty `WARREN_GATEWAY_BIN` counts as unset.
+    pub fn gateway_bin_path() -> Result<PathBuf> {
+        gateway_bin_path_from(
+            std::env::var_os("WARREN_GATEWAY_BIN").filter(|v| !v.is_empty()),
+            std::env::var_os("CARGO_TARGET_DIR"),
+        )
+    }
+
+    /// Spawn `warrend --dev` on a free port with a fresh data directory and
+    /// `--gateway-bin` pointing at the static gateway, capture its output to
+    /// `warrend.log` in the temp directory and wait for `GET /v1/health`. On
+    /// failure the log tail is printed and the error says why.
     pub async fn start() -> Result<Daemon> {
         let bin = Self::binary_path()?;
+        let gateway_bin = Self::gateway_bin_path()?;
         let vm = Self::vm_requested();
         let port = free_port()?;
         let root = TempRoot::new("warren-e2e")?;
@@ -153,6 +250,8 @@ impl Daemon {
                 &format!("{}s", METER_INTERVAL.as_secs()),
             ])
             .args(["--min-idle-seconds", &MIN_IDLE_SECONDS.to_string()])
+            .arg("--gateway-bin")
+            .arg(&gateway_bin)
             .args(["--log", &log_level]);
         if let Some(tag) = std::env::var("WARREN_E2E_IMAGE_TAG")
             .ok()
@@ -182,8 +281,9 @@ impl Daemon {
             .spawn()
             .map_err(|e| transport(&format!("spawn {}", bin.display()), e))?;
         eprintln!(
-            "[e2e] warrend pid {} listening on {port}; log {}",
+            "[e2e] warrend pid {} listening on {port}; gateway {}; log {}",
             child.id(),
+            gateway_bin.display(),
             log_path.display()
         );
 
@@ -192,6 +292,7 @@ impl Daemon {
             base_domain,
             data_dir,
             log_path,
+            gateway_bin,
             child: Mutex::new(Some(child)),
             clients: Mutex::new(HashMap::new()),
             raw_clients: Mutex::new(HashMap::new()),
@@ -266,6 +367,11 @@ impl Daemon {
 
     pub fn log_path(&self) -> &Path {
         &self.log_path
+    }
+
+    /// The static gateway binary the daemon was started with (`--gateway-bin`).
+    pub fn gateway_bin(&self) -> &Path {
+        &self.gateway_bin
     }
 
     /// The `GET /v1/health` body observed at startup.
@@ -452,16 +558,57 @@ mod tests {
             err.message.contains("cargo build --release -p warrend"),
             "{err}"
         );
-        let err = binary_path_from(None, Some("/nonexistent-target".into())).unwrap_err();
+        // The defaults depend on the checkout; resolve them against an empty repo.
+        let candidates = warrend_candidates(
+            Path::new("/nonexistent-repo"),
+            None,
+            Some("/nonexistent-target".into()),
+        );
+        let err = first_existing("warrend binary", &candidates, WARREND_HINT).unwrap_err();
         assert!(
-            err.message
-                .contains("target/release/warrend (<repo>/target/release/warrend)"),
+            err.message.contains(
+                "/nonexistent-repo/target/release/warrend (<repo>/target/release/warrend)"
+            ),
             "{err}"
         );
         assert!(
             err.message.contains(
                 "/nonexistent-target/release/warrend ($CARGO_TARGET_DIR/release/warrend)"
             ),
+            "{err}"
+        );
+        assert!(err.message.contains("WARREN_BIN at"), "{err}");
+    }
+
+    #[test]
+    fn missing_gateway_is_a_clear_error() {
+        let err =
+            gateway_bin_path_from(Some("/nonexistent/warren-gateway".into()), None).unwrap_err();
+        assert!(
+            err.message
+                .contains("/nonexistent/warren-gateway (WARREN_GATEWAY_BIN)"),
+            "{err}"
+        );
+        assert!(err.message.contains("make gateway"), "{err}");
+        assert!(err.message.contains("WARREN_GATEWAY_BIN at"), "{err}");
+        let candidates = gateway_candidates(
+            Path::new("/nonexistent-repo"),
+            None,
+            Some("/nonexistent-target".into()),
+        );
+        let err =
+            first_existing("static warren-gateway binary", &candidates, GATEWAY_HINT).unwrap_err();
+        for rel in DEFAULT_GATEWAY_BINS {
+            assert!(
+                err.message
+                    .contains(&format!("/nonexistent-repo/{rel} (<repo>/{rel})")),
+                "{err}"
+            );
+        }
+        assert!(
+            err.message.contains(&format!(
+                "/nonexistent-target/{MUSL_GATEWAY_REL} ($CARGO_TARGET_DIR/{MUSL_GATEWAY_REL})"
+            )),
             "{err}"
         );
     }
@@ -475,11 +622,58 @@ mod tests {
             binary_path_from(Some(fake.clone().into_os_string()), None).unwrap(),
             fake
         );
-        std::fs::create_dir_all(root.path().join("release")).unwrap();
-        std::fs::write(root.path().join("release/warrend"), b"x").unwrap();
-        let found = binary_path_from(None, Some(root.path().as_os_str().to_owned()));
-        // Either the repo's release binary exists (preferred) or the target-dir fallback is used.
-        let found = found.unwrap();
-        assert!(found.ends_with("release/warrend"), "{}", found.display());
+        // The repo's release binary wins over the target-dir fallback; each is
+        // found when it is the only one.
+        let repo = root.path().join("repo");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(repo.join("target/release")).unwrap();
+        std::fs::create_dir_all(target.join("release")).unwrap();
+        std::fs::write(target.join("release/warrend"), b"x").unwrap();
+        let find = || {
+            first_existing(
+                "warrend binary",
+                &warrend_candidates(&repo, None, Some(target.as_os_str().to_owned())),
+                WARREND_HINT,
+            )
+            .unwrap()
+        };
+        assert_eq!(find(), target.join("release/warrend"));
+        std::fs::write(repo.join("target/release/warrend"), b"x").unwrap();
+        assert_eq!(find(), repo.join("target/release/warrend"));
+    }
+
+    #[test]
+    fn existing_gateway_is_found() {
+        let root = TempRoot::new("warren-e2e-gateway").unwrap();
+        let fake = root.path().join("warren-gateway");
+        std::fs::write(&fake, b"\x7fELF").unwrap();
+        assert_eq!(
+            gateway_bin_path_from(Some(fake.clone().into_os_string()), None).unwrap(),
+            fake
+        );
+        // Order: <repo>/target, then <repo>/target-musl, then $CARGO_TARGET_DIR.
+        let repo = root.path().join("repo");
+        let target = root.path().join("target");
+        let write = |p: &Path| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"\x7fELF").unwrap();
+        };
+        let find = || {
+            first_existing(
+                "static warren-gateway binary",
+                &gateway_candidates(&repo, None, Some(target.as_os_str().to_owned())),
+                GATEWAY_HINT,
+            )
+            .unwrap()
+        };
+        let under_target = target.join(MUSL_GATEWAY_REL);
+        write(&under_target);
+        assert_eq!(find(), under_target);
+        let musl = repo.join(DEFAULT_GATEWAY_BINS[1]);
+        write(&musl);
+        assert_eq!(find(), musl);
+        let shared = repo.join(DEFAULT_GATEWAY_BINS[0]);
+        write(&shared);
+        assert_eq!(find(), shared);
     }
 }

@@ -25,8 +25,9 @@ pub async fn ensure(image: &str) -> Result<String> {
     })
 }
 
-/// `docker image inspect` → digest, or `None` when the image is not present.
-pub async fn inspect_digest(image: &str) -> Result<Option<String>> {
+/// `docker image inspect` as a parsed document, or `None` when the image is
+/// not present locally.
+pub async fn inspect(image: &str) -> Result<Option<serde_json::Value>> {
     let docker = host::tool("docker")?;
     let out = tokio::process::Command::new(&docker)
         .args(["image", "inspect", image])
@@ -43,16 +44,46 @@ pub async fn inspect_digest(image: &str) -> Result<Option<String>> {
             "docker image inspect {image} failed: {err}"
         )));
     }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
+    serde_json::from_slice(&out.stdout).map(Some).map_err(|e| {
         Error::internal(format!(
             "docker image inspect {image}: unreadable output: {e}"
         ))
-    })?;
+    })
+}
+
+/// The content digest of a local image, or `None` when it is not present.
+pub async fn inspect_digest(image: &str) -> Result<Option<String>> {
+    let Some(v) = inspect(image).await? else {
+        return Ok(None);
+    };
     digest_from_inspect(&v).map(Some).ok_or_else(|| {
         Error::internal(format!(
             "docker image inspect {image}: no digest or id in output"
         ))
     })
+}
+
+/// The argv a container of `image` would run: `Config.Entrypoint` followed by
+/// `Config.Cmd`, empty when the image declares neither. The image must be
+/// present locally (see [`ensure`]).
+pub async fn inspect_command(image: &str) -> Result<Vec<String>> {
+    let v = inspect(image)
+        .await?
+        .ok_or_else(|| Error::internal(format!("docker image inspect {image}: no such image")))?;
+    Ok(command_from_inspect(&v))
+}
+
+/// `Config.Entrypoint` then `Config.Cmd` from an inspect document. Either may
+/// be `null` or absent, and entries that are not strings are skipped.
+pub fn command_from_inspect(v: &serde_json::Value) -> Vec<String> {
+    let img = v.as_array().and_then(|a| a.first()).unwrap_or(v);
+    let config = img.get("Config");
+    ["Entrypoint", "Cmd"]
+        .into_iter()
+        .filter_map(|key| config?.get(key)?.as_array())
+        .flatten()
+        .filter_map(|s| s.as_str().map(str::to_string))
+        .collect()
 }
 
 /// The content digest from an inspect document: the first `RepoDigests` entry
@@ -178,6 +209,33 @@ mod tests {
         assert_eq!(digest_from_inspect(&serde_json::json!({"Id": ""})), None);
     }
 
+    #[test]
+    fn command_joins_entrypoint_and_cmd() {
+        let v = serde_json::json!([{
+            "Config": { "Entrypoint": ["docker-entrypoint.sh"], "Cmd": ["redis-server"] }
+        }]);
+        assert_eq!(
+            command_from_inspect(&v),
+            vec!["docker-entrypoint.sh", "redis-server"]
+        );
+        let v = serde_json::json!([{ "Config": { "Entrypoint": null, "Cmd": ["/bin/sh"] } }]);
+        assert_eq!(command_from_inspect(&v), vec!["/bin/sh"]);
+        let v = serde_json::json!([{
+            "Config": { "Entrypoint": ["/usr/local/bin/warren-gateway", "--serve"], "Cmd": null }
+        }]);
+        assert_eq!(
+            command_from_inspect(&v),
+            vec!["/usr/local/bin/warren-gateway", "--serve"]
+        );
+        assert!(command_from_inspect(&serde_json::json!([{ "Config": {} }])).is_empty());
+        assert!(command_from_inspect(&serde_json::json!([{ "Config": null }])).is_empty());
+        assert!(command_from_inspect(&serde_json::json!([{}])).is_empty());
+        assert!(command_from_inspect(&serde_json::json!([])).is_empty());
+        // A single object instead of an array, and entries that are not strings.
+        let v = serde_json::json!({ "Config": { "Cmd": ["sh", 1, null] } });
+        assert_eq!(command_from_inspect(&v), vec!["sh"]);
+    }
+
     #[tokio::test]
     async fn inspect_and_export_with_docker() {
         let Some(image) = crate::testutil::docker_test_image().await else {
@@ -192,6 +250,15 @@ mod tests {
         );
         let digest = ensure(&image).await.unwrap();
         assert!(digest.starts_with("sha256:"), "{digest}");
+        let command = inspect_command(&image).await.unwrap();
+        if image == "alpine:3.20" {
+            assert_eq!(command, vec!["/bin/sh"]);
+        }
+        assert!(
+            inspect_command("warren-test/does-not-exist:zzz")
+                .await
+                .is_err()
+        );
         let tmp = crate::testutil::TempDir::new("fc-export");
         let dest = tmp.path().join("rootfs-dir");
         export_rootfs(&image, &dest).await.unwrap();

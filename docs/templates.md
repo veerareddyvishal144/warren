@@ -1,6 +1,6 @@
 # Templates
 
-A template is a named image plus what the platform needs to run it. Three come built in; you register your own from any image that follows the image contract.
+A template is a named image plus what the platform needs to run it. Three come built in; you register your own from any Linux image: the daemon injects its gateway into images that do not ship it, so files, exec and health work without changing the image (see [Any image works](#any-image-works-the-injected-gateway)).
 
 ```bash
 export WARREN_API=http://api.warren.localhost:7337/v1
@@ -54,7 +54,8 @@ curl -s -X POST $WARREN_API/templates -H "$AUTH" -H "$JSON" -d '{
 
 - `name`: lowercase letters, digits and dashes, 3 to 40 characters, not starting with `warren-` (reserved for the catalog).
 - `image_ref` is required. The daemon pulls the image when you register and records its digest, so a mutable tag is frozen at the revision. A private registry needs the Docker daemon on the host to be logged in.
-- `default_port` 0 means the bare instance URL serves nothing (`502` with a plain-text explanation); other ports still work at `<id>-<port>`.
+- `default_port` is where the bare instance URL lands: `3737` makes `https://<id>.<base>/` the gateway (files, health, the Agent API if `agent: true`); the port of your own service makes the bare URL your service while the gateway stays at `https://<id>-3737.<base>/`; `0` means the bare URL serves nothing (`502` with the plain-text explanation "this template has no default port") while `<id>-3737` still reaches the gateway and any other port works at `<id>-<port>`.
+- `mount_path` is where the persistent disk mounts; it must be a directory the image's processes can use (`/home` for `alpine:3.20`, `/home/node` for the official Node images, `/home/agent` for images derived from `warren/base`).
 - `agent: true` says the image answers `POST /v1/responses` on `default_port`, which also enables crons.
 
 The response is `201` with `"revision": 1`. Posting again with the same name publishes revision 2, 3, ...; older revisions stay readable:
@@ -82,9 +83,24 @@ curl -s -X DELETE $WARREN_API/templates/my-agent -H "$AUTH"     # {"name":"my-ag
 
 `409 conflict` while any instance uses the template (any revision). Move or delete those instances first. System templates cannot be deleted.
 
+## Any image works: the injected gateway
+
+A registered image does not have to know about Warren. When an instance of a workspace template starts, the runtime injects the daemon's static `warren-gateway` binary into the container at `/warren/warren-gateway` (outside any home, so it never collides with your files) and runs it as the entrypoint in **wrap mode**: the gateway serves the Warren API on port 3737 and starts the image's own `ENTRYPOINT` and `CMD` as a child process, which it supervises. The decision is by template scope: workspace templates get the gateway injected; the built-in (`system`) templates already contain it at `/usr/local/bin/warren-gateway` and run it directly, unwrapped.
+
+What this gives you on any Linux image, Alpine and distroless ones included (the binary is fully static, built for `x86_64-unknown-linux-musl`, and needs no libc, shell or user database):
+
+- The **files API** on 3737, confined to `mount_path`.
+- **Exec** (`POST /v1/instances/{id}/exec`), defaulting to the owner of the persistent home as everywhere.
+- **Health**: `GET /v1/health` answers `{"healthy": true, ..., "wrapped": {"running": <bool>, "exit_code": <int|null>}}`, so the daemon's readiness check works and you can see whether the image's own process is still running and how it exited.
+- **No long-running process required.** `alpine:3.20` runs `/bin/sh`, which exits at once without a stdin; the gateway reports `"wrapped": {"running": false, "exit_code": 0}` and keeps serving, so the instance stays `running` and usable for exec and files. A service image (nginx, n8n, your own agent) keeps running as the child.
+- **Terminal-less operation.** A foreign image has no `ttyd`, so `<id>-7681` answers `502` and the dashboard terminal is unavailable; everything else works. Derive from `warren/base` if you want the browser terminal.
+- **The image's user is kept.** An image with `USER node` runs the gateway and its child as `node`; one without `USER` runs as root like the built-in images.
+
+Only workspace templates are wrapped, and only when the daemon has the binary: `--gateway-bin <path>` (or `WARREN_GATEWAY_BIN`), else a `warren-gateway` next to `warrend`, else `/usr/local/bin/warren-gateway`. `make gateway` builds it (`make musl-setup` once for the musl toolchain); `scripts/dev-up.sh` builds it when missing and passes the flag. Without it the daemon warns at startup and instances of registered images that lack a gateway cannot start.
+
 ## Writing an image
 
-The contract is spelled out in [images/common/README.md](../images/common/README.md). The short version: derive from the base image and keep its conventions.
+The contract is spelled out in [images/common/README.md](../images/common/README.md). Deriving from the base image is optional (any image works, see above); it gives you the `agent` user, the toolchain, `ttyd` and the gateway baked in. If you derive, keep its conventions.
 
 ```dockerfile
 FROM warren/base:dev
@@ -99,7 +115,7 @@ ENV WARREN_AGENT_DRIVER=command WARREN_AGENT_COMMAND='my-agent --prompt {prompt}
 - Never bake credentials in. Keys arrive through the instance `env`; the workspace API key is never present inside an instance.
 - The driver is selected by `WARREN_AGENT_DRIVER`: `openai` (agent loop against `OPENAI_BASE_URL` with `OPENAI_API_KEY` and `WARREN_MODEL`), `command` (`WARREN_AGENT_COMMAND` run once per turn, `{prompt}` replaced by the input or appended as the last argument, stdout is the reply), `echo` (deterministic, for tests). Unset means no agent.
 
-An image that does not ship the gateway can still be registered (`agent: false`, `default_port` of its own service); you lose the files API, exec on `vm` instances, the health-based readiness check and the terminal, so this is only useful for the `default` type and plain services.
+The daemon decides by template scope, not by inspecting the image: every workspace template, including one derived from `warren/base` that carries a gateway of its own, starts with the injected gateway as the entrypoint and the image's own entrypoint as its child.
 
 Platform variables injected into every instance, which always win over template and instance env: `WARREN_INSTANCE_ID`, `WARREN_INSTANCE_TOKEN`, `WARREN_WORKSPACE_ID`, `WARREN_HOME`, `WARREN_GATEWAY_PORT`, `WARREN_BUDGET_MONTHLY_CAP_MICROS`, `WARREN_BUDGET_CREDIT_MICROS`.
 

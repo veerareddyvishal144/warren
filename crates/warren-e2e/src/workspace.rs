@@ -88,7 +88,15 @@ impl Workspace {
     /// The SDK's Agent API client for an instance, through the edge on the
     /// default port, with DNS pinned to the daemon.
     pub fn agent(&self, id: &str) -> Result<AgentClient> {
-        let url = self.daemon.instance_url(id, 0);
+        self.agent_on_port(id, 0)
+    }
+
+    /// Like [`Workspace::agent`] but through `<id>-<preview_port>.<base>`
+    /// (`0` means the default port), for gateways on a port that is not the
+    /// template's default, such as an injected gateway on 3737 when
+    /// `default_port` is 0.
+    pub fn agent_on_port(&self, id: &str, preview_port: u16) -> Result<AgentClient> {
+        let url = self.daemon.instance_url(id, preview_port);
         let http = self.daemon.client_for_url(&url)?;
         Ok(AgentClient::with_http(url, self.api_key(), http))
     }

@@ -10,6 +10,13 @@
 //! shutdown. Nothing is ever mounted on the host: backups, rebuilds and clones
 //! read and edit images with `debugfs`.
 //!
+//! System templates ship the gateway in their image. Workspace templates are
+//! registered from arbitrary images that have none (and often no long-running
+//! process), so before packing, the fully static gateway the daemon was given
+//! (`--gateway-bin`) is copied to `/usr/local/bin/warren-gateway` and the
+//! image's own `Entrypoint + Cmd` is recorded in `/etc/warren.wrap.json`
+//! ([`WRAP_FILE`]) for the gateway to supervise while it serves the API.
+//!
 //! Layout under `<instances_dir>/<id>/vm/`: `rootfs.ext4`, `config.json`, `ip`,
 //! `pid`, `console.log`.
 //!
@@ -21,6 +28,7 @@
 mod gateway;
 mod host;
 mod image;
+mod inject;
 mod net;
 mod paths;
 mod process;
@@ -40,9 +48,10 @@ use std::{
 use async_trait::async_trait;
 use warren_core::{
     Config, Error, ExecRequest, ExecResult, GATEWAY_PORT, Instance, LogsOptions, NetworkMode,
-    Result, RunInfo, Runtime, STOP_GRACE_SECS, Shape, Stats, Template, errors,
+    Result, RunInfo, Runtime, STOP_GRACE_SECS, Shape, Stats, Template, TemplateScope, errors,
 };
 
+pub use inject::WRAP_FILE;
 pub use net::{BRIDGE, HOST_IP, SUBNET, tap_name};
 pub use paths::VmPaths;
 pub use vmconfig::{GUEST_INIT, VmConfig, boot_args, boot_args_with_init};
@@ -57,6 +66,20 @@ pub const BOOT_TIMEOUT: Duration = Duration::from_secs(120);
 const CONSOLE_TAIL_BYTES: u64 = 4 << 20;
 /// Time allowed for a SIGKILLed VM to disappear.
 const KILL_WAIT: Duration = Duration::from_secs(5);
+
+/// How a root filesystem gets the gateway that serves the Warren API. The
+/// daemon decides through the template's scope; see [`inject`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GatewayPlan {
+    /// A system image: it ships `/usr/local/bin/warren-gateway` as its entrypoint.
+    ImageProvides,
+    /// A workspace image: copy the daemon's static gateway in unless the image
+    /// has one, and record the image's own command in the wrap file.
+    Inject {
+        /// `Config.Entrypoint` followed by `Config.Cmd` of the image.
+        command: Vec<String>,
+    },
+}
 
 /// Firecracker-backed [`Runtime`].
 pub struct FirecrackerRuntime {
@@ -177,9 +200,71 @@ impl FirecrackerRuntime {
         (!m.trim_matches('/').is_empty()).then_some(m)
     }
 
-    /// Export `image`, drop `preserved_home` in at the mount path, write the
-    /// identity files and the env, and pack everything into a fresh
-    /// `rootfs.ext4`. The old image stays in place until the new one is complete.
+    /// Workspace templates are registered from arbitrary images and get the
+    /// daemon's gateway injected; system templates are built with it.
+    fn needs_injection(tpl: &Template) -> bool {
+        tpl.scope == TemplateScope::Workspace
+    }
+
+    /// Turn the daemon's decision into a plan. Injection needs the image's own
+    /// command, read with `docker image inspect`.
+    async fn plan_gateway(image: &str, inject: bool) -> Result<GatewayPlan> {
+        if !inject {
+            return Ok(GatewayPlan::ImageProvides);
+        }
+        let command = image::inspect_command(image).await?;
+        Ok(GatewayPlan::Inject { command })
+    }
+
+    /// Everything the exported tree at `dir` needs before it is packed: the
+    /// gateway and wrap file as `plan` says, `preserved_home` moved to the
+    /// mount path, then the identity files and the env.
+    fn stage_rootfs_dir(
+        &self,
+        dir: &Path,
+        inst: &Instance,
+        env: &BTreeMap<String, String>,
+        preserved_home: Option<PathBuf>,
+        plan: &GatewayPlan,
+    ) -> Result<()> {
+        match plan {
+            GatewayPlan::ImageProvides => {
+                if self.guest_init == GUEST_INIT
+                    && !rootfs::guest_to_host(dir, GUEST_INIT).is_file()
+                {
+                    tracing::warn!(instance = %inst.id, init = GUEST_INIT, "system image has no gateway at the init path; the VM cannot serve the API");
+                }
+            }
+            GatewayPlan::Inject { command } => {
+                let outcome = inject::ensure_gateway(dir, self.cfg.gateway_bin.as_deref())?;
+                tracing::info!(instance = %inst.id, gateway = ?outcome, command = ?command, "workspace image prepared for the gateway");
+                inject::write_wrap_file(dir, command)?;
+            }
+        }
+        if let (Some(home), Some(mount)) = (preserved_home, Self::home_dir(inst)) {
+            let target = rootfs::guest_to_host(dir, mount);
+            rootfs::remove_tree(&target)?;
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| Error::internal(format!("mkdir {}: {e}", parent.display())))?;
+            }
+            std::fs::rename(&home, &target).map_err(|e| {
+                Error::internal(format!(
+                    "move {} to {}: {e}",
+                    home.display(),
+                    target.display()
+                ))
+            })?;
+        }
+        rootfs::write_identity_files(dir, &inst.id, &inst.mount_path)?;
+        rootfs::write_env_file(dir, env)?;
+        Ok(())
+    }
+
+    /// Export `image`, stage the tree (gateway, preserved home, identity files,
+    /// env) and pack everything into a fresh `rootfs.ext4`. The old image stays
+    /// in place until the new one is complete. `inject_gateway` is the daemon's
+    /// decision for this image: true for workspace templates.
     async fn build_rootfs(
         &self,
         inst: &Instance,
@@ -187,6 +272,7 @@ impl FirecrackerRuntime {
         image: &str,
         env: &BTreeMap<String, String>,
         preserved_home: Option<PathBuf>,
+        inject_gateway: bool,
     ) -> Result<()> {
         if image.is_empty() {
             return Err(Error::invalid(
@@ -200,19 +286,10 @@ impl FirecrackerRuntime {
         rootfs::remove_tree(&dir)?;
         let _ = std::fs::remove_file(&tmp);
         let result = async {
+            let plan = Self::plan_gateway(image, inject_gateway).await?;
             tracing::info!(instance = %inst.id, image, "exporting image");
             image::export_rootfs(image, &dir).await?;
-            if let (Some(home), Some(mount)) = (preserved_home, Self::home_dir(inst)) {
-                let target = rootfs::guest_to_host(&dir, mount);
-                rootfs::remove_tree(&target)?;
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| Error::internal(format!("mkdir {}: {e}", parent.display())))?;
-                }
-                std::fs::rename(&home, &target)
-                    .map_err(|e| Error::internal(format!("move {} to {}: {e}", home.display(), target.display())))?;
-            }
-            rootfs::write_identity_files(&dir, &inst.id, &inst.mount_path)?;
-            rootfs::write_env_file(&dir, env)?;
+            self.stage_rootfs_dir(&dir, inst, env, preserved_home, &plan)?;
             tracing::info!(instance = %inst.id, disk_gb = inst.shape.disk, "packing root filesystem");
             rootfs::mkfs(&dir, &tmp, inst.shape.disk).await?;
             std::fs::rename(&tmp, p.rootfs()).map_err(|e| Error::internal(format!("install rootfs: {e}")))?;
@@ -322,6 +399,21 @@ impl Runtime for FirecrackerRuntime {
                 kernel.display()
             )));
         }
+        // Not a hard failure: system templates work without it.
+        match &self.cfg.gateway_bin {
+            Some(bin) if !bin.is_file() => {
+                tracing::warn!(path = %bin.display(), "gateway binary (--gateway-bin) does not exist; workspace templates cannot be created")
+            }
+            Some(bin) => {
+                tracing::debug!(path = %bin.display(), "gateway injection enabled for workspace templates")
+            }
+            None => {
+                tracing::info!(
+                    init = GUEST_INIT,
+                    "no gateway binary configured (--gateway-bin); workspace templates whose image lacks the gateway cannot be created"
+                )
+            }
+        }
         for t in [
             "mkfs.ext4",
             "debugfs",
@@ -368,8 +460,15 @@ impl Runtime for FirecrackerRuntime {
             rootfs::put_file(&image, "/etc/hostname", &format!("{}\n", inst.id), 0o644).await?;
             rootfs::grow(&image, inst.shape.disk).await?;
         } else {
-            self.build_rootfs(inst, &p, &tpl.image_ref, &env, None)
-                .await?;
+            self.build_rootfs(
+                inst,
+                &p,
+                &tpl.image_ref,
+                &env,
+                None,
+                Self::needs_injection(tpl),
+            )
+            .await?;
         }
         let ip = self.ensure_ip(&p).await?;
         self.write_config(inst, &p, ip)?;
@@ -591,7 +690,14 @@ impl Runtime for FirecrackerRuntime {
             _ => None,
         };
         let result = self
-            .build_rootfs(inst, &p, &tpl.image_ref, &env, preserved)
+            .build_rootfs(
+                inst,
+                &p,
+                &tpl.image_ref,
+                &env,
+                preserved,
+                Self::needs_injection(tpl),
+            )
             .await;
         let _ = rootfs::remove_tree(&keep);
         result?;
@@ -688,16 +794,19 @@ impl Runtime for FirecrackerRuntime {
                 "this template has no mount path to restore into",
             ));
         };
-        // The env file inside the current image still carries the template
-        // defaults, which the instance record alone does not have.
-        let base = match p.rootfs().is_file() {
-            true => rootfs::cat(&p.rootfs(), &format!("/{}", rootfs::ENV_FILE))
+        // The current image remembers what the instance record alone does not:
+        // its env file carries the template defaults, and its wrap file marks a
+        // workspace image whose gateway the daemon injected.
+        let (base, inject_gateway) = if p.rootfs().is_file() {
+            let base = rootfs::cat(&p.rootfs(), &format!("/{}", rootfs::ENV_FILE))
                 .await?
-                .map(|t| rootfs::parse_env(&t)),
-            false => None,
-        }
-        .unwrap_or_default();
-        let env = inst.effective_env(&base);
+                .map(|t| rootfs::parse_env(&t));
+            let wrapped = rootfs::exists(&p.rootfs(), &format!("/{WRAP_FILE}")).await?;
+            (base, wrapped)
+        } else {
+            (None, false)
+        };
+        let env = inst.effective_env(&base.unwrap_or_default());
         let scratch = p.restore_dir();
         rootfs::remove_tree(&scratch)?;
         let target = scratch.join(rootfs::guest_basename(home)?);
@@ -707,8 +816,15 @@ impl Runtime for FirecrackerRuntime {
             .map_err(|e| Error::internal(format!("restore task failed: {e}")))?
         {
             Ok(()) => {
-                self.build_rootfs(inst, &p, &inst.image_ref, &env, Some(target))
-                    .await
+                self.build_rootfs(
+                    inst,
+                    &p,
+                    &inst.image_ref,
+                    &env,
+                    Some(target),
+                    inject_gateway,
+                )
+                .await
             }
             Err(e) => Err(e),
         };
@@ -726,6 +842,8 @@ impl Runtime for FirecrackerRuntime {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
     use crate::testutil::{TempDir, docker_test_image, firecracker_assets, have_e2fsprogs};
     use warren_core::{InstanceType, errors::CODE_NOT_SUPPORTED};
@@ -1285,5 +1403,240 @@ mod tests {
         assert!(!host::link_exists(&tap_name(&inst.id)));
         rt.destroy(&inst, true).await.unwrap();
         assert!(!p.root.exists());
+    }
+
+    /// A fake `docker export`: just enough of an Alpine layout.
+    fn fake_export(dir: &Path) {
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/sh"), "#!/bin/sh\n").unwrap();
+    }
+
+    #[test]
+    fn scope_decides_injection() {
+        let mut tpl = template("alpine:3.20");
+        assert_eq!(tpl.scope, TemplateScope::System);
+        assert!(!FirecrackerRuntime::needs_injection(&tpl));
+        tpl.scope = TemplateScope::Workspace;
+        assert!(FirecrackerRuntime::needs_injection(&tpl));
+    }
+
+    /// The staging step on a fake export: workspace images get the daemon's
+    /// gateway (0755) and the wrap file, system images are left alone, and
+    /// without `--gateway-bin` a foreign image is refused. No Docker, no root.
+    #[tokio::test]
+    async fn staging_injects_the_gateway_for_workspace_images_only() {
+        let tmp = TempDir::new("fc-stage");
+        let fake_gateway = tmp.path().join("warren-gateway-musl");
+        std::fs::write(&fake_gateway, "ELF static gateway").unwrap();
+        let mut cfg = test_config(tmp.path());
+        cfg.gateway_bin = Some(fake_gateway);
+        let rt = FirecrackerRuntime::new(cfg).await.unwrap();
+        let tpl = template("alpine:3.20");
+        let inst = instance("ab12cd34ef", &tpl);
+        let env = inst.effective_env(&tpl.env);
+        let gateway = Path::new("usr/local/bin/warren-gateway");
+
+        // System image: nothing but the identity files and the env.
+        let dir = tmp.path().join("system");
+        fake_export(&dir);
+        rt.stage_rootfs_dir(&dir, &inst, &env, None, &GatewayPlan::ImageProvides)
+            .unwrap();
+        assert!(!dir.join(gateway).exists());
+        assert!(!dir.join(WRAP_FILE).exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("etc/hostname")).unwrap(),
+            "ab12cd34ef\n"
+        );
+        assert!(dir.join(rootfs::ENV_FILE).is_file());
+
+        // Workspace image: the gateway is copied in, the command recorded, and
+        // a preserved home lands at the mount path.
+        let dir = tmp.path().join("workspace");
+        fake_export(&dir);
+        let keep = tmp.path().join("keep/agent");
+        std::fs::create_dir_all(keep.join("work")).unwrap();
+        std::fs::write(keep.join("work/notes.txt"), "keep me").unwrap();
+        let plan = GatewayPlan::Inject {
+            command: vec!["/bin/sh".to_string()],
+        };
+        rt.stage_rootfs_dir(&dir, &inst, &env, Some(keep.clone()), &plan)
+            .unwrap();
+        let injected = dir.join(gateway);
+        assert_eq!(
+            std::fs::read_to_string(&injected).unwrap(),
+            "ELF static gateway"
+        );
+        assert_eq!(
+            std::fs::metadata(&injected).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(WRAP_FILE)).unwrap(),
+            "[\"/bin/sh\"]\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("home/agent/work/notes.txt")).unwrap(),
+            "keep me"
+        );
+        assert!(!keep.exists(), "the preserved home is moved, not copied");
+        let staged =
+            rootfs::parse_env(&std::fs::read_to_string(dir.join(rootfs::ENV_FILE)).unwrap());
+        assert_eq!(
+            staged.get("WARREN_INSTANCE_ID").map(String::as_str),
+            Some("ab12cd34ef")
+        );
+
+        // A workspace image built on warren/base keeps its own gateway; the
+        // wrap file still says what the image would have run.
+        let dir = tmp.path().join("derived");
+        fake_export(&dir);
+        std::fs::create_dir_all(dir.join("usr/local/bin")).unwrap();
+        std::fs::write(dir.join(gateway), "image gateway").unwrap();
+        let own = GatewayPlan::Inject {
+            command: vec![GUEST_INIT.to_string(), "--serve".to_string()],
+        };
+        rt.stage_rootfs_dir(&dir, &inst, &env, None, &own).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(gateway)).unwrap(),
+            "image gateway"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(WRAP_FILE)).unwrap(),
+            "[\"/usr/local/bin/warren-gateway\",\"--serve\"]\n"
+        );
+
+        // No --gateway-bin: a foreign image is refused before anything is
+        // staged; a system image, or a workspace image with its own gateway,
+        // still works.
+        let rt = FirecrackerRuntime::new(test_config(tmp.path()))
+            .await
+            .unwrap();
+        assert_eq!(rt.config().gateway_bin, None);
+        let dir = tmp.path().join("bare");
+        fake_export(&dir);
+        let err = rt
+            .stage_rootfs_dir(&dir, &inst, &env, None, &plan)
+            .unwrap_err();
+        assert_eq!(err.code, CODE_NOT_SUPPORTED);
+        assert!(err.message.contains("--gateway-bin"), "{}", err.message);
+        assert!(!dir.join(WRAP_FILE).exists() && !dir.join("etc/hostname").exists());
+        rt.stage_rootfs_dir(&dir, &inst, &env, None, &GatewayPlan::ImageProvides)
+            .unwrap();
+        assert!(dir.join("etc/hostname").is_file());
+        std::fs::create_dir_all(dir.join("usr/local/bin")).unwrap();
+        std::fs::write(dir.join(gateway), "image gateway").unwrap();
+        rt.stage_rootfs_dir(&dir, &inst, &env, None, &plan).unwrap();
+        assert!(dir.join(WRAP_FILE).is_file());
+    }
+
+    /// Workspace templates come from images without a gateway: the daemon's
+    /// static binary is injected and the image's command recorded, across
+    /// create, recreate, restore and fork; system templates are left alone.
+    /// Needs Docker and e2fsprogs, not root.
+    #[tokio::test]
+    async fn workspace_images_get_the_gateway_with_docker() {
+        let Some(image) = docker_test_image().await else {
+            eprintln!("skipping: docker unavailable");
+            return;
+        };
+        if !have_e2fsprogs() {
+            eprintln!("skipping: e2fsprogs not installed");
+            return;
+        }
+        let tmp = TempDir::new("fc-inject");
+        let fake_gateway = tmp.path().join("warren-gateway");
+        std::fs::write(&fake_gateway, "#!/bin/sh\necho fake static gateway\n").unwrap();
+        let mut cfg = test_config(tmp.path());
+        cfg.gateway_bin = Some(fake_gateway);
+        let rt = FirecrackerRuntime::new(cfg).await.unwrap();
+        let mut tpl = template(&image);
+        tpl.name = "my-image".into();
+        tpl.scope = TemplateScope::Workspace;
+        let command = image::inspect_command(&image).await.unwrap();
+        if image == "alpine:3.20" {
+            assert_eq!(command, vec!["/bin/sh"]);
+        }
+        let wrap = inject::render_wrap(&command);
+        let wrap_path = format!("/{WRAP_FILE}");
+
+        let mut inst = instance("ws12cd34ef", &tpl);
+        rt.create(&mut inst, &tpl).await.unwrap();
+        let p = rt.paths(&inst);
+        assert_eq!(
+            rootfs::stat_mode(&p.rootfs(), GUEST_INIT).await.unwrap(),
+            Some(0o755)
+        );
+        assert_eq!(
+            rootfs::cat(&p.rootfs(), &wrap_path)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(wrap.as_str())
+        );
+        assert!(
+            rootfs::exists(&p.rootfs(), "/etc/warren.env")
+                .await
+                .unwrap()
+        );
+
+        // A new revision injects again; a restore has no template at hand and
+        // takes the decision from the image it replaces.
+        rt.recreate(&mut inst, &tpl).await.unwrap();
+        assert!(rootfs::exists(&p.rootfs(), GUEST_INIT).await.unwrap());
+        let backup = tmp.path().join("b.tar.gz");
+        rt.backup_storage(&inst, &backup).await.unwrap();
+        rt.restore_storage(&inst, &backup).await.unwrap();
+        assert_eq!(
+            rootfs::stat_mode(&p.rootfs(), GUEST_INIT).await.unwrap(),
+            Some(0o755)
+        );
+        assert_eq!(
+            rootfs::cat(&p.rootfs(), &wrap_path)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(wrap.as_str())
+        );
+
+        // A fork copies the disk, gateway included, and create adopts it as is.
+        let mut dst = instance("ws98zz98zz", &tpl);
+        rt.clone_storage(&inst, &mut dst).await.unwrap();
+        rt.create(&mut dst, &tpl).await.unwrap();
+        let dp = rt.paths(&dst);
+        assert!(rootfs::exists(&dp.rootfs(), GUEST_INIT).await.unwrap());
+        assert_eq!(
+            rootfs::cat(&dp.rootfs(), &wrap_path)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(wrap.as_str())
+        );
+
+        // The same image under a system template: the daemon says it ships the
+        // gateway, so nothing is injected and no wrap file is written.
+        let sys_tpl = template(&image);
+        let mut sys = instance("sy12cd34ef", &sys_tpl);
+        rt.create(&mut sys, &sys_tpl).await.unwrap();
+        let sp = rt.paths(&sys);
+        assert!(!rootfs::exists(&sp.rootfs(), GUEST_INIT).await.unwrap());
+        assert!(!rootfs::exists(&sp.rootfs(), &wrap_path).await.unwrap());
+
+        // Without --gateway-bin a workspace image cannot become a VM, and the
+        // failed build leaves nothing behind.
+        let bare_rt = FirecrackerRuntime::new(test_config(tmp.path()))
+            .await
+            .unwrap();
+        let mut bare = instance("no12cd34ef", &tpl);
+        let err = bare_rt.create(&mut bare, &tpl).await.unwrap_err();
+        assert_eq!(err.code, CODE_NOT_SUPPORTED);
+        assert!(err.message.contains("--gateway-bin"), "{}", err.message);
+        let bp = bare_rt.paths(&bare);
+        assert!(!bp.rootfs().exists() && !bp.rootfs_tmp().exists() && !bp.rootfs_dir().exists());
+
+        for (r, i) in [(&rt, &inst), (&rt, &dst), (&rt, &sys), (&bare_rt, &bare)] {
+            r.destroy(i, true).await.unwrap();
+        }
+        assert!(!p.root.exists() && !dp.root.exists() && !sp.root.exists() && !bp.root.exists());
     }
 }

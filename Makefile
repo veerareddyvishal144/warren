@@ -1,16 +1,23 @@
 SHELL := /bin/bash
-BIN := target/release
+BIN := $(or $(CARGO_TARGET_DIR),target)/release
 
-.PHONY: all build gateway images test e2e e2e-vm dev-up clippy fmt clean
+.PHONY: all build gateway musl-setup images test e2e e2e-vm dev-up clippy fmt clean
 
 all: build
 
-build: ## Build warrend, warren, warren-gateway, warren-mcp (release)
-	cargo build --release -p warrend -p warren-cli -p warren-gateway -p warren-mcp
+build: gateway ## Build warrend, warren, warren-mcp (release) and the static gateway
+	cargo build --release --locked -p warrend -p warren-cli -p warren-mcp
 
-gateway: ## Static-enough gateway binary for the template images (glibc, Debian bookworm compatible)
-	cargo build --release -p warren-gateway
-	mkdir -p images/.build && cp $(BIN)/warren-gateway images/.build/warren-gateway
+MUSL := x86_64-unknown-linux-musl
+TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
+
+gateway: ## Fully static gateway binary (musl) used by the template images and injected into registered images
+	CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --locked -p warren-gateway --target $(MUSL)
+	mkdir -p images/.build && cp $(TARGET_DIR)/$(MUSL)/release/warren-gateway images/.build/warren-gateway
+
+musl-setup: ## One-time: the musl C compiler and Rust target the gateway build needs
+	sudo apt-get install -y musl-tools
+	rustup target add $(MUSL)
 
 images: gateway ## Build the built-in template images (warren/base, warren/agent, warren/opencode)
 	./scripts/build-images.sh

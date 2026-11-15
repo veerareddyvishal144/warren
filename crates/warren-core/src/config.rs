@@ -19,6 +19,9 @@ pub struct Config {
     pub enable_firecracker: bool,
     pub firecracker_bin: PathBuf,
     pub kernel_image: Option<PathBuf>,
+    /// The static `warren-gateway` binary the runtimes inject into images that do
+    /// not ship it (registered workspace templates). None disables injection.
+    pub gateway_bin: Option<PathBuf>,
     /// Dev top-ups without a payment provider, short idle timeouts, host.docker.internal.
     pub dev_mode: bool,
     pub free_credit_micros: Money,
@@ -45,6 +48,7 @@ impl Default for Config {
             enable_firecracker: false,
             firecracker_bin: PathBuf::from("/usr/local/bin/firecracker"),
             kernel_image: None,
+            gateway_bin: None,
             dev_mode: false,
             free_credit_micros: 5 * MICROS_PER_DOLLAR,
             min_idle_timeout_sec: MIN_IDLE_TIMEOUT_SEC,
@@ -212,6 +216,31 @@ impl Config {
                 ..Default::default()
             },
         ]
+    }
+
+    /// Where injected gateways are mounted inside a container or placed in a VM
+    /// rootfs. The path is outside any home so it can never collide with user files.
+    pub const INJECTED_GATEWAY_PATH: &'static str = "/warren/warren-gateway";
+
+    /// Resolve the gateway binary: an explicit setting wins; otherwise a
+    /// `warren-gateway` next to the running executable, then
+    /// `/usr/local/bin/warren-gateway`. Returns None when nothing exists.
+    pub fn resolve_gateway_bin(explicit: Option<PathBuf>) -> Option<PathBuf> {
+        if let Some(p) = explicit {
+            return Some(p);
+        }
+        let mut candidates = Vec::new();
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            candidates.push(dir.join("warren-gateway"));
+            // Developer checkouts: target/release/warrend next to the musl target dir.
+            if let Some(target) = dir.parent() {
+                candidates.push(target.join("x86_64-unknown-linux-musl/release/warren-gateway"));
+            }
+        }
+        candidates.push(PathBuf::from("/usr/local/bin/warren-gateway"));
+        candidates.into_iter().find(|p| p.is_file())
     }
 
     pub fn instances_dir(&self) -> PathBuf {

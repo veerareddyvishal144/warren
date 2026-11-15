@@ -55,6 +55,10 @@ struct Args {
     firecracker_bin: PathBuf,
     #[arg(long, env = "WARREN_KERNEL_IMAGE")]
     kernel: Option<PathBuf>,
+    /// Static warren-gateway binary injected into registered images; found next to
+    /// warrend or in /usr/local/bin when unset.
+    #[arg(long, env = "WARREN_GATEWAY_BIN")]
+    gateway_bin: Option<PathBuf>,
     /// HMAC secret for signed URLs; generated into the data dir when unset.
     #[arg(long, env = "WARREN_SECRET")]
     secret: Option<String>,
@@ -90,6 +94,7 @@ impl Args {
             enable_firecracker: self.firecracker,
             firecracker_bin: self.firecracker_bin,
             kernel_image: self.kernel,
+            gateway_bin: Config::resolve_gateway_bin(self.gateway_bin),
             secret: self.secret.unwrap_or_default(),
             meter_interval: Duration::from(self.meter_interval),
             image_tag: self.image_tag,
@@ -211,6 +216,14 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
+    match &cfg.gateway_bin {
+        Some(p) => {
+            tracing::info!(path = %p.display(), "gateway injection enabled for registered images")
+        }
+        None => tracing::warn!(
+            "no warren-gateway binary found; registered images that do not ship the gateway will not start (set --gateway-bin)"
+        ),
+    }
     tracing::info!(addr = %addr, api = %cfg.api_url(), base_domain = %cfg.base_domain, dev_mode = cfg.dev_mode, version = %cfg.version, "warrend listening");
     let server_shutdown = shutdown.clone();
     tasks.spawn(async move {

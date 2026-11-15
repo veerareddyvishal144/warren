@@ -2,11 +2,13 @@
 //! `#[ignore]`d; run them with
 //! `cargo test -p warren-e2e -- --ignored --test-threads=1` or `scripts/e2e.sh`.
 //!
-//! Each test starts its own daemon on a free port with a fresh data directory,
-//! signs up its own workspace, deletes the instances it created (also after a
-//! failure) and prints the daemon log tail when it fails. The template images
-//! (`warren/base:dev`, `warren/agent:dev`) must exist locally; `alpine:3.20`
-//! is pulled by the daemon when the templates test registers it.
+//! Each test starts its own daemon on a free port with a fresh data directory
+//! and the static gateway as `--gateway-bin`, signs up its own workspace,
+//! deletes the instances it created (also after a failure) and prints the
+//! daemon log tail when it fails. The template images (`warren/base:dev`,
+//! `warren/agent:dev`) must exist locally; `alpine:3.20` and
+//! `node:24-bookworm-slim` are pulled by the daemon when the templates test
+//! registers them (`scripts/e2e.sh` pulls them beforehand).
 
 use std::{
     collections::BTreeMap, future::Future, panic::AssertUnwindSafe, sync::Arc, time::Duration,
@@ -14,9 +16,9 @@ use std::{
 
 use futures::{FutureExt, StreamExt};
 use reqwest::Method;
-use serde_json::json;
+use serde_json::{Value, json};
 use warren_core::{
-    COOKIE_NAME, CreateInstanceRequest, ENV_AGENT_DRIVER, Error, ExecRequest, ForkRequest,
+    COOKIE_NAME, Config, CreateInstanceRequest, ENV_AGENT_DRIVER, Error, ExecRequest, ForkRequest,
     GATEWAY_PORT, Instance, InstanceStatus, InstanceType, LedgerKind, MICROS_PER_DOLLAR,
     PatchInstanceRequest, RegisterTemplateRequest, Result, Shape, ShapeRequest, TERMINAL_PORT,
     TemplateScope,
@@ -121,6 +123,17 @@ fn expect_api_error<T: std::fmt::Debug>(
             "{what}: expected {status} {code}, got success: {v:?}"
         ))),
     }
+}
+
+/// Read a gateway `GET /v1/health` answer: it must be `200` with
+/// `"healthy": true`; the whole document is returned for further checks
+/// (for example the `wrapped` object of an injected gateway).
+async fn health_json(resp: reqwest::Response) -> Result<Value> {
+    let body = expect_status(resp, 200, None).await?;
+    let health: Value =
+        serde_json::from_slice(&body).map_err(|e| fail(format!("gateway health JSON: {e}")))?;
+    ensure!(health["healthy"] == true, "gateway health: {health}");
+    Ok(health)
 }
 
 /// Drain an SDK event stream within `timeout`.
@@ -1628,7 +1641,9 @@ async fn templates() {
 }
 
 async fn templates_body(cx: Ctx) -> Result<()> {
+    let d = &cx.daemon;
     let sdk = cx.ws.sdk();
+    let key = cx.ws.api_key();
     let catalog = sdk.templates().await?;
     let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
     for name in ["warren-base", "warren-agent", "warren-opencode"] {
@@ -1720,7 +1735,11 @@ async fn templates_body(cx: Ctx) -> Result<()> {
         listed.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
 
-    // An instance from it: exec works, the bare URL has no default port, crons need an agent.
+    // An instance from it. alpine:3.20 ships no gateway and no long-running
+    // process: its /bin/sh exits at once without a stdin. The daemon injects the
+    // static gateway at Config::INJECTED_GATEWAY_PATH and runs it as the
+    // entrypoint in wrap mode, where it supervises sh as a child and keeps
+    // serving, so the instance reaches running and exec works.
     let inst = cx.ws.create_and_wait("e2e-alpine", &[]).await?;
     let id = inst.id.as_str();
     ensure!(
@@ -1736,7 +1755,7 @@ async fn templates_body(cx: Ctx) -> Result<()> {
     );
     let r = sdk.exec(id, &cmd("cat /etc/alpine-release")).await?;
     ensure!(
-        r.exit_code == 0 && r.stdout.starts_with("3.20"),
+        r.exit_code == 0 && r.stdout.contains("3.20"),
         "alpine release: {r:?}"
     );
     let r = sdk
@@ -1746,16 +1765,84 @@ async fn templates_body(cx: Ctx) -> Result<()> {
         r.exit_code == 0 && r.stdout.contains("from-e2e"),
         "the mount path is writable: {r:?}"
     );
-    let resp = cx
-        .ws
-        .edge(id)
-        .get(0, "/", Auth::Key(cx.ws.api_key()))
+    let r = sdk
+        .exec(
+            id,
+            &ExecRequest {
+                command: format!("test -f {}", Config::INJECTED_GATEWAY_PATH),
+                user: "root".into(),
+                ..Default::default()
+            },
+        )
         .await?;
+    ensure!(
+        r.exit_code == 0,
+        "the gateway is injected at {}: {r:?}",
+        Config::INJECTED_GATEWAY_PATH
+    );
+
+    // default_port 0: the bare URL serves nothing, <id>-3737 reaches the
+    // injected gateway, whose health reports the wrapped entrypoint. sh has
+    // usually exited (code 0) by the time the daemon sees the gateway healthy;
+    // poll for `running: false` to cover the race and accept any exit code.
+    let edge = cx.ws.edge(id);
+    let resp = edge.get(0, "/", Auth::Key(key)).await?;
     let body = expect_status(resp, 502, None).await?;
     ensure!(
         String::from_utf8_lossy(&body).contains("no default port"),
         "502 text: {}",
         String::from_utf8_lossy(&body)
+    );
+    let edge_ref = &edge;
+    let health = poll_until(
+        "the wrapped entrypoint of the alpine instance to exit",
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        || async move {
+            let resp = edge_ref
+                .get(GATEWAY_PORT, "/v1/health", Auth::Key(key))
+                .await?;
+            let health = health_json(resp).await?;
+            let wrapped = &health["wrapped"];
+            ensure!(
+                wrapped.is_object(),
+                "the health of an injected gateway carries `wrapped`: {health}"
+            );
+            Ok::<_, Error>((wrapped["running"] == false).then_some(health))
+        },
+    )
+    .await?;
+    let exit_code = &health["wrapped"]["exit_code"];
+    ensure!(
+        exit_code.is_null() || exit_code.is_i64(),
+        "wrapped.exit_code is an integer or null: {health}"
+    );
+
+    // The files API works through the preview URL, confined to the mount path.
+    let files = cx.ws.agent_on_port(id, GATEWAY_PORT)?;
+    let put = files
+        .write_file("e2e/hello.txt", b"hello from alpine".to_vec())
+        .await?;
+    ensure!(
+        put.path == "e2e/hello.txt" && put.size == 17,
+        "put through <id>-3737: {put:?}"
+    );
+    ensure!(
+        files.read_file("e2e/hello.txt").await? == b"hello from alpine",
+        "read back through <id>-3737"
+    );
+    let listing = files.list_files("e2e").await?;
+    ensure!(
+        listing
+            .entries
+            .iter()
+            .any(|e| e.name == "hello.txt" && e.kind == "file" && e.size == 17),
+        "listing through <id>-3737: {listing:?}"
+    );
+    let r = sdk.exec(id, &cmd("cat /home/e2e/hello.txt")).await?;
+    ensure!(
+        r.stdout == "hello from alpine",
+        "the file landed under /home: {r:?}"
     );
     expect_api_error(
         "cron on a non-agent template",
@@ -1788,6 +1875,59 @@ async fn templates_body(cx: Ctx) -> Result<()> {
         sdk.instance(id).await?.template_revision == 1,
         "the instance keeps its revision"
     );
+
+    // A registered image with a default port: node:24-bookworm-slim ships no
+    // gateway either and its CMD (`node`) exits at once without a stdin. With
+    // default_port 3737 the bare instance URL reaches the injected gateway.
+    let node_req = RegisterTemplateRequest {
+        name: "e2e-node".into(),
+        image_ref: "node:24-bookworm-slim".into(),
+        default_port: GATEWAY_PORT,
+        mount_path: "/home/node".into(),
+        agent: false,
+        description: "node for the e2e suite".into(),
+        env: BTreeMap::new(),
+    };
+    let node_tpl = sdk.register_template(&node_req).await?;
+    ensure!(
+        node_tpl.default_port == GATEWAY_PORT && node_tpl.revision == 1,
+        "registered node: {node_tpl:?}"
+    );
+    let node = cx.ws.create_and_wait("e2e-node", &[]).await?;
+    let node_id = node.id.as_str();
+    ensure!(
+        node.default_port == GATEWAY_PORT
+            && node.image_ref == "node:24-bookworm-slim"
+            && node.url == d.instance_url(node_id, 0),
+        "node instance: {node:?}"
+    );
+    let resp = cx
+        .ws
+        .edge(node_id)
+        .get(0, "/v1/health", Auth::Key(key))
+        .await?;
+    let health = health_json(resp).await?;
+    ensure!(
+        health["wrapped"].is_object(),
+        "the bare URL of an injected image reaches its gateway: {health}"
+    );
+    let r = sdk.exec(node_id, &cmd("node --version")).await?;
+    ensure!(
+        r.exit_code == 0 && r.stdout.trim().starts_with("v24"),
+        "node --version: {r:?}"
+    );
+    let node_files = cx.ws.agent(node_id)?;
+    node_files
+        .write_file("hello.js", b"console.log('hi')".to_vec())
+        .await?;
+    let r = sdk.exec(node_id, &cmd("node /home/node/hello.js")).await?;
+    ensure!(
+        r.stdout.trim() == "hi",
+        "a file written through the bare URL runs under the mount path: {r:?}"
+    );
+    cx.ws.delete_and_wait(node_id).await?;
+    let deleted = sdk.delete_template("e2e-node").await?;
+    ensure!(deleted.deleted, "delete the node template: {deleted:?}");
 
     cx.ws.delete_and_wait(id).await?;
     let deleted = sdk.delete_template("e2e-alpine").await?;

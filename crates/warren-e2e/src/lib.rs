@@ -10,6 +10,10 @@
 //!
 //! Environment knobs:
 //! - `WARREN_BIN`: the daemon binary (default `<repo>/target/release/warrend`).
+//! - `WARREN_GATEWAY_BIN`: the static (musl) gateway every daemon gets as
+//!   `--gateway-bin` and injects into registered images (default
+//!   `<repo>/target/x86_64-unknown-linux-musl/release/warren-gateway`, then
+//!   `<repo>/target-musl/...`); starting a daemon fails when none exists.
 //! - `WARREN_E2E_VM=1`: start the daemon with `--firecracker --kernel ...` and
 //!   run the vm scenario (`WARREN_E2E_KERNEL`, `WARREN_E2E_FIRECRACKER_BIN`).
 //! - `WARREN_E2E_KEEP=1`: keep each daemon's data dir and log after the test.
@@ -27,7 +31,9 @@ pub mod edge;
 pub mod util;
 pub mod workspace;
 
-pub use daemon::{Daemon, METER_INTERVAL, MIN_IDLE_SECONDS};
+pub use daemon::{
+    DEFAULT_GATEWAY_BINS, Daemon, METER_INTERVAL, MIN_IDLE_SECONDS, MUSL_GATEWAY_REL,
+};
 pub use edge::{Auth, Edge, expect_status, header, read_ok, session_cookie};
 pub use util::{
     CODE_E2E, api_error, cookie_value, encode_query, fail, host_of, now_unix, poll_until,

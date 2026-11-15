@@ -15,7 +15,7 @@ Warren is a single Rust binary (`warrend`) that runs the whole platform on one L
 | Agent API | `POST /v1/responses` with sessions, SSE streaming, cancel and replay, on the built-in agent (any OpenAI-compatible model), OpenCode, or your own command. |
 | Files and exec | List, read, write, move, delete and download the home directory over HTTP; run shell commands with a captured exit code, stdout and stderr. |
 | Browser terminal | `ttyd` on port 7681 inside every instance, opened with a signed URL from the dashboard or the API. |
-| Templates | Three built-in images plus your own: register an image, publish revisions, pin instances to `name@rev`, update in place. |
+| Templates | Three built-in images plus your own: register any Linux image (Alpine included) and Warren injects its static gateway and wraps the image's own entrypoint, so files, exec and health work without changing the image. Publish revisions, pin instances to `name@rev`, update in place. |
 | Fork, backup, restore, resize | Copy an instance with its disk, take backups without stopping, restore, grow the disk or change the shape. |
 | Crons | Scheduled prompts for agent instances; each firing wakes the instance and runs one turn. |
 | Prepaid metering | Per-minute charges from monthly list prices, a $5 welcome credit, a ledger, awake-instance limits that grow with top-ups. |

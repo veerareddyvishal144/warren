@@ -52,16 +52,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release
-      - name: Build the gateway (release)
-        run: cargo build --release --locked -p warren-gateway
+      - name: Install the musl toolchain for the static gateway
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build the gateway (release, static musl)
+        run: CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --locked -p warren-gateway --target x86_64-unknown-linux-musl
       - name: Prepare the paths scripts/env.sh expects
         # build-images.sh sources scripts/env.sh, which creates /data/tmp; the runner has no /data.
         run: sudo mkdir -p /data/tmp && sudo chmod 1777 /data/tmp
       - name: Build warren/base, warren/agent and warren/opencode
         run: |
-          bin=target/release/warren-gateway
-          [ -x "$bin" ] || bin=target/release/gateway
-          WARREN_GATEWAY_BIN="$bin" scripts/build-images.sh
+          WARREN_GATEWAY_BIN=target/x86_64-unknown-linux-musl/release/warren-gateway scripts/build-images.sh
       - name: Save the images
         run: docker save "warren/base:$WARREN_IMAGE_TAG" "warren/agent:$WARREN_IMAGE_TAG" "warren/opencode:$WARREN_IMAGE_TAG" | gzip -1 > warren-images.tar.gz
       - uses: actions/upload-artifact@v4
@@ -96,10 +98,17 @@ jobs:
           else
             echo "::warning::gVisor could not be installed on this runner; the e2e suite runs instances under runc"
           fi
-      - name: Build warrend and the gateway (release)
-        run: cargo build --release --locked -p warrend -p warren-gateway
+      - name: Install the musl toolchain for the static gateway
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build warrend (release) and the static gateway the daemon injects into registered images
+        run: |
+          cargo build --release --locked -p warrend
+          CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --locked -p warren-gateway --target x86_64-unknown-linux-musl
       - name: Run the end-to-end suite
         env:
           WARREN_BIN: ${{ github.workspace }}/target/release/warrend
+          WARREN_GATEWAY_BIN: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/warren-gateway
           WARREN_E2E_LOG: info
         run: cargo test --locked -p warren-e2e -- --ignored --test-threads=1 --skip vm_

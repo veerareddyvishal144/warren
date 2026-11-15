@@ -8,7 +8,7 @@ cargo build --workspace        # shared target dir: /data/warren/target
 cargo test -p warren-core
 ```
 
-Rust 1.99, edition 2024. Dependencies are pinned in the root `Cargo.toml` under `[workspace.dependencies]`; every crate's `Cargo.toml` lists what it may use. Do not add dependencies or edit any `Cargo.toml` or `Cargo.lock` without agreement: build with `--locked`. If an API needs something not declared, implement it with `std` or a declared crate, or report the need.
+Rust 1.99, edition 2024. The in-instance gateway is built fully static for `x86_64-unknown-linux-musl` so it runs in any Linux image (Debian, Alpine, distroless); install `musl-tools` and `rustup target add x86_64-unknown-linux-musl` once (`make musl-setup`), then `make gateway`. Dependencies are pinned in the root `Cargo.toml` under `[workspace.dependencies]`; every crate's `Cargo.toml` lists what it may use. Do not add dependencies or edit any `Cargo.toml` or `Cargo.lock` without agreement: build with `--locked`. If an API needs something not declared, implement it with `std` or a declared crate, or report the need.
 
 Exact dependency sources are on disk at `/data/cargo/registry/src/*/<crate>-<version>/`. When an API does not match your memory, grep the source of the pinned version instead of guessing; several crates (reqwest 0.13, bollard 0.21, rusqlite 0.43, rand/sha2/hmac/base64 current majors, rmcp 3) changed their APIs recently.
 

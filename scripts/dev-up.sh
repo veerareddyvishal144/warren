@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Build warrend (release) and run it in dev mode with data under ./data.
+# Build warrend (release) and the static gateway, then run warrend in dev mode
+# with data under ./data.
 #
 # Usage: scripts/dev-up.sh [--no-build] [-- <extra warrend flags>]
-#   --no-build   run the binary already in $CARGO_TARGET_DIR/release (or $WARREN_BIN)
+#   --no-build   run the binaries already there: $CARGO_TARGET_DIR/release/warrend
+#                (or $WARREN_BIN) and the static gateway (see WARREN_GATEWAY_BIN)
 #
 # Environment:
 #   WARREN_PORT         listen and public port (default 7337)
@@ -11,6 +13,10 @@
 #   WARREN_LOG          log filter (default info)
 #   WARREN_IMAGE_TAG    tag of the built-in images (default dev)
 #   WARREN_BIN          daemon binary (default $CARGO_TARGET_DIR/release/warrend)
+#   WARREN_GATEWAY_BIN  static (musl) warren-gateway the daemon injects into registered
+#                       images, passed as --gateway-bin (default
+#                       $CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/warren-gateway,
+#                       built with `make gateway` when missing; `make musl-setup` once)
 #
 # Dev mode means: dev top-ups through POST /v1/billing/top-up, a 5 s minimum
 # idle timeout and host.docker.internal for instances. Stop with Ctrl-C.
@@ -40,13 +46,29 @@ PORT="${WARREN_PORT:-7337}"
 DATA="${WARREN_DATA_DIR:-$ROOT/data}"
 BASE="${WARREN_BASE_DOMAIN:-warren.localhost}"
 TAG="${WARREN_IMAGE_TAG:-dev}"
+GATEWAY="${WARREN_GATEWAY_BIN:-$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/warren-gateway}"
 
 if [ "$BUILD" = 1 ]; then
     log "building warrend (release) into $CARGO_TARGET_DIR"
     cargo build --release --locked -p warrend
+    if [ -z "${WARREN_GATEWAY_BIN:-}" ] && [ ! -x "$GATEWAY" ]; then
+        log "building the static gateway (make gateway)"
+        make -C "$ROOT" gateway
+    fi
 fi
 BIN="${WARREN_BIN:-$CARGO_TARGET_DIR/release/warrend}"
 [ -x "$BIN" ] || die "$BIN not found; run without --no-build or set WARREN_BIN"
+
+# The daemon injects this binary into registered images that do not ship the
+# gateway; without it such instances cannot start (the daemon warns at startup).
+GATEWAY_FLAGS=()
+if [ -x "$GATEWAY" ]; then
+    GATEWAY_FLAGS=(--gateway-bin "$GATEWAY")
+elif [ -n "${WARREN_GATEWAY_BIN:-}" ]; then
+    die "WARREN_GATEWAY_BIN=$WARREN_GATEWAY_BIN is not an executable file"
+else
+    log "warning: no static gateway at $GATEWAY; registered images that do not ship the gateway will not start (run 'make gateway' or set WARREN_GATEWAY_BIN)"
+fi
 
 command -v docker >/dev/null 2>&1 || die "docker is not installed or not on PATH"
 docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon"
@@ -60,6 +82,9 @@ echo "  Dashboard:  http://$BASE:$PORT/"
 echo "  API:        http://api.$BASE:$PORT/v1/health"
 echo "  Instances:  http://<id>.$BASE:$PORT/   (preview ports: http://<id>-<port>.$BASE:$PORT/)"
 echo "  Data:       $DATA"
+if [ ${#GATEWAY_FLAGS[@]} -gt 0 ]; then
+    echo "  Gateway:    $GATEWAY   (injected into registered images)"
+fi
 echo
 echo "  First steps: curl -s -X POST http://api.$BASE:$PORT/v1/signup | jq ."
 echo "  See docs/TESTING.md for a curl walkthrough of every feature."
@@ -72,4 +97,5 @@ exec "$BIN" --dev \
     --base-domain "$BASE" \
     --image-tag "$TAG" \
     --log "${WARREN_LOG:-info}" \
+    "${GATEWAY_FLAGS[@]}" \
     "${EXTRA[@]}"
