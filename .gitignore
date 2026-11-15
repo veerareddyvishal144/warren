@@ -1,0 +1,13 @@
+/bin/
+/images/.build/
+/data/
+*.ext4
+*.squashfs
+vmlinux*
+firecracker
+node_modules/
+__pycache__/
+*.log
+.DS_Store
+/target/
+/target-*/

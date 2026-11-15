@@ -1,0 +1,31 @@
+[package]
+name = "warrend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "warrend"
+path = "src/main.rs"
+
+[dependencies]
+warren-core.workspace = true
+warren-store.workspace = true
+warren-runtime-docker.workspace = true
+warren-runtime-firecracker.workspace = true
+warren-templates.workspace = true
+warren-billing.workspace = true
+warren-lifecycle.workspace = true
+warren-edge.workspace = true
+warren-api.workspace = true
+warren-cron.workspace = true
+warren-dashboard.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+axum.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+humantime.workspace = true

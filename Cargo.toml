@@ -1,0 +1,73 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/veerareddyvishal144/warren"
+rust-version = "1.90"
+
+[workspace.dependencies]
+warren-core = { path = "crates/warren-core" }
+warren-store = { path = "crates/warren-store" }
+warren-runtime-docker = { path = "crates/warren-runtime-docker" }
+warren-runtime-firecracker = { path = "crates/warren-runtime-firecracker" }
+warren-templates = { path = "crates/warren-templates" }
+warren-billing = { path = "crates/warren-billing" }
+warren-lifecycle = { path = "crates/warren-lifecycle" }
+warren-edge = { path = "crates/warren-edge" }
+warren-api = { path = "crates/warren-api" }
+warren-cron = { path = "crates/warren-cron" }
+warren-dashboard = { path = "crates/warren-dashboard" }
+warren-sdk = { path = "crates/warren-sdk" }
+
+tokio = { version = "1.54", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
+axum-extra = { version = "0.12", features = ["cookie", "typed-header"] }
+hyper = { version = "1.12", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+http = "1.5"
+bytes = "1.12"
+tower = { version = "0.5", features = ["util", "timeout"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "limit"] }
+bollard = "0.21"
+rusqlite = { version = "0.43", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+sha2 = "0.11"
+hmac = "0.13"
+base64 = "0.23"
+hex = "0.4"
+chrono = { version = "0.4", features = ["clock", "std"] }
+chrono-tz = "0.10"
+cron = "0.17"
+clap = { version = "4.6", features = ["derive", "env"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "charset", "http2"] }
+nix = { version = "0.32", features = ["mount", "reboot", "process", "signal", "fs", "net"] }
+tar = "0.4"
+flate2 = "1.1"
+walkdir = "2.5"
+mime_guess = "2"
+urlencoding = "2"
+parking_lot = "0.13"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+humantime = "2"
+rmcp = { version = "3", features = ["server", "transport-io", "macros"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true

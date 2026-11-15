@@ -1,0 +1,22 @@
+[package]
+name = "warren-runtime-docker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+warren-core.workspace = true
+bollard.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+tar.workspace = true
+flate2.workspace = true
+walkdir.workspace = true
