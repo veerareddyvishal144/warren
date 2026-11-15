@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{ids, ApiKey, Authenticator, Clock, Error, Result, Store, Workspace, HEADER_API_KEY};
+use crate::{ApiKey, Authenticator, Clock, Error, HEADER_API_KEY, Result, Store, Workspace, ids};
 
 pub struct KeyAuthenticator {
     store: Arc<dyn Store>,

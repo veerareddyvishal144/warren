@@ -1,26 +1,26 @@
 //! Instance orchestration across store, runtimes and biller.
-use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
-use warren_core::{Biller, Clock, Config, Result, Runtimes, Store, TemplateService};
+//!
+//! The [`Manager`] is the only component that calls a [`warren_core::Runtime`]
+//! and the only one that moves [`warren_core::Instance::status`]. It implements
+//! [`warren_core::Lifecycle`] for the API, the edge and the cron scheduler, and
+//! [`warren_core::InstanceStopper`] for the biller.
+//!
+//! Every operation on one instance runs under that instance's async mutex, so
+//! concurrent requests serialize per instance and never interleave runtime
+//! calls. Activity is recorded in memory and flushed to the store every 30 s.
+//! [`Manager::run`] reconciles the stored state with the runtimes at startup
+//! and then drives the idle sleeper, the metrics sampler, the activity flush
+//! and the disk-usage refresh until the shutdown token is cancelled.
 
-pub struct Deps {
-    pub store: Arc<dyn Store>,
-    pub runtimes: Runtimes,
-    pub biller: Arc<dyn Biller>,
-    pub templates: Arc<dyn TemplateService>,
-    pub config: Config,
-    pub clock: Arc<dyn Clock>,
-}
+mod loops;
+mod manager;
+mod ops;
+mod validate;
 
-pub struct Manager;
+#[cfg(test)]
+pub(crate) mod fakes;
+#[cfg(test)]
+mod tests;
 
-impl Manager {
-    /// Validate deps and return the manager. Background loops start in `run`.
-    pub fn new(_d: Deps) -> Result<Arc<Manager>> {
-        unimplemented!("lifecycle: not implemented")
-    }
-    /// Reconciler, idle sleeper, metrics sampler and disk refresh until shutdown.
-    pub async fn run(self: Arc<Self>, _shutdown: CancellationToken) -> Result<()> {
-        unimplemented!("lifecycle: not implemented")
-    }
-}
+pub use manager::{Deps, Manager};
+pub use validate::{validate_env, validate_idle_timeout, validate_metadata, validate_name};

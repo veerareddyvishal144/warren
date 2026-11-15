@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, collections::HashMap, sync::Arc, time::Duration
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{types::*, Result};
+use crate::{Result, types::*};
 
 /// Runtimes keyed by the instance type they serve.
 pub type Runtimes = Arc<HashMap<InstanceType, Arc<dyn Runtime>>>;
@@ -20,10 +20,16 @@ pub struct RealClock;
 
 impl Clock for RealClock {
     fn now_unix(&self) -> i64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
     }
     fn now_unix_ms(&self) -> i64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
     }
 }
 
@@ -48,7 +54,12 @@ pub trait Store: Send + Sync {
     /// workspace template increments `revision` and keeps older revisions readable.
     async fn upsert_template(&self, t: &Template) -> Result<()>;
     async fn get_template(&self, workspace_id: &str, name: &str) -> Result<Template>;
-    async fn get_template_revision(&self, workspace_id: &str, name: &str, revision: u32) -> Result<Template>;
+    async fn get_template_revision(
+        &self,
+        workspace_id: &str,
+        name: &str,
+        revision: u32,
+    ) -> Result<Template>;
     async fn list_templates(&self, workspace_id: &str) -> Result<Vec<Template>>;
     async fn delete_template(&self, workspace_id: &str, name: &str) -> Result<()>;
 
@@ -210,14 +221,24 @@ pub trait Lifecycle: Send + Sync {
     async fn create(&self, ws: &Workspace, req: &CreateInstanceRequest) -> Result<Instance>;
     async fn get(&self, workspace_id: &str, id: &str) -> Result<Instance>;
     async fn list(&self, workspace_id: &str) -> Result<Vec<Instance>>;
-    async fn patch(&self, workspace_id: &str, id: &str, req: &PatchInstanceRequest) -> Result<Instance>;
+    async fn patch(
+        &self,
+        workspace_id: &str,
+        id: &str,
+        req: &PatchInstanceRequest,
+    ) -> Result<Instance>;
     async fn start(&self, workspace_id: &str, id: &str) -> Result<Instance>;
     async fn stop(&self, workspace_id: &str, id: &str) -> Result<Instance>;
     async fn sleep(&self, workspace_id: &str, id: &str) -> Result<Instance>;
     async fn restart(&self, workspace_id: &str, id: &str) -> Result<Instance>;
     async fn delete(&self, workspace_id: &str, id: &str) -> Result<()>;
     async fn resize(&self, workspace_id: &str, id: &str, shape: &ShapeRequest) -> Result<Instance>;
-    async fn update(&self, workspace_id: &str, id: &str, template: Option<&str>) -> Result<Instance>;
+    async fn update(
+        &self,
+        workspace_id: &str,
+        id: &str,
+        template: Option<&str>,
+    ) -> Result<Instance>;
     async fn fork(&self, ws: &Workspace, id: &str, req: &ForkRequest) -> Result<Instance>;
     async fn exec(&self, workspace_id: &str, id: &str, req: &ExecRequest) -> Result<ExecResult>;
     async fn logs(&self, workspace_id: &str, id: &str, opts: LogsOptions) -> Result<String>;
@@ -255,7 +276,12 @@ pub trait Biller: Send + Sync {
     async fn assert_can_wake(&self, ws: &Workspace) -> Result<()>;
     fn awake_limit(&self, ws: &Workspace) -> u32;
     async fn top_up(&self, workspace_id: &str, micros: Money, note: &str) -> Result<Workspace>;
-    async fn grant_credit(&self, workspace_id: &str, micros: Money, note: &str) -> Result<Workspace>;
+    async fn grant_credit(
+        &self,
+        workspace_id: &str,
+        micros: Money,
+        note: &str,
+    ) -> Result<Workspace>;
     /// Charge every instance for the minutes elapsed since its `metered_through`,
     /// write ledger entries, stop instances whose wallet is exhausted.
     async fn tick(&self, now: i64) -> Result<()>;
@@ -269,7 +295,8 @@ pub trait TemplateService: Send + Sync {
     async fn resolve(&self, workspace_id: &str, name: &str) -> Result<Template>;
     async fn get(&self, workspace_id: &str, name: &str) -> Result<Template>;
     async fn list(&self, workspace_id: &str) -> Result<Vec<Template>>;
-    async fn register(&self, workspace_id: &str, req: &RegisterTemplateRequest) -> Result<Template>;
+    async fn register(&self, workspace_id: &str, req: &RegisterTemplateRequest)
+    -> Result<Template>;
     async fn delete(&self, workspace_id: &str, name: &str) -> Result<()>;
     /// Seed the built-in catalog at startup.
     async fn ensure_system_templates(&self) -> Result<()>;

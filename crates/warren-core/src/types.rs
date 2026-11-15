@@ -73,7 +73,13 @@ impl InstanceStatus {
     pub fn awake(self) -> bool {
         matches!(
             self,
-            Self::Provisioning | Self::Running | Self::Stopping | Self::Starting | Self::Restarting | Self::Updating | Self::Waking
+            Self::Provisioning
+                | Self::Running
+                | Self::Stopping
+                | Self::Starting
+                | Self::Restarting
+                | Self::Updating
+                | Self::Waking
         )
     }
 
@@ -81,7 +87,10 @@ impl InstanceStatus {
     /// stopped minutes bill disk alone; provisioning is free until the instance
     /// first reaches running (see `Instance::meter_started_at`).
     pub fn bills_compute(self) -> bool {
-        matches!(self, Self::Running | Self::Stopping | Self::Starting | Self::Restarting | Self::Updating)
+        matches!(
+            self,
+            Self::Running | Self::Stopping | Self::Starting | Self::Restarting | Self::Updating
+        )
     }
 
     /// A minute in this state bills the disk rate only.
@@ -375,8 +384,14 @@ impl Instance {
         env.insert(ENV_WORKSPACE_ID.into(), self.workspace_id.clone());
         env.insert(ENV_HOME.into(), self.mount_path.clone());
         env.insert(ENV_GATEWAY_PORT.into(), GATEWAY_PORT.to_string());
-        env.insert(ENV_BUDGET_MONTHLY.into(), self.budget.monthly_cap_micros.to_string());
-        env.insert(ENV_BUDGET_CREDIT.into(), self.budget.credit_micros.to_string());
+        env.insert(
+            ENV_BUDGET_MONTHLY.into(),
+            self.budget.monthly_cap_micros.to_string(),
+        );
+        env.insert(
+            ENV_BUDGET_CREDIT.into(),
+            self.budget.credit_micros.to_string(),
+        );
         env
     }
 }
@@ -548,7 +563,13 @@ pub struct Rates {
 impl Default for Rates {
     /// $0.80 per vCPU-month, $0.70 per GB RAM, $0.09 per GB disk, VM 2.5x, performance 4x.
     fn default() -> Self {
-        Rates { vcpu_month_micros: 800_000, ram_gb_month_micros: 700_000, disk_gb_month_micros: 90_000, vm_multiplier: 2.5, performance_multiplier: 4.0 }
+        Rates {
+            vcpu_month_micros: 800_000,
+            ram_gb_month_micros: 700_000,
+            disk_gb_month_micros: 90_000,
+            vm_multiplier: 2.5,
+            performance_multiplier: 4.0,
+        }
     }
 }
 
@@ -562,7 +583,8 @@ impl Rates {
     }
     /// Monthly price of a running instance of this shape and type.
     pub fn monthly_running(&self, shape: Shape, t: InstanceType) -> Money {
-        let compute = shape.cpu as f64 * self.vcpu_month_micros as f64 + shape.memory as f64 * self.ram_gb_month_micros as f64;
+        let compute = shape.cpu as f64 * self.vcpu_month_micros as f64
+            + shape.memory as f64 * self.ram_gb_month_micros as f64;
         (compute * self.multiplier(t)).round() as Money + self.monthly_disk(shape)
     }
     /// Monthly price of the disk alone.

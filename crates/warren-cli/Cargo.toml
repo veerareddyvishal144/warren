@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "cli"
+name = "warren"
 path = "src/main.rs"
 
 [dependencies]

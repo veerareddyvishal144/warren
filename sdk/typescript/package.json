@@ -1,0 +1,33 @@
+{
+  "name": "warren-sdk",
+  "version": "0.1.0",
+  "description": "One-file TypeScript client for the Warren Sandbox API and Agent API (fetch-based, Node 20+ and browsers)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/veerareddyvishal144/warren",
+    "directory": "sdk/typescript"
+  },
+  "type": "module",
+  "main": "./warren.ts",
+  "types": "./warren.ts",
+  "exports": {
+    ".": "./warren.ts"
+  },
+  "files": [
+    "warren.ts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test warren.test.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

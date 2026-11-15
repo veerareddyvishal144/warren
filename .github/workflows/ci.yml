@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # Tag the images and the daemon agree on (scripts/build-images.sh and warrend default to "dev").
+  WARREN_IMAGE_TAG: dev
+
+jobs:
+  fmt-clippy:
+    name: fmt and clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (every crate except warren-e2e)
+        run: cargo test --workspace --exclude warren-e2e --locked
+
+  images:
+    name: template images
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+      - name: Build the gateway (release)
+        run: cargo build --release --locked -p warren-gateway
+      - name: Prepare the paths scripts/env.sh expects
+        # build-images.sh sources scripts/env.sh, which creates /data/tmp; the runner has no /data.
+        run: sudo mkdir -p /data/tmp && sudo chmod 1777 /data/tmp
+      - name: Build warren/base, warren/agent and warren/opencode
+        run: |
+          bin=target/release/warren-gateway
+          [ -x "$bin" ] || bin=target/release/gateway
+          WARREN_GATEWAY_BIN="$bin" scripts/build-images.sh
+      - name: Save the images
+        run: docker save "warren/base:$WARREN_IMAGE_TAG" "warren/agent:$WARREN_IMAGE_TAG" "warren/opencode:$WARREN_IMAGE_TAG" | gzip -1 > warren-images.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: warren-images
+          path: warren-images.tar.gz
+          retention-days: 1
+          compression-level: 0
+
+  e2e:
+    name: end-to-end
+    needs: images
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+      - uses: actions/download-artifact@v4
+        with:
+          name: warren-images
+      - name: Load the images
+        run: |
+          docker load < warren-images.tar.gz
+          docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep '^warren/'
+      - name: Install gVisor (falls back to runc)
+        run: |
+          if sudo scripts/install-gvisor.sh; then
+            echo "gVisor installed; instances run under runsc"
+          else
+            echo "::warning::gVisor could not be installed on this runner; the e2e suite runs instances under runc"
+          fi
+      - name: Build warrend and the gateway (release)
+        run: cargo build --release --locked -p warrend -p warren-gateway
+      - name: Run the end-to-end suite
+        env:
+          WARREN_BIN: ${{ github.workspace }}/target/release/warrend
+          WARREN_E2E_LOG: info
+        run: cargo test --locked -p warren-e2e -- --ignored --test-threads=1 --skip vm_

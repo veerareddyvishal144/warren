@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
-use crate::{types::*, InstanceType, Shape, Template, TemplateScope};
+use crate::{InstanceType, Shape, Template, TemplateScope, types::*};
 
 /// Daemon configuration. Built by `warrend` from flags and `WARREN_*` variables;
 /// defaults are safe for a single developer machine.
@@ -63,7 +63,10 @@ pub enum HostKind {
     Root,
     Api,
     /// `port` 0 means the template's default port.
-    Instance { id: String, port: u16 },
+    Instance {
+        id: String,
+        port: u16,
+    },
 }
 
 impl Config {
@@ -71,7 +74,11 @@ impl Config {
         let implicit = self.public_port == 0
             || (self.public_scheme == "http" && self.public_port == 80)
             || (self.public_scheme == "https" && self.public_port == 443);
-        if implicit { host.to_string() } else { format!("{host}:{}", self.public_port) }
+        if implicit {
+            host.to_string()
+        } else {
+            format!("{host}:{}", self.public_port)
+        }
     }
 
     pub fn api_host(&self) -> String {
@@ -80,17 +87,29 @@ impl Config {
 
     /// Public base URL of the Sandbox API, without a trailing slash.
     pub fn api_url(&self) -> String {
-        format!("{}://{}/v1", self.public_scheme, self.host_port(&self.api_host()))
+        format!(
+            "{}://{}/v1",
+            self.public_scheme,
+            self.host_port(&self.api_host())
+        )
     }
 
     /// `scheme://{id}.<base>[:port]`
     pub fn instance_url(&self, id: &str) -> String {
-        format!("{}://{}", self.public_scheme, self.host_port(&format!("{id}.{}", self.base_domain)))
+        format!(
+            "{}://{}",
+            self.public_scheme,
+            self.host_port(&format!("{id}.{}", self.base_domain))
+        )
     }
 
     /// `scheme://{id}-{port}.<base>[:port]`
     pub fn preview_url(&self, id: &str, port: u16) -> String {
-        format!("{}://{}", self.public_scheme, self.host_port(&format!("{id}-{port}.{}", self.base_domain)))
+        format!(
+            "{}://{}",
+            self.public_scheme,
+            self.host_port(&format!("{id}-{port}.{}", self.base_domain))
+        )
     }
 
     /// Classify a Host header. Ports in the header are ignored.
@@ -101,34 +120,46 @@ impl Config {
             if let Some(end) = host.find(']') {
                 host = host[..=end].to_string();
             }
-        } else if let Some(i) = host.rfind(':') {
-            if host[i + 1..].chars().all(|c| c.is_ascii_digit()) {
-                host.truncate(i);
-            }
+        } else if let Some(i) = host.rfind(':')
+            && host[i + 1..].chars().all(|c| c.is_ascii_digit())
+        {
+            host.truncate(i);
         }
         let base = self.base_domain.to_ascii_lowercase();
-        if host == base || host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1" {
+        if host == base
+            || host == "localhost"
+            || host == "127.0.0.1"
+            || host == "[::1]"
+            || host == "::1"
+        {
             return HostKind::Root;
         }
         if host == format!("api.{base}") {
             return HostKind::Api;
         }
-        let Some(label) = host.strip_suffix(&format!(".{base}")) else { return HostKind::Root };
+        let Some(label) = host.strip_suffix(&format!(".{base}")) else {
+            return HostKind::Root;
+        };
         if label.contains('.') {
             return HostKind::Root;
         }
         if let Some(i) = label.rfind('-') {
             let (id, port) = (&label[..i], &label[i + 1..]);
-            if id.len() == INSTANCE_ID_LENGTH {
-                if let Ok(p) = port.parse::<u16>() {
-                    if p > 0 {
-                        return HostKind::Instance { id: id.to_string(), port: p };
-                    }
-                }
+            if id.len() == INSTANCE_ID_LENGTH
+                && let Ok(p) = port.parse::<u16>()
+                && p > 0
+            {
+                return HostKind::Instance {
+                    id: id.to_string(),
+                    port: p,
+                };
             }
         }
         if label.len() == INSTANCE_ID_LENGTH && crate::ids::valid_instance_id(label) {
-            return HostKind::Instance { id: label.to_string(), port: 0 };
+            return HostKind::Instance {
+                id: label.to_string(),
+                port: 0,
+            };
         }
         HostKind::Root
     }
@@ -200,9 +231,24 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.parse_host("warren.localhost:7337"), HostKind::Root);
         assert_eq!(c.parse_host("api.warren.localhost:7337"), HostKind::Api);
-        assert_eq!(c.parse_host("ab12cd34ef.warren.localhost"), HostKind::Instance { id: "ab12cd34ef".into(), port: 0 });
-        assert_eq!(c.parse_host("AB12cd34ef-7681.warren.localhost:7337"), HostKind::Instance { id: "ab12cd34ef".into(), port: 7681 });
-        assert_eq!(c.parse_host("evil.ab12cd34ef.warren.localhost"), HostKind::Root);
+        assert_eq!(
+            c.parse_host("ab12cd34ef.warren.localhost"),
+            HostKind::Instance {
+                id: "ab12cd34ef".into(),
+                port: 0
+            }
+        );
+        assert_eq!(
+            c.parse_host("AB12cd34ef-7681.warren.localhost:7337"),
+            HostKind::Instance {
+                id: "ab12cd34ef".into(),
+                port: 7681
+            }
+        );
+        assert_eq!(
+            c.parse_host("evil.ab12cd34ef.warren.localhost"),
+            HostKind::Root
+        );
         assert_eq!(c.parse_host("[::1]:7337"), HostKind::Root);
         assert_eq!(c.parse_host("other.example.com"), HostKind::Root);
     }
@@ -211,11 +257,22 @@ mod tests {
     fn urls() {
         let c = Config::default();
         assert_eq!(c.api_url(), "http://api.warren.localhost:7337/v1");
-        assert_eq!(c.instance_url("ab12cd34ef"), "http://ab12cd34ef.warren.localhost:7337");
-        assert_eq!(c.preview_url("ab12cd34ef", 8080), "http://ab12cd34ef-8080.warren.localhost:7337");
-        let mut c = Config::default();
-        c.public_scheme = "https".into();
-        c.public_port = 443;
-        assert_eq!(c.instance_url("ab12cd34ef"), "https://ab12cd34ef.warren.localhost");
+        assert_eq!(
+            c.instance_url("ab12cd34ef"),
+            "http://ab12cd34ef.warren.localhost:7337"
+        );
+        assert_eq!(
+            c.preview_url("ab12cd34ef", 8080),
+            "http://ab12cd34ef-8080.warren.localhost:7337"
+        );
+        let c = Config {
+            public_scheme: "https".into(),
+            public_port: 443,
+            ..Config::default()
+        };
+        assert_eq!(
+            c.instance_url("ab12cd34ef"),
+            "https://ab12cd34ef.warren.localhost"
+        );
     }
 }

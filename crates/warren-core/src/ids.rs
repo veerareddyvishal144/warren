@@ -41,7 +41,11 @@ fn random_string(alphabet: &[u8], n: usize) -> String {
 /// 10 lowercase alphanumerics starting with a letter: a valid DNS label that can
 /// never be mistaken for a port suffix.
 pub fn new_instance_id() -> String {
-    format!("{}{}", random_string(&LOWER_ALNUM[..26], 1), random_string(LOWER_ALNUM, INSTANCE_ID_LENGTH - 1))
+    format!(
+        "{}{}",
+        random_string(&LOWER_ALNUM[..26], 1),
+        random_string(LOWER_ALNUM, INSTANCE_ID_LENGTH - 1)
+    )
 }
 
 /// 32 hex characters for ledger entries, backups, crons and keys.
@@ -88,7 +92,8 @@ pub fn valid_instance_id(s: &str) -> bool {
 /// Template names: lowercase, digits and dashes, 3..=40 characters.
 pub fn valid_template_name(s: &str) -> bool {
     (3..=40).contains(&s.len())
-        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !s.starts_with('-')
         && !s.ends_with('-')
 }

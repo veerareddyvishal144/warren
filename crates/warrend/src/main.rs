@@ -5,7 +5,10 @@ use anyhow::Context;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
-use warren_core::{Config, HmacSigner, InstanceType, KeyAuthenticator, Money, RealClock, Runtime, Runtimes, MICROS_PER_DOLLAR, MIN_IDLE_TIMEOUT_SEC};
+use warren_core::{
+    Config, HmacSigner, InstanceType, KeyAuthenticator, MICROS_PER_DOLLAR, MIN_IDLE_TIMEOUT_SEC,
+    Money, RealClock, Runtime, Runtimes, TemplateService,
+};
 
 /// Warren daemon.
 #[derive(Parser, Debug)]
@@ -44,7 +47,11 @@ struct Args {
     /// Enable vm-type instances (needs root, /dev/kvm, firecracker and a kernel).
     #[arg(long, env = "WARREN_ENABLE_FIRECRACKER", default_value_t = false)]
     firecracker: bool,
-    #[arg(long, env = "WARREN_FIRECRACKER_BIN", default_value = "/usr/local/bin/firecracker")]
+    #[arg(
+        long,
+        env = "WARREN_FIRECRACKER_BIN",
+        default_value = "/usr/local/bin/firecracker"
+    )]
     firecracker_bin: PathBuf,
     #[arg(long, env = "WARREN_KERNEL_IMAGE")]
     kernel: Option<PathBuf>,
@@ -64,25 +71,31 @@ struct Args {
 
 impl Args {
     fn into_config(self) -> Config {
-        let mut cfg = Config::default();
-        cfg.listen = self.listen;
-        cfg.base_domain = self.base_domain;
-        cfg.public_scheme = self.public_scheme;
-        cfg.public_port = self.public_port;
-        cfg.data_dir = self.data_dir;
-        cfg.runtime = self.runtime;
-        cfg.region = self.region;
-        cfg.dev_mode = self.dev;
-        cfg.free_credit_micros = self.free_credit_micros;
-        cfg.min_idle_timeout_sec = self.min_idle_seconds.unwrap_or(if self.dev { 5 } else { MIN_IDLE_TIMEOUT_SEC });
-        cfg.enable_firecracker = self.firecracker;
-        cfg.firecracker_bin = self.firecracker_bin;
-        cfg.kernel_image = self.kernel;
-        cfg.secret = self.secret.unwrap_or_default();
-        cfg.meter_interval = Duration::from(self.meter_interval);
-        cfg.image_tag = self.image_tag;
-        cfg.version = env!("CARGO_PKG_VERSION").to_string();
-        cfg
+        let dev = self.dev;
+        Config {
+            listen: self.listen,
+            base_domain: self.base_domain,
+            public_scheme: self.public_scheme,
+            public_port: self.public_port,
+            data_dir: self.data_dir,
+            runtime: self.runtime,
+            region: self.region,
+            dev_mode: dev,
+            free_credit_micros: self.free_credit_micros,
+            min_idle_timeout_sec: self.min_idle_seconds.unwrap_or(if dev {
+                5
+            } else {
+                MIN_IDLE_TIMEOUT_SEC
+            }),
+            enable_firecracker: self.firecracker,
+            firecracker_bin: self.firecracker_bin,
+            kernel_image: self.kernel,
+            secret: self.secret.unwrap_or_default(),
+            meter_interval: Duration::from(self.meter_interval),
+            image_tag: self.image_tag,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            ..Config::default()
+        }
     }
 }
 
@@ -95,16 +108,20 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let mut cfg = args.into_config();
 
-    std::fs::create_dir_all(&cfg.data_dir).with_context(|| format!("create data dir {}", cfg.data_dir.display()))?;
+    std::fs::create_dir_all(&cfg.data_dir)
+        .with_context(|| format!("create data dir {}", cfg.data_dir.display()))?;
     if cfg.secret.is_empty() {
         cfg.secret = load_or_create_secret(&cfg.data_dir.join("secret"))?;
     }
 
-    let store = warren_store::SqliteStore::open(&cfg.data_dir.join("warren.db")).context("open store")?;
+    let store =
+        warren_store::SqliteStore::open(&cfg.data_dir.join("warren.db")).context("open store")?;
     let clock = Arc::new(RealClock);
 
     let mut runtimes: HashMap<InstanceType, Arc<dyn Runtime>> = HashMap::new();
-    let docker = warren_runtime_docker::DockerRuntime::new(cfg.clone()).await.context("docker runtime")?;
+    let docker = warren_runtime_docker::DockerRuntime::new(cfg.clone())
+        .await
+        .context("docker runtime")?;
     docker.ready().await.context("docker runtime not ready")?;
     runtimes.insert(InstanceType::Default, Arc::new(docker));
     if cfg.enable_firecracker {
@@ -114,7 +131,9 @@ async fn main() -> anyhow::Result<()> {
                     tracing::info!("firecracker runtime enabled");
                     runtimes.insert(InstanceType::Vm, Arc::new(fc));
                 }
-                Err(e) => tracing::warn!(err = %e, "firecracker runtime not ready; vm instances disabled"),
+                Err(e) => {
+                    tracing::warn!(err = %e, "firecracker runtime not ready; vm instances disabled")
+                }
             },
             Err(e) => tracing::warn!(err = %e, "firecracker runtime disabled"),
         }
@@ -122,7 +141,10 @@ async fn main() -> anyhow::Result<()> {
     let runtimes: Runtimes = Arc::new(runtimes);
 
     let templates = warren_templates::Templates::new(store.clone(), runtimes.clone(), cfg.clone());
-    templates.ensure_system_templates().await.context("system templates")?;
+    templates
+        .ensure_system_templates()
+        .await
+        .context("system templates")?;
     let biller = warren_billing::Biller::new(store.clone(), cfg.clone(), clock.clone());
     let lifecycle = warren_lifecycle::Manager::new(warren_lifecycle::Deps {
         store: store.clone(),
@@ -134,7 +156,8 @@ async fn main() -> anyhow::Result<()> {
     })
     .context("lifecycle")?;
     biller.set_stopper(lifecycle.clone());
-    let scheduler = warren_cron::Scheduler::new(store.clone(), lifecycle.clone(), cfg.clone(), clock.clone());
+    let scheduler =
+        warren_cron::Scheduler::new(store.clone(), lifecycle.clone(), cfg.clone(), clock.clone());
     let auth = Arc::new(KeyAuthenticator::new(store.clone(), clock.clone()));
     let signer = Arc::new(HmacSigner::new(&cfg.secret, clock.clone()));
 
@@ -163,7 +186,11 @@ async fn main() -> anyhow::Result<()> {
     tasks.spawn({
         let lc = lifecycle.clone();
         let s = shutdown.clone();
-        async move { lc.run(s).await.map_err(|e| anyhow::anyhow!("lifecycle: {e}")) }
+        async move {
+            lc.run(s)
+                .await
+                .map_err(|e| anyhow::anyhow!("lifecycle: {e}"))
+        }
     });
     tasks.spawn({
         let b = biller.clone();
@@ -172,18 +199,28 @@ async fn main() -> anyhow::Result<()> {
     });
     tasks.spawn({
         let s = shutdown.clone();
-        async move { scheduler.run(s).await.map_err(|e| anyhow::anyhow!("cron: {e}")) }
+        async move {
+            scheduler
+                .run(s)
+                .await
+                .map_err(|e| anyhow::anyhow!("cron: {e}"))
+        }
     });
 
     let addr = normalize_listen(&cfg.listen);
-    let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("bind {addr}"))?;
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("bind {addr}"))?;
     tracing::info!(addr = %addr, api = %cfg.api_url(), base_domain = %cfg.base_domain, dev_mode = cfg.dev_mode, version = %cfg.version, "warrend listening");
     let server_shutdown = shutdown.clone();
     tasks.spawn(async move {
-        axum::serve(listener, root)
-            .with_graceful_shutdown(async move { server_shutdown.cancelled().await })
-            .await
-            .map_err(|e| anyhow::anyhow!("http: {e}"))
+        axum::serve(
+            listener,
+            root.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { server_shutdown.cancelled().await })
+        .await
+        .map_err(|e| anyhow::anyhow!("http: {e}"))
     });
 
     tokio::select! {
@@ -195,12 +232,15 @@ async fn main() -> anyhow::Result<()> {
         },
     }
     shutdown.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(15), async { while tasks.join_next().await.is_some() {} }).await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
     Ok(())
 }
 
 async fn wait_for_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).expect("sigterm handler");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
@@ -210,7 +250,11 @@ async fn wait_for_signal() {
 
 /// Accept ":7337" as well as "0.0.0.0:7337"; bind dual-stack when no host is given.
 fn normalize_listen(listen: &str) -> String {
-    if listen.starts_with(':') { format!("[::]{listen}") } else { listen.to_string() }
+    if listen.starts_with(':') {
+        format!("[::]{listen}")
+    } else {
+        listen.to_string()
+    }
 }
 
 fn load_or_create_secret(path: &std::path::Path) -> anyhow::Result<String> {
@@ -221,7 +265,8 @@ fn load_or_create_secret(path: &std::path::Path) -> anyhow::Result<String> {
         }
     }
     let s = warren_core::ids::new_secret();
-    std::fs::write(path, format!("{s}\n")).with_context(|| format!("write secret {}", path.display()))?;
+    std::fs::write(path, format!("{s}\n"))
+        .with_context(|| format!("write secret {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

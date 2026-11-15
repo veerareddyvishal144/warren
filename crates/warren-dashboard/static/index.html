@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Warren</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f6fed'/%3E%3Cpath d='M7 9l4 14 5-10 5 10 4-14' fill='none' stroke='%23fff' stroke-width='3' stroke-linejoin='round' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/styles.css">
+<script src="/config.js"></script>
+<script src="/app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">W</span>
+    <span class="brand-name">Warren</span>
+    <span id="server-info" class="muted small"></span>
+  </div>
+  <nav id="nav" aria-label="Sections" hidden>
+    <button type="button" id="nav-instances" class="navbtn" aria-current="page">Instances</button>
+    <button type="button" id="nav-billing" class="navbtn">Billing</button>
+  </nav>
+  <div id="who" class="who" hidden>
+    <span id="workspace-name" class="small"></span>
+    <code id="key-prefix" class="small muted" title="Stored in this browser's localStorage"></code>
+    <button type="button" id="logout-btn" class="btn small">Log out</button>
+  </div>
+</header>
+
+<!-- Login: shown until an API key is stored -->
+<section id="login" class="login panel" aria-labelledby="login-title">
+  <h1 id="login-title">Sign in to Warren</h1>
+  <p class="muted">Warren gives every agent or person a persistent Linux computer reachable over HTTPS. Paste a workspace API key, or create a new workspace to get one.</p>
+  <form id="login-form" class="stack">
+    <label for="login-key">API key</label>
+    <input id="login-key" name="key" type="password" autocomplete="off" spellcheck="false" placeholder="sk_live_..." required>
+    <div class="row">
+      <button type="submit" class="btn primary">Use this key</button>
+      <span class="muted small">The key is kept only in this browser's localStorage.</span>
+    </div>
+    <p id="login-error" class="error" role="alert" hidden></p>
+  </form>
+  <div class="divider" aria-hidden="true"><span>or</span></div>
+  <form id="signup-form" class="stack">
+    <label for="signup-name">Workspace name <span class="muted">(optional)</span></label>
+    <input id="signup-name" name="name" type="text" maxlength="80" placeholder="My workspace">
+    <div class="row">
+      <button type="submit" class="btn">Create workspace</button>
+      <span class="muted small">Creates a workspace with free credit and a fresh API key.</span>
+    </div>
+  </form>
+  <div id="signup-result" class="notice" hidden>
+    <p><strong>Workspace created.</strong> This API key is shown once; store it somewhere safe.</p>
+    <code id="signup-key" class="keybox"></code>
+    <p id="signup-wallet" class="small muted"></p>
+    <button type="button" id="signup-continue" class="btn primary">Continue to the dashboard</button>
+  </div>
+</section>
+
+<main id="main" class="app" hidden>
+  <aside class="sidebar" aria-labelledby="instances-title">
+    <div class="sidebar-head">
+      <h2 id="instances-title">Instances</h2>
+      <button type="button" id="new-instance-btn" class="btn primary small">New</button>
+    </div>
+    <p id="list-status" class="muted small" aria-live="polite">Loading…</p>
+    <ul id="instance-list" class="instance-list" role="list"></ul>
+  </aside>
+
+  <section class="content">
+    <!-- Empty state -->
+    <section id="empty-panel" class="panel center">
+      <h2>No instance selected</h2>
+      <p class="muted">Pick an instance on the left or create a new one.</p>
+      <button type="button" id="empty-new-btn" class="btn primary">Create an instance</button>
+    </section>
+
+    <!-- Create form -->
+    <section id="create-panel" class="panel" aria-labelledby="create-title" hidden>
+      <h2 id="create-title">New instance</h2>
+      <form id="create-form" class="grid2">
+        <div class="field">
+          <label for="create-template">Template</label>
+          <select id="create-template" name="template" required></select>
+          <p id="create-template-desc" class="muted small"></p>
+        </div>
+        <div class="field">
+          <label for="create-name">Name <span class="muted">(optional)</span></label>
+          <input id="create-name" name="name" type="text" maxlength="80" placeholder="Production agent">
+        </div>
+        <div class="field">
+          <label for="create-shape">Shape</label>
+          <select id="create-shape" name="shape">
+            <option value="2,4,4">2 vCPU · 4 GB RAM · 4 GB disk</option>
+            <option value="4,8,6">4 vCPU · 8 GB RAM · 6 GB disk</option>
+            <option value="4,16,12">4 vCPU · 16 GB RAM · 12 GB disk</option>
+            <option value="4,32,24">4 vCPU · 32 GB RAM · 24 GB disk</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="create-disk">Disk GB <span class="muted">(optional override)</span></label>
+          <input id="create-disk" name="disk" type="number" min="2" max="100" step="1" placeholder="shape default">
+        </div>
+        <div class="field">
+          <label for="create-type">Type</label>
+          <select id="create-type" name="type">
+            <option value="default">default — gVisor container</option>
+            <option value="vm">vm — Firecracker microVM (2.5× compute)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="create-network">Network</label>
+          <select id="create-network" name="network">
+            <option value="allow-all">allow-all — outbound internet</option>
+            <option value="deny-all">deny-all — no outbound network</option>
+          </select>
+        </div>
+        <div class="field">
+          <label class="check"><input id="create-auto-sleep" name="auto_sleep" type="checkbox"> Auto-sleep when idle</label>
+          <label for="create-idle" class="small">Idle timeout (seconds, 300–86400)</label>
+          <input id="create-idle" name="idle_timeout_seconds" type="number" min="300" max="86400" step="1" value="900" disabled>
+        </div>
+        <div class="field">
+          <p class="small muted" id="create-price">Price: —</p>
+        </div>
+        <p id="create-error" class="error span2" role="alert" hidden></p>
+        <div class="row span2">
+          <button type="submit" id="create-submit" class="btn primary">Create instance</button>
+          <button type="button" id="create-cancel" class="btn">Cancel</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- Instance detail -->
+    <section id="detail-panel" class="panel" aria-labelledby="detail-name" hidden>
+      <header class="detail-head">
+        <div>
+          <h2 id="detail-name">Instance</h2>
+          <p class="small">
+            <code id="detail-id"></code>
+            <span id="detail-status" class="badge">—</span>
+            <span id="detail-reason" class="muted"></span>
+          </p>
+          <p class="small"><a id="detail-url" href="#" target="_blank" rel="noopener noreferrer" title="Opens in a new tab through a signed URL"></a> <span class="muted">(default port, signed URL)</span></p>
+        </div>
+        <dl class="facts">
+          <dt>Template</dt><dd id="detail-template"></dd>
+          <dt>Type</dt><dd id="detail-type"></dd>
+          <dt>Shape</dt><dd id="detail-shape"></dd>
+          <dt>Region</dt><dd id="detail-region"></dd>
+          <dt>Runtime</dt><dd id="detail-runtime"></dd>
+          <dt>Sleep</dt><dd id="detail-sleep"></dd>
+          <dt>Disk used</dt><dd id="detail-disk"></dd>
+          <dt>Created</dt><dd id="detail-created"></dd>
+        </dl>
+      </header>
+
+      <div class="actions" role="group" aria-label="Instance actions">
+        <button type="button" id="act-start" class="btn">Start</button>
+        <button type="button" id="act-stop" class="btn">Stop</button>
+        <button type="button" id="act-sleep" class="btn">Sleep</button>
+        <button type="button" id="act-restart" class="btn">Restart</button>
+        <button type="button" id="act-fork" class="btn">Fork</button>
+        <button type="button" id="act-backup" class="btn">Backup</button>
+        <button type="button" id="act-terminal" class="btn primary">Terminal</button>
+        <button type="button" id="act-delete" class="btn danger">Delete</button>
+      </div>
+
+      <div id="tabs" class="tabs" role="tablist" aria-label="Instance tools">
+        <button type="button" role="tab" id="tab-exec" aria-controls="panel-exec" aria-selected="true">Exec</button>
+        <button type="button" role="tab" id="tab-chat" aria-controls="panel-chat" aria-selected="false" tabindex="-1">Chat</button>
+        <button type="button" role="tab" id="tab-sessions" aria-controls="panel-sessions" aria-selected="false" tabindex="-1">Sessions</button>
+        <button type="button" role="tab" id="tab-files" aria-controls="panel-files" aria-selected="false" tabindex="-1">Files</button>
+        <button type="button" role="tab" id="tab-logs" aria-controls="panel-logs" aria-selected="false" tabindex="-1">Logs</button>
+        <button type="button" role="tab" id="tab-metrics" aria-controls="panel-metrics" aria-selected="false" tabindex="-1">Metrics</button>
+        <button type="button" role="tab" id="tab-backups" aria-controls="panel-backups" aria-selected="false" tabindex="-1">Backups</button>
+      </div>
+
+      <!-- Exec console -->
+      <section id="panel-exec" class="tabpanel" role="tabpanel" aria-labelledby="tab-exec">
+        <form id="exec-form" class="row">
+          <label for="exec-command" class="sr-only">Command</label>
+          <input id="exec-command" class="grow mono" type="text" autocomplete="off" spellcheck="false" placeholder="ls -la ~" required>
+          <label for="exec-user" class="sr-only">User</label>
+          <select id="exec-user" title="User">
+            <option value="">image user</option>
+            <option value="root">root</option>
+          </select>
+          <button type="submit" id="exec-run" class="btn primary">Run</button>
+          <button type="button" id="exec-clear" class="btn">Clear</button>
+        </form>
+        <div id="exec-output" class="console" role="log" aria-live="polite" aria-label="Command output"></div>
+      </section>
+
+      <!-- Chat (agent instances) -->
+      <section id="panel-chat" class="tabpanel" role="tabpanel" aria-labelledby="tab-chat" hidden>
+        <p id="chat-unavailable" class="muted" hidden>This template does not serve the Agent API, so there is nobody to chat with. Use Exec or the Terminal instead.</p>
+        <div id="chat-wrap">
+          <div class="row between small">
+            <span class="muted">Session: <code id="chat-session">new</code></span>
+            <span>
+              <button type="button" id="chat-new-session" class="btn small">New session</button>
+              <button type="button" id="chat-stop" class="btn small" hidden>Stop</button>
+            </span>
+          </div>
+          <div id="chat-messages" class="chat" role="log" aria-live="polite" aria-label="Conversation"></div>
+          <form id="chat-form" class="row">
+            <label for="chat-input" class="sr-only">Message</label>
+            <textarea id="chat-input" class="grow" rows="2" placeholder="Ask the agent… (Enter to send, Shift+Enter for a new line)" required></textarea>
+            <button type="submit" id="chat-send" class="btn primary">Send</button>
+          </form>
+        </div>
+      </section>
+
+      <!-- Sessions -->
+      <section id="panel-sessions" class="tabpanel" role="tabpanel" aria-labelledby="tab-sessions" hidden>
+        <div class="row between">
+          <p id="sessions-status" class="muted small" aria-live="polite"></p>
+          <button type="button" id="sessions-refresh" class="btn small">Refresh</button>
+        </div>
+        <div class="split">
+          <ul id="sessions-list" class="plain-list" role="list"></ul>
+          <div id="session-detail" hidden>
+            <div class="row between">
+              <h3 id="session-title" class="h3"></h3>
+              <span>
+                <button type="button" id="session-use" class="btn small">Use in chat</button>
+                <button type="button" id="session-delete" class="btn small danger">Delete</button>
+              </span>
+            </div>
+            <div id="session-messages" class="chat static"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Files -->
+      <section id="panel-files" class="tabpanel" role="tabpanel" aria-labelledby="tab-files" hidden>
+        <form id="files-path-form" class="row">
+          <button type="button" id="files-up" class="btn" title="Parent directory" aria-label="Parent directory">↑</button>
+          <label for="files-path" class="sr-only">Path (relative to home)</label>
+          <input id="files-path" class="grow mono" type="text" value="." autocomplete="off" spellcheck="false">
+          <button type="submit" id="files-go" class="btn">Open</button>
+          <button type="button" id="files-refresh" class="btn">Refresh</button>
+        </form>
+        <div class="row small">
+          <label for="files-upload" class="btn">Choose file…</label>
+          <input id="files-upload" type="file" class="sr-only">
+          <span id="files-upload-name" class="muted"></span>
+          <button type="button" id="files-upload-btn" class="btn" disabled>Upload here</button>
+          <button type="button" id="files-new-btn" class="btn">New text file</button>
+          <span id="files-status" class="muted" aria-live="polite"></span>
+        </div>
+        <div class="split">
+          <ul id="files-list" class="plain-list files" role="list"></ul>
+          <div id="file-editor" hidden>
+            <div class="row between">
+              <code id="file-editor-path" class="small"></code>
+              <span>
+                <button type="button" id="file-save" class="btn small primary">Save</button>
+                <button type="button" id="file-download" class="btn small">Download</button>
+                <button type="button" id="file-delete" class="btn small danger">Delete</button>
+                <button type="button" id="file-close" class="btn small">Close</button>
+              </span>
+            </div>
+            <label for="file-editor-text" class="sr-only">File contents</label>
+            <textarea id="file-editor-text" class="mono editor" rows="18" spellcheck="false"></textarea>
+            <p id="file-editor-status" class="muted small" aria-live="polite"></p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Logs -->
+      <section id="panel-logs" class="tabpanel" role="tabpanel" aria-labelledby="tab-logs" hidden>
+        <div class="row">
+          <label for="logs-tail" class="small">Tail</label>
+          <select id="logs-tail">
+            <option value="100">100 lines</option>
+            <option value="200" selected>200 lines</option>
+            <option value="1000">1000 lines</option>
+          </select>
+          <button type="button" id="logs-refresh" class="btn small">Refresh</button>
+        </div>
+        <pre id="logs-output" class="console" aria-label="Instance logs" tabindex="0"></pre>
+      </section>
+
+      <!-- Metrics -->
+      <section id="panel-metrics" class="tabpanel" role="tabpanel" aria-labelledby="tab-metrics" hidden>
+        <div class="row">
+          <label for="metrics-hours" class="small">Window</label>
+          <select id="metrics-hours">
+            <option value="1" selected>1 hour</option>
+            <option value="6">6 hours</option>
+            <option value="24">24 hours</option>
+          </select>
+          <button type="button" id="metrics-refresh" class="btn small">Refresh</button>
+          <span id="metrics-empty" class="muted small" aria-live="polite"></span>
+        </div>
+        <div class="grid2">
+          <figure class="metric">
+            <figcaption>CPU <span id="metrics-cpu-value" class="muted"></span></figcaption>
+            <div id="metrics-cpu" class="spark"></div>
+          </figure>
+          <figure class="metric">
+            <figcaption>Memory <span id="metrics-mem-value" class="muted"></span></figcaption>
+            <div id="metrics-mem" class="spark"></div>
+          </figure>
+        </div>
+      </section>
+
+      <!-- Backups -->
+      <section id="panel-backups" class="tabpanel" role="tabpanel" aria-labelledby="tab-backups" hidden>
+        <div class="row between">
+          <p id="backups-status" class="muted small" aria-live="polite"></p>
+          <button type="button" id="backups-refresh" class="btn small">Refresh</button>
+        </div>
+        <table class="table">
+          <thead><tr><th scope="col">Taken</th><th scope="col">Size</th><th scope="col">Note</th><th scope="col">Id</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+          <tbody id="backups-body"></tbody>
+        </table>
+      </section>
+    </section>
+
+    <!-- Billing -->
+    <section id="billing-panel" class="panel" aria-labelledby="billing-title" hidden>
+      <div class="row between">
+        <h2 id="billing-title">Billing</h2>
+        <button type="button" id="billing-refresh" class="btn small">Refresh</button>
+      </div>
+      <div class="tiles">
+        <div class="tile"><span class="tile-label">Wallet balance</span><strong id="billing-wallet" class="tile-value">—</strong></div>
+        <div class="tile"><span class="tile-label">Awake instances</span><strong id="billing-awake" class="tile-value">—</strong><span id="billing-awake-note" class="small muted"></span></div>
+        <div class="tile"><span class="tile-label">Total top-ups</span><strong id="billing-topups" class="tile-value">—</strong></div>
+        <div class="tile"><span class="tile-label">Free credit</span><strong id="billing-credit" class="tile-value">—</strong></div>
+      </div>
+      <p id="billing-rates" class="small muted"></p>
+
+      <section id="topup-section" aria-labelledby="topup-title" hidden>
+        <h3 id="topup-title" class="h3">Developer top-up</h3>
+        <form id="topup-form" class="row">
+          <label for="topup-amount">Amount (USD)</label>
+          <input id="topup-amount" type="number" min="5" max="10000" step="1" value="20" required>
+          <input type="hidden" id="topup-provider" value="dev">
+          <button type="submit" id="topup-submit" class="btn primary">Add funds (dev)</button>
+          <span class="muted small">The daemon runs in dev mode: funds are added without a payment provider.</span>
+        </form>
+        <p id="topup-error" class="error" role="alert" hidden></p>
+      </section>
+
+      <h3 class="h3">Ledger</h3>
+      <table class="table">
+        <thead><tr><th scope="col">When</th><th scope="col">Kind</th><th scope="col">Instance</th><th scope="col">Minutes</th><th scope="col">Amount</th><th scope="col">Note</th></tr></thead>
+        <tbody id="ledger-body"></tbody>
+      </table>
+      <p id="ledger-status" class="muted small" aria-live="polite"></p>
+    </section>
+  </section>
+</main>
+
+<div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+</body>
+</html>

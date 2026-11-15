@@ -8,6 +8,7 @@
 pub mod agentapi;
 pub mod auth;
 pub mod config;
+pub mod cronexpr;
 pub mod errors;
 pub mod ids;
 pub mod json;

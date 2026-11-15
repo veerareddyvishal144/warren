@@ -37,7 +37,8 @@ impl axum::response::IntoResponse for Error {
         if self.is_internal() {
             tracing::error!(code = %self.code, details = ?self.details, "internal error");
         }
-        let status = axum::http::StatusCode::from_u16(self.status).unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let status = axum::http::StatusCode::from_u16(self.status)
+            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         (status, axum::Json(ErrorEnvelope::from(self))).into_response()
     }
 }

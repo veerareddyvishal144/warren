@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::{dollars, Money};
+use crate::types::{Money, dollars};
 
 /// Stable error codes. Branch on the code, show the message.
 pub const CODE_INVALID_REQUEST: &str = "invalid_request";
@@ -33,7 +33,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
     pub fn new(code: &str, status: u16, message: impl Into<String>) -> Self {
-        Error { code: code.to_string(), message: message.into(), details: None, status }
+        Error {
+            code: code.to_string(),
+            message: message.into(),
+            details: None,
+            status,
+        }
     }
     pub fn with_details(mut self, details: serde_json::Value) -> Self {
         self.details = Some(details);
@@ -44,7 +49,15 @@ impl Error {
     }
     pub fn invalid_api_key(message: impl Into<String>) -> Self {
         let m: String = message.into();
-        Self::new(CODE_INVALID_API_KEY, 401, if m.is_empty() { "Missing or invalid API key.".to_string() } else { m })
+        Self::new(
+            CODE_INVALID_API_KEY,
+            401,
+            if m.is_empty() {
+                "Missing or invalid API key.".to_string()
+            } else {
+                m
+            },
+        )
     }
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self::new(CODE_FORBIDDEN, 403, message)
@@ -71,7 +84,11 @@ impl Error {
         Self::new(
             CODE_INSUFFICIENT_BALANCE,
             402,
-            format!("Wallet balance {:.6} is below the {:.6} required.", dollars(balance), dollars(required)),
+            format!(
+                "Wallet balance {:.6} is below the {:.6} required.",
+                dollars(balance),
+                dollars(required)
+            ),
         )
         .with_details(serde_json::json!({ "required_micros": required, "balance_micros": balance }))
     }
@@ -86,7 +103,8 @@ impl Error {
     /// Wrap an unexpected failure. The cause is kept in `details` for logs; the
     /// JSON layer strips it before answering clients.
     pub fn internal(cause: impl std::fmt::Display) -> Self {
-        Self::new(CODE_INTERNAL, 500, "Internal error.").with_details(serde_json::json!({ "cause": cause.to_string() }))
+        Self::new(CODE_INTERNAL, 500, "Internal error.")
+            .with_details(serde_json::json!({ "cause": cause.to_string() }))
     }
     pub fn is_not_found(&self) -> bool {
         self.code == CODE_NOT_FOUND
@@ -96,7 +114,11 @@ impl Error {
     }
     /// The client-safe copy: internal errors lose their details.
     pub fn public(&self) -> Error {
-        if self.is_internal() { Error::new(CODE_INTERNAL, 500, "Internal error.") } else { self.clone() }
+        if self.is_internal() {
+            Error::new(CODE_INTERNAL, 500, "Internal error.")
+        } else {
+            self.clone()
+        }
     }
 }
 
@@ -121,9 +143,14 @@ impl From<serde_json::Error> for Error {
 /// Returned by `Runtime::resize` when the new shape cannot be applied live; the
 /// caller stops, resizes again and starts.
 pub fn requires_restart() -> Error {
-    Error::new(CODE_TRY_AGAIN, 503, "resize requires restart").with_details(serde_json::json!({ "requires_restart": true }))
+    Error::new(CODE_TRY_AGAIN, 503, "resize requires restart")
+        .with_details(serde_json::json!({ "requires_restart": true }))
 }
 
 pub fn is_requires_restart(e: &Error) -> bool {
-    e.details.as_ref().and_then(|d| d.get("requires_restart")).and_then(|v| v.as_bool()).unwrap_or(false)
+    e.details
+        .as_ref()
+        .and_then(|d| d.get("requires_restart"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }

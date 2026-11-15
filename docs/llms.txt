@@ -1,0 +1,41 @@
+# Warren
+
+> Warren is an open-source Rust platform that gives every AI agent or end user a persistent Linux computer (an "instance") reachable over HTTPS at a URL derived from its id, with auto-sleep, prepaid per-minute metering, a files API, exec, a browser terminal and an Agent API. One daemon (`warrend`) runs a whole single-node platform; one gateway (`warren-gateway`) runs inside every instance.
+
+Key facts: the Sandbox API is `https://api.<base>/v1` with `Authorization: Bearer sk_live_...`; instances are `https://<id>.<base>/` (default port) and `https://<id>-<port>.<base>/` (any port) with the same key in `X-Warren-Key`, or a signed URL; JSON everywhere, lists are `{"data":[...]}`, errors are `{"error":{"code","message","details"}}`; money is integer micro-dollars; timestamps are unix seconds on the Sandbox API and unix milliseconds on the Agent API. Locally the base is `warren.localhost:7337`. `docs/API.md` is the contract; when a page and the contract disagree, the contract wins.
+
+## Docs
+
+- [Index](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/index.md): every page with a one-line description.
+- [Quickstart](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/quickstart.md): prerequisites, gVisor, `make images`, `make dev-up`, signup, create an instance, exec, files, signed URL terminal, agent chat, sleep/stop/delete, billing calls.
+- [Concepts](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/concepts.md): instance, template, session and response, workspace, wallet, budget; two planes one key; derivable URLs.
+- [Instances](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/instances.md): the instance object, lifecycle states, create/patch/stop/start/sleep/restart/resize/update/fork/backup/restore/delete with curl, auto-sleep semantics, the four shapes with prices ($4.76, $9.34, $15.48, $27.76 a month; vm compute x 2.5), network modes, error codes.
+- [Templates](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/templates.md): the built-in catalog (warren-base, warren-agent, warren-opencode), registering your own image, revisions and `name@rev` pins, the image contract, building the images.
+- [Billing](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/billing.md): default rates ($0.80/vCPU, $0.70/GB RAM, $0.09/GB disk per month), the per-minute meter, what each state bills, the one-day rule, exhausted wallets, awake limits (3/10/50/200/1000), top-ups, the ledger.
+- [URLs](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/urls.md): hosts, key auth on instance hosts, signed URLs (`GET /v1/instances/{id}/signed-url`), the `warren_session` cookie and 302, preview URLs, what the edge forwards and strips, CORS.
+- [Agent API](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/agent-api.md): `POST /v1/responses`, SSE events (response.created, response.output_text.delta, response.tool_call, response.completed, response.failed), replay and cancel, sessions, models, the echo/openai/command drivers.
+- [Files](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/files.md): list, read, write, move, delete, download a directory as tar.gz, upload patterns, confinement to the home directory.
+- [Exec](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/exec.md): `POST /v1/instances/{id}/exec`, request fields and limits, exit codes as data, 1 MiB output cap, background processes, root, how exec reaches containers and VMs.
+- [Crons](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/crons.md): scheduled prompts for agent instances, five-field schedules with timezones, create/list/patch/delete, what a firing does.
+- [VM instances](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/vm-instances.md): the experimental Firecracker type, root and /dev/kvm requirements, fetching the binary and kernel, enabling the runtime, how the rootfs and network are built, limits.
+- [Self-hosting](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/self-hosting.md): a single node on Debian or Ubuntu: Docker, gVisor, building, the data directory, every environment variable, systemd, wildcard DNS and TLS with Caddy or Cloudflare, firewall, backups, upgrades.
+- [For agents](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/for-agents.md): a prompt to paste into a coding agent, the llms.txt approach, the MCP server, common mistakes.
+- [Security](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/security.md): threat model, edge authentication, gVisor, the per-instance token, files confinement, secrets at rest, what is not isolated yet.
+
+## Reference
+
+- [API contract](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/API.md): the wire contract: planes and hosts, conventions, the instance object, every Sandbox API endpoint, the Agent API, edge rules.
+- [Design](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/DESIGN.md): crates and responsibilities, storage layout, metering rules, sleep and wake, security model, testing strategy.
+- [Development](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/DEVELOPMENT.md): toolchain, building one crate at a time, conventions for contributors.
+- [Testing](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/docs/TESTING.md): unit tests, the end-to-end suite against Docker, the Firecracker vm scenario, and a manual curl walkthrough of every feature.
+- [Image contract](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/images/common/README.md): what a template image must provide: user agent, /home/agent, the gateway entrypoint, ports 3737 and 7681, environment variables.
+- [MCP server](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/mcp/README.md): warren-mcp setup for Claude Code, Cursor, Claude Desktop and Windsurf, and its tools.
+- [Python client](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/sdk/python/README.md): one-file standard-library client for the Sandbox API and the Agent API, with streaming.
+- [TypeScript client](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/sdk/typescript/README.md): one-file fetch-based client for Node, Deno, Bun and browsers.
+
+## Optional
+
+- [README](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/README.md): overview, feature table, architecture diagram, pricing, instance types, roadmap.
+- [Contributing](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/CONTRIBUTING.md): how to propose changes.
+- [Security policy](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/SECURITY.md): how to report vulnerabilities.
+- [Changelog](https://raw.githubusercontent.com/veerareddyvishal144/warren/main/CHANGELOG.md): release notes.

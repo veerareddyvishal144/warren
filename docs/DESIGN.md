@@ -53,7 +53,7 @@ Sleep stops the container and keeps the disk. The instance reports `sleeping`, b
 ## Security model
 
 - Instances never get public IPs. Every request passes the edge, which authenticates with the workspace key or a signed URL.
-- Default type: gVisor when present. `runc` is a fallback for development only and the health endpoint reports which is active.
+- Default type: gVisor when present. `runc` is a fallback for development only; `GET /v1/health` lists the enabled runtimes (`docker`, and `firecracker` when enabled) and the daemon logs at startup which Docker runtime (`runsc` or `runc`) it selected.
 - Per-instance env never contains the workspace API key. The gateway's exec endpoint requires the per-instance token, which only the daemon knows.
 - Files API confines paths to the home directory. Exec output is capped.
 - Private ranges: the Docker networks are ordinary bridges; blocking RFC1918 egress from instances is done with an nftables rule set installed at startup when running as root, and skipped with a warning otherwise.

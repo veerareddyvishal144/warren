@@ -1,20 +1,22 @@
-//! Rates, per-minute metering, wallet and limits.
-use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
-use warren_core::{Clock, Config, InstanceStopper, Result, Store};
+//! Rates, per-minute metering with fractional carry, the wallet ledger, the
+//! one-day-of-balance rule, the awake-instance ladder and the exhausted-wallet
+//! stop.
+//!
+//! The crate owns [`Biller`], which implements [`warren_core::Biller`]. Money is
+//! integer micros everywhere; the only float is the sub-micro carry kept on each
+//! instance between ticks (see [`meter`]). Nothing here moves `Instance::status`
+//! directly: instances whose wallet is exhausted are handed to the wired
+//! [`warren_core::InstanceStopper`].
 
-pub struct Biller;
+mod biller;
+pub mod limits;
+pub mod meter;
 
-impl Biller {
-    pub fn new(_store: Arc<dyn Store>, _cfg: Config, _clock: Arc<dyn Clock>) -> Arc<Biller> {
-        unimplemented!("billing: not implemented")
-    }
-    /// Wire the component that stops instances when a wallet is exhausted.
-    pub fn set_stopper(&self, _s: Arc<dyn InstanceStopper>) {
-        unimplemented!("billing: not implemented")
-    }
-    /// Tick on `Config::meter_interval` until `shutdown` fires.
-    pub async fn run(self: Arc<Self>, _shutdown: CancellationToken) -> Result<()> {
-        unimplemented!("billing: not implemented")
-    }
-}
+#[cfg(test)]
+mod fakes;
+#[cfg(test)]
+mod tests;
+
+pub use biller::{Biller, STOP_REASON_INSUFFICIENT_BALANCE};
+pub use limits::{MAX_TOP_UP_MICROS, MIN_TOP_UP_MICROS, awake_limit, required_balance_to_create};
+pub use meter::{MeterStep, advance, billing_rate, metered_from, per_minute_micros};
