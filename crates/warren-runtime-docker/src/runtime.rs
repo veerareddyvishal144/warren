@@ -5,19 +5,23 @@
 use std::{
     collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
 use async_trait::async_trait;
-use bollard::{Docker, models::NetworkCreateRequest};
+use bollard::{Docker, models::NetworkCreateRequest, query_parameters::ListContainersOptions};
 use warren_core::{
     Config, Error, ExecRequest, ExecResult, Instance, LogsOptions, Result, RunInfo, Runtime, Shape,
     Stats, Template,
 };
 
 use crate::{
-    CONTAINER_PREFIX, HOME_DIR, NETWORK_INTERNAL, NETWORK_PUBLIC, error, observe::CpuSample,
+    CONTAINER_PREFIX, HOME_DIR, NETWORK_INTERNAL, NETWORK_PUBLIC, error, netpolicy,
+    observe::CpuSample,
 };
 
 /// Default-type instances as Docker containers.
@@ -33,6 +37,13 @@ pub struct DockerRuntime {
     chosen: OnceLock<String>,
     /// Last CPU counters per container, so one-shot stats become a rate.
     pub(crate) cpu_samples: Mutex<HashMap<String, CpuSample>>,
+    /// Networks found with inter-container communication on and containers
+    /// attached; no new instance is created on them (see `netpolicy`).
+    blocked_networks: Mutex<BTreeSet<String>>,
+    /// The egress firewall rules were installed by the last `ready`.
+    egress_installed: AtomicBool,
+    /// The "not root, no egress rules" warning was logged.
+    egress_warned: AtomicBool,
 }
 
 /// Outcome of choosing the OCI runtime.
@@ -98,7 +109,44 @@ impl DockerRuntime {
             docker,
             chosen: OnceLock::new(),
             cpu_samples: Mutex::new(HashMap::new()),
+            blocked_networks: Mutex::new(BTreeSet::new()),
+            egress_installed: AtomicBool::new(false),
+            egress_warned: AtomicBool::new(false),
         })
+    }
+
+    /// True when the last [`Runtime::ready`] installed the host firewall rules
+    /// that keep instances away from the metadata service, private networks and
+    /// the host (root only; see the `netpolicy` module).
+    pub fn egress_rules_installed(&self) -> bool {
+        self.egress_installed.load(Ordering::Relaxed)
+    }
+
+    /// Networks that exist with inter-container communication enabled and
+    /// containers attached; `create` refuses instances on them until the
+    /// operator recreates the network.
+    pub fn blocked_networks(&self) -> Vec<String> {
+        self.blocked_networks
+            .lock()
+            .map(|b| b.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn network_blocked(&self, name: &str) -> bool {
+        self.blocked_networks
+            .lock()
+            .map(|b| b.contains(name))
+            .unwrap_or(false)
+    }
+
+    fn set_network_blocked(&self, name: &str, blocked: bool) {
+        if let Ok(mut set) = self.blocked_networks.lock() {
+            if blocked {
+                set.insert(name.to_string());
+            } else {
+                set.remove(name);
+            }
+        }
     }
 
     /// The OCI runtime new containers are created with (`runsc` or `runc`). Empty
@@ -169,16 +217,47 @@ impl DockerRuntime {
         }
         self.ensure_network(NETWORK_PUBLIC, false).await?;
         self.ensure_network(NETWORK_INTERNAL, true).await?;
+        self.install_egress_rules().await?;
         tracing::info!(
             runtime = %self.runtime_name(),
             server = info.server_version.as_deref().unwrap_or("?"),
             offered = ?available,
+            egress_rules = self.egress_rules_installed(),
             "docker runtime ready"
         );
         Ok(())
     }
 
-    /// Create the bridge network `name` unless it exists.
+    /// Containers (running or not) attached to the network `name`.
+    async fn attached_containers(&self, name: &str) -> Result<Vec<String>> {
+        let options = ListContainersOptions {
+            all: true,
+            filters: Some(HashMap::from([(
+                "network".to_string(),
+                vec![name.to_string()],
+            )])),
+            ..Default::default()
+        };
+        let list = self
+            .docker
+            .list_containers(Some(options))
+            .await
+            .map_err(|e| error::map(e, "container"))?;
+        Ok(list
+            .into_iter()
+            .map(|c| {
+                c.names
+                    .and_then(|n| n.first().cloned())
+                    .or(c.id)
+                    .unwrap_or_default()
+            })
+            .collect())
+    }
+
+    /// Create the bridge network `name` with inter-container communication off,
+    /// unless it already exists that way. An existing network with ICC on is
+    /// recreated when nothing is attached to it and otherwise blocked for new
+    /// instances with an error naming the fix.
     async fn ensure_network(&self, name: &str, internal: bool) -> Result<()> {
         match self.docker.inspect_network(name, None).await {
             Ok(net) => {
@@ -189,8 +268,31 @@ impl DockerRuntime {
                         "existing network has the wrong internal flag"
                     );
                 }
-                tracing::debug!(network = name, "network present");
-                return Ok(());
+                if netpolicy::icc_disabled(net.options.as_ref()) {
+                    self.set_network_blocked(name, false);
+                    tracing::debug!(network = name, "network present with ICC off");
+                    return Ok(());
+                }
+                let attached = self.attached_containers(name).await?;
+                if !attached.is_empty() {
+                    self.set_network_blocked(name, true);
+                    tracing::error!(
+                        network = name,
+                        containers = ?attached,
+                        "{}; refusing to create new instances on it until then",
+                        netpolicy::blocked_network_hint(name)
+                    );
+                    return Ok(());
+                }
+                tracing::warn!(
+                    network = name,
+                    "network exists with inter-container communication on and nothing attached; recreating it with ICC off"
+                );
+                match self.docker.remove_network(name).await {
+                    Ok(()) => {}
+                    Err(e) if error::is_not_found(&e) => {}
+                    Err(e) => return Err(error::map(e, "network")),
+                }
             }
             Err(e) if error::is_not_found(&e) => {}
             Err(e) => return Err(error::map(e, "network")),
@@ -199,12 +301,14 @@ impl DockerRuntime {
             name: name.to_string(),
             driver: Some("bridge".to_string()),
             internal: Some(internal),
+            options: Some(netpolicy::network_options()),
             labels: Some(HashMap::from([(
                 "warren.managed".to_string(),
                 "true".to_string(),
             )])),
             ..Default::default()
         };
+        self.set_network_blocked(name, false);
         match self.docker.create_network(request).await {
             Ok(created) => {
                 if !created.warning.is_empty() {
@@ -219,6 +323,66 @@ impl DockerRuntime {
             }
             Err(e) => Err(error::map(e, "network")),
         }
+    }
+
+    /// Host interface of the Docker network `name`, from its options or id.
+    pub(crate) async fn bridge_interface(&self, name: &str) -> Result<String> {
+        let net = self
+            .docker
+            .inspect_network(name, None)
+            .await
+            .map_err(|e| error::map(e, "network"))?;
+        netpolicy::bridge_name(net.options.as_ref(), net.id.as_deref().unwrap_or("")).ok_or_else(
+            || {
+                Error::internal(format!(
+                    "cannot determine the bridge interface of docker network {name}"
+                ))
+            },
+        )
+    }
+
+    /// Install the egress firewall rules for both Warren bridges when running as
+    /// root; otherwise warn once and leave them out. Idempotent. As root a
+    /// failure is an error: the daemon must not silently run without them.
+    async fn install_egress_rules(&self) -> Result<()> {
+        if !netpolicy::is_root() {
+            if !self.egress_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    uid = netpolicy::effective_uid(),
+                    "not root: egress rules (metadata service, private ranges, host) are not installed; instances can reach them"
+                );
+            }
+            return Ok(());
+        }
+        let iptables = netpolicy::find_tool("iptables").ok_or_else(|| {
+            Error::not_supported(
+                "iptables is not installed; it is needed for the instance egress rules",
+            )
+        })?;
+        let host_addrs = netpolicy::host_addresses().await;
+        if host_addrs.is_empty() && !self.cfg.allow_private_egress {
+            tracing::warn!(
+                "no host addresses found; instances are not kept from reaching the host"
+            );
+        }
+        let mut added = 0usize;
+        for name in [NETWORK_PUBLIC, NETWORK_INTERNAL] {
+            let bridge = self.bridge_interface(name).await?;
+            for rule in netpolicy::egress_rules(&bridge, self.cfg.allow_private_egress, &host_addrs)
+            {
+                if netpolicy::ensure_rule(&iptables, &rule).await? {
+                    added += 1;
+                }
+            }
+        }
+        self.egress_installed.store(true, Ordering::Relaxed);
+        tracing::info!(
+            added,
+            allow_private_egress = self.cfg.allow_private_egress,
+            host_addrs = ?host_addrs,
+            "egress rules in place for the warren bridges"
+        );
+        Ok(())
     }
 }
 

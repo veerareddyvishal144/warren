@@ -18,15 +18,19 @@ use warren_core::{
     Workspace,
 };
 
+/// A lifecycle write applied to the instance map, see [`FakeStore::after_next_listing`].
+type ListingHook = Box<dyn FnOnce(&mut BTreeMap<String, Instance>) + Send>;
+
 #[derive(Default)]
 struct State {
     workspaces: BTreeMap<String, Workspace>,
     instances: BTreeMap<String, Instance>,
     ledger: Vec<LedgerEntry>,
     next_id: u64,
-    /// Applied to `get_instance` reads only, to simulate the lifecycle moving a
-    /// status between the biller's listing and its save.
-    status_on_read: Option<(String, InstanceStatus)>,
+    /// Run against the instance map right after the next `list_all_instances`
+    /// has taken its snapshot, to simulate lifecycle writes that land between
+    /// the biller's listing and its metering.
+    after_listing: Vec<ListingHook>,
 }
 
 /// In-memory `Store`. Methods the biller does not use return `internal`.
@@ -35,8 +39,8 @@ pub struct FakeStore {
     state: Mutex<State>,
     /// Make `apply_ledger` fail.
     pub fail_ledger: AtomicBool,
-    /// Make `update_instance` fail.
-    pub fail_update_instance: AtomicBool,
+    /// Make `set_meter` fail.
+    pub fail_set_meter: AtomicBool,
 }
 
 fn unused() -> Error {
@@ -89,9 +93,13 @@ impl FakeStore {
             .collect()
     }
 
-    /// Make `get_instance(id)` report `status` without touching the stored row.
-    pub fn set_status_on_read(&self, id: &str, status: InstanceStatus) {
-        self.state.lock().status_on_read = Some((id.to_string(), status));
+    /// Apply `f` to the instance map right after the biller's next listing,
+    /// before it meters: the lifecycle writing between the two.
+    pub fn after_next_listing(
+        &self,
+        f: impl FnOnce(&mut BTreeMap<String, Instance>) + Send + 'static,
+    ) {
+        self.state.lock().after_listing.push(Box::new(f));
     }
 }
 
@@ -171,18 +179,12 @@ impl Store for FakeStore {
         Ok(())
     }
     async fn get_instance(&self, id: &str) -> Result<Instance> {
-        let st = self.state.lock();
-        let mut inst = st
+        self.state
+            .lock()
             .instances
             .get(id)
             .cloned()
-            .ok_or_else(|| Error::not_found("instance"))?;
-        if let Some((target, status)) = &st.status_on_read
-            && target == id
-        {
-            inst.status = *status;
-        }
-        Ok(inst)
+            .ok_or_else(|| Error::not_found("instance"))
     }
     async fn get_instance_for_workspace(&self, workspace_id: &str, id: &str) -> Result<Instance> {
         let inst = self.get_instance(id).await?;
@@ -202,21 +204,52 @@ impl Store for FakeStore {
             .collect())
     }
     async fn list_all_instances(&self) -> Result<Vec<Instance>> {
-        let all: Vec<Instance> = self.state.lock().instances.values().cloned().collect();
+        let all: Vec<Instance> = {
+            let mut st = self.state.lock();
+            let all = st.instances.values().cloned().collect();
+            let hooks = std::mem::take(&mut st.after_listing);
+            for hook in hooks {
+                hook(&mut st.instances);
+            }
+            all
+        };
         // Give concurrent callers a chance to interleave, as a real database would.
         tokio::task::yield_now().await;
         Ok(all)
     }
+    /// Like the real store, writes every field except the meter position.
     async fn update_instance(&self, inst: &Instance) -> Result<()> {
-        if self.fail_update_instance.load(Ordering::SeqCst) {
+        let mut st = self.state.lock();
+        let Some(stored) = st.instances.get_mut(&inst.id) else {
+            return Err(Error::not_found("instance"));
+        };
+        let (metered_through, meter_carry_micros) =
+            (stored.metered_through, stored.meter_carry_micros);
+        *stored = inst.clone();
+        stored.metered_through = metered_through;
+        stored.meter_carry_micros = meter_carry_micros;
+        Ok(())
+    }
+    async fn set_meter(
+        &self,
+        id: &str,
+        metered_through: i64,
+        carry_micros: f64,
+        expected_from: Option<i64>,
+    ) -> Result<bool> {
+        if self.fail_set_meter.load(Ordering::SeqCst) {
             return Err(Error::internal("instance table unavailable (injected)"));
         }
         let mut st = self.state.lock();
-        if !st.instances.contains_key(&inst.id) {
+        let Some(stored) = st.instances.get_mut(id) else {
             return Err(Error::not_found("instance"));
+        };
+        if expected_from.is_some_and(|expected| stored.metered_through != expected) {
+            return Ok(false);
         }
-        st.instances.insert(inst.id.clone(), inst.clone());
-        Ok(())
+        stored.metered_through = metered_through;
+        stored.meter_carry_micros = carry_micros;
+        Ok(true)
     }
     async fn delete_instance(&self, id: &str) -> Result<()> {
         self.state

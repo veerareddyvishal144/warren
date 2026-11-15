@@ -181,3 +181,74 @@ async fn templates_catalog_register_pin_and_delete() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn cors_allows_only_the_dashboard_origin() {
+    use axum::body::Body;
+    use http::{
+        Request,
+        header::{ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_ORIGIN, ORIGIN},
+    };
+    let h = Harness::new();
+    let dashboard = "http://warren.localhost:7337";
+    let preflight = |origin: &str| {
+        Request::builder()
+            .method("OPTIONS")
+            .uri("/v1/health")
+            .header(ORIGIN, origin)
+            .header("access-control-request-method", "GET")
+            .header("access-control-request-headers", "authorization")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, headers, _) = h.send(preflight(dashboard)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), dashboard);
+    assert_eq!(
+        headers.get(ACCESS_CONTROL_ALLOW_CREDENTIALS).unwrap(),
+        "true"
+    );
+
+    for origin in [
+        "http://evil.example",
+        "http://ab12cd34ef.warren.localhost:7337",
+        "https://warren.localhost:7337",
+    ] {
+        let (_, headers, _) = h.send(preflight(origin)).await;
+        assert!(
+            headers.get(ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+            "{origin} must not be granted"
+        );
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/health")
+            .header(ORIGIN, origin)
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, _) = h.send(req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            headers.get(ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+            "{origin}"
+        );
+    }
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/health")
+        .header(ORIGIN, dashboard)
+        .body(Body::empty())
+        .unwrap();
+    let (_, headers, _) = h.send(req).await;
+    assert_eq!(headers.get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), dashboard);
+
+    let cfg = warren_core::Config {
+        public_scheme: "https".into(),
+        public_port: 443,
+        base_domain: "warren.example".into(),
+        ..warren_core::Config::default()
+    };
+    assert_eq!(
+        crate::routes::dashboard_origin(&cfg),
+        "https://warren.example"
+    );
+}

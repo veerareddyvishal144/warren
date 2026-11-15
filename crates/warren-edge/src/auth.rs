@@ -4,8 +4,8 @@
 
 use axum::{body::Body, response::Response};
 use http::{
-    HeaderMap, HeaderValue, StatusCode, Uri,
-    header::{AUTHORIZATION, LOCATION, SET_COOKIE},
+    HeaderMap, HeaderValue, Method, StatusCode, Uri,
+    header::{LOCATION, ORIGIN, REFERER, SET_COOKIE},
 };
 use warren_core::{COOKIE_NAME, Config, Error, HEADER_API_KEY, Result, ids::KEY_PREFIX};
 
@@ -14,6 +14,10 @@ use crate::{Edge, headers};
 /// What the 401 says when nothing identified the caller.
 pub(crate) const UNAUTHENTICATED: &str =
     "This instance URL requires authentication. Send X-Warren-Key or open a signed URL.";
+
+/// What the 401 says when a session cookie arrives on a cross-origin request.
+pub(crate) const CROSS_ORIGIN: &str =
+    "The session cookie is only accepted on same-origin requests. Send X-Warren-Key instead.";
 
 /// A successful authentication.
 pub(crate) enum Outcome {
@@ -27,8 +31,10 @@ pub(crate) enum Outcome {
 /// Resolve the caller in contract order: key header, signed URL, cookie.
 pub(crate) async fn authorize(
     edge: &Edge,
+    method: &Method,
     headers: &HeaderMap,
     uri: &Uri,
+    host: &str,
     id: &str,
     host_port: u16,
 ) -> Result<Outcome> {
@@ -48,13 +54,19 @@ pub(crate) async fn authorize(
         tracing::debug!(instance = id, "signed URL accepted, setting session cookie");
         return Ok(Outcome::Redirect(redirect_without_token(
             &edge.config,
+            host,
             uri.path(),
             &rest,
             &token,
-        )));
+        )?));
     }
     if let Some(token) = cookie {
         verify_token(edge, &token, id, host_port)?;
+        let own = own_origins(&edge.config, host, id, host_port);
+        if !same_origin(method, headers, &own) {
+            tracing::debug!(instance = id, origin = ?headers.get(ORIGIN), referer = ?headers.get(REFERER), site = ?headers.get(SEC_FETCH_SITE), "session cookie refused on a cross-origin request");
+            return Err(Error::invalid_api_key(CROSS_ORIGIN));
+        }
         tracing::trace!(
             instance = id,
             "instance request authenticated by session cookie"
@@ -78,13 +90,73 @@ fn key_from_headers(headers: &HeaderMap, has_session: bool) -> Option<String> {
     {
         return Some(key.to_string());
     }
-    let auth = headers.get(AUTHORIZATION)?.to_str().ok()?.trim();
-    let scheme = auth.get(..7)?;
-    if !scheme.eq_ignore_ascii_case("bearer ") {
-        return None;
-    }
-    let token = auth[7..].trim();
+    let token = headers::bearer_token(headers)?;
     (token.starts_with(KEY_PREFIX) || !has_session).then(|| token.to_string())
+}
+
+const SEC_FETCH_SITE: http::HeaderName = http::HeaderName::from_static("sec-fetch-site");
+const SEC_FETCH_MODE: http::HeaderName = http::HeaderName::from_static("sec-fetch-mode");
+const SEC_FETCH_DEST: http::HeaderName = http::HeaderName::from_static("sec-fetch-dest");
+
+/// The origins a session cookie may be used from: the instance's own URLs for
+/// this host plus `scheme://<Host>` as the client sent it (a browser never
+/// lets a page choose the Host of a cross-origin request). Lowercase.
+fn own_origins(cfg: &Config, host: &str, id: &str, host_port: u16) -> Vec<String> {
+    let mut own = vec![cfg.instance_url(id).to_ascii_lowercase()];
+    if host_port != 0 {
+        own.push(cfg.preview_url(id, host_port).to_ascii_lowercase());
+    }
+    if !host.is_empty() {
+        own.push(format!("{}://{}", cfg.public_scheme, host).to_ascii_lowercase());
+    }
+    own
+}
+
+/// Whether a cookie-authenticated request is same-origin. A top-level
+/// document navigation with a safe method is always accepted: that is what
+/// `SameSite=Lax` already permits and how a signed URL opened from the
+/// dashboard becomes a cookie request after the 302. Everything else must
+/// carry an `Origin`/`Referer` of the instance itself (when present) and a
+/// `Sec-Fetch-Site` of `same-origin` or `none` (when present).
+pub(crate) fn same_origin(method: &Method, headers: &HeaderMap, own: &[String]) -> bool {
+    let header = |name: &http::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+    let safe = *method == Method::GET || *method == Method::HEAD;
+    let navigation = header(&SEC_FETCH_MODE).is_some_and(|m| m.eq_ignore_ascii_case("navigate"))
+        && header(&SEC_FETCH_DEST).is_some_and(|d| d.eq_ignore_ascii_case("document"));
+    if safe && navigation {
+        return true;
+    }
+    let listed = |origin: &str| {
+        let origin = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+        own.contains(&origin)
+    };
+    if let Some(origin) = header(&ORIGIN)
+        && !listed(origin)
+    {
+        return false;
+    }
+    if let Some(referer) = header(&REFERER)
+        && !listed(&origin_of(referer))
+    {
+        return false;
+    }
+    if let Some(site) = header(&SEC_FETCH_SITE)
+        && !(site.eq_ignore_ascii_case("same-origin") || site.eq_ignore_ascii_case("none"))
+    {
+        return false;
+    }
+    true
+}
+
+/// `scheme://authority` of a URL, or the input when it has no path.
+fn origin_of(url: &str) -> String {
+    let url = url.trim();
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let rest = &url[scheme_end + 3..];
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    format!("{}://{}", &url[..scheme_end], &rest[..end])
 }
 
 /// A signed-URL token is good for exactly one instance and one port; port 0
@@ -103,24 +175,37 @@ fn verify_token(edge: &Edge, token: &str, id: &str, host_port: u16) -> Result<()
     Ok(())
 }
 
-/// `302` to `path[?rest]` with the session cookie set.
-fn redirect_without_token(cfg: &Config, path: &str, rest: &str, token: &str) -> Response {
-    let location = if rest.is_empty() {
-        path.to_string()
-    } else {
-        format!("{path}?{rest}")
-    };
+/// `302` to `scheme://host/path[?rest]` with the session cookie set. The
+/// Location is absolute so a browser can never be sent to another host by a
+/// path such as `//evil.example/`, which is refused outright.
+fn redirect_without_token(
+    cfg: &Config,
+    host: &str,
+    path: &str,
+    rest: &str,
+    token: &str,
+) -> Result<Response> {
+    if path.starts_with("//") || path.starts_with("/\\") {
+        return Err(Error::invalid(
+            "The request path must not start with a double slash.",
+        ));
+    }
+    let path = if path.is_empty() { "/" } else { path };
+    let mut location = format!("{}://{host}{path}", cfg.public_scheme);
+    if !rest.is_empty() {
+        location.push('?');
+        location.push_str(rest);
+    }
+    let location = HeaderValue::from_str(&location)
+        .map_err(|_| Error::invalid("The request host or path is not a valid URL."))?;
     let mut resp = Response::new(Body::empty());
     *resp.status_mut() = StatusCode::FOUND;
     let h = resp.headers_mut();
-    h.insert(
-        LOCATION,
-        HeaderValue::from_str(&location).unwrap_or_else(|_| HeaderValue::from_static("/")),
-    );
+    h.insert(LOCATION, location);
     if let Ok(cookie) = HeaderValue::from_str(&session_cookie(cfg, token)) {
         h.insert(SET_COOKIE, cookie);
     }
-    resp
+    Ok(resp)
 }
 
 /// `warren_session=<token>; HttpOnly; SameSite=Lax; Path=/`, plus `Secure`

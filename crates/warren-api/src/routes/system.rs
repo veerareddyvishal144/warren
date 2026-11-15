@@ -2,12 +2,15 @@
 
 use std::sync::Arc;
 
-use axum::{Json, extract::State, response::Response};
+use axum::{Extension, Json, extract::State, response::Response};
 use serde::Serialize;
 use serde_json::{Value, json};
-use warren_core::{ApiKey, Result, Workspace, ids};
+use warren_core::{ApiKey, Error, Result, Workspace, ids};
 
-use crate::{Deps, JsonBody, SignupRequest, routes::created, validate};
+use crate::{
+    ClientIp, Deps, JsonBody, SIGNUPS_PER_HOUR, SignupRequest, ratelimit::RateLimiter,
+    routes::created, validate,
+};
 
 /// `GET /v1/health`
 pub async fn health(State(d): State<Arc<Deps>>) -> Json<Value> {
@@ -39,10 +42,27 @@ pub struct SignupResponse {
 }
 
 /// `POST /v1/signup`: a workspace, its free credit (once) and a first key.
+/// `404` when signups are disabled; `429 try_again` past [`SIGNUPS_PER_HOUR`]
+/// from one client IP (unknown peers share one bucket; loopback is exempt in
+/// dev mode).
 pub async fn signup(
     State(d): State<Arc<Deps>>,
+    Extension(limiter): Extension<Arc<RateLimiter>>,
+    ClientIp(ip): ClientIp,
     JsonBody(req): JsonBody<SignupRequest>,
 ) -> Result<Response> {
+    if !d.config.signup_enabled {
+        return Err(Error::not_found("route /v1/signup"));
+    }
+    let exempt = d.config.dev_mode && ip.is_some_and(|ip| ip.is_loopback());
+    if !exempt && !limiter.try_acquire(ip, d.clock.now_unix()) {
+        tracing::info!(ip = ?ip, "signup rate limit hit");
+        return Err(Error::new(
+            warren_core::errors::CODE_TRY_AGAIN,
+            429,
+            format!("Too many signups from this address; at most {SIGNUPS_PER_HOUR} per hour."),
+        ));
+    }
     let name = req
         .name
         .as_deref()

@@ -428,7 +428,7 @@ impl Runtime for FirecrackerRuntime {
         let dir = self.cfg.instances_dir();
         std::fs::create_dir_all(&dir)
             .map_err(|e| Error::internal(format!("mkdir {}: {e}", dir.display())))?;
-        host::ensure_network().await?;
+        host::ensure_network(self.cfg.allow_private_egress).await?;
         tracing::info!(firecracker = %bin.display(), kernel = %kernel.display(), bridge = BRIDGE, "firecracker runtime ready");
         Ok(())
     }
@@ -507,7 +507,7 @@ impl Runtime for FirecrackerRuntime {
         }
 
         self.write_config(inst, &p, ip)?;
-        host::ensure_network().await?;
+        host::ensure_network(self.cfg.allow_private_egress).await?;
         let tap = net::tap_name(&inst.id);
         host::tap_create(&tap).await?;
         if let Err(e) = host::set_egress(ip, inst.network == NetworkMode::AllowAll).await {

@@ -144,7 +144,7 @@ the balance rule and the exhausted-wallet stop with unit tests.
   image's gateway never came up. Check that `warren/base:<tag>` carries the real
   binary (`docker run --rm --entrypoint /usr/local/bin/warren-gateway warren/base:dev --version`);
   a stand-in script makes every scenario fail this way. Rebuild with
-  `cargo build --release -p warren-gateway && scripts/build-images.sh base agent`.
+  `make gateway && WARREN_SKIP_GATEWAY_BUILD=1 scripts/build-images.sh base agent`.
   To test images built under another tag without touching `:dev`, build with
   `WARREN_IMAGE_TAG=<tag>` and run the suite with `WARREN_E2E_IMAGE_TAG=<tag>`.
 - `remove storage: Permission denied` when an instance is deleted, or
@@ -178,6 +178,18 @@ WARREN_E2E_FIRECRACKER_BIN=/data/sandbox-probe/firecracker \
 otherwise the test prints that it was skipped. Without KVM the daemon logs
 "firecracker runtime not ready; vm instances disabled" and the test fails with
 that message in the log tail.
+
+## Dashboard smoke test (real browser)
+
+`scripts/dashboard-smoke.mjs` drives the embedded dashboard in headless Chrome against a dev daemon it starts itself: signup through the UI, create an instance from the form, wait for `running`, run a command in the exec console, open the billing panel, delete the instance. It fails on any browser console error, page error or failed request.
+
+```bash
+make build                          # release binaries and the static gateway
+npm i --no-save playwright-core     # one-time, in the repo root
+CHROME=/usr/bin/google-chrome node scripts/dashboard-smoke.mjs
+```
+
+Environment: `PORT` (default 7471), `CHROME`, `WARREN_BIN`, `WARREN_GATEWAY_BIN`, `WARREN_SMOKE_DATA` (default `data/dashboard-smoke`). On this host it passes in about 25 seconds.
 
 ## Manual walkthrough with curl
 

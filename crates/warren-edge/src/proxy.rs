@@ -15,10 +15,10 @@ use axum::{
 };
 use http::{
     HeaderMap, HeaderValue, Method, StatusCode, Uri, Version,
-    header::{CONNECTION, COOKIE, HOST, ORIGIN, UPGRADE},
+    header::{AUTHORIZATION, CONNECTION, COOKIE, HOST, HeaderName, ORIGIN, UPGRADE},
 };
 use hyper::{body::Incoming, upgrade::OnUpgrade};
-use warren_core::{Error, HEADER_API_KEY, Result};
+use warren_core::{Error, HEADER_API_KEY, HEADER_INSTANCE_TOKEN, Result};
 
 use crate::{
     Edge,
@@ -37,8 +37,9 @@ pub(crate) async fn handle(
     id: String,
     host_port: u16,
 ) -> Response {
+    let allowed = cors::allowed_origins(&edge.config, &id, host_port);
     if req.method() == Method::OPTIONS {
-        return cors::preflight(req.headers());
+        return cors::preflight(req.headers(), &allowed);
     }
     let origin = req.headers().get(ORIGIN).cloned();
     let mut resp = match serve(&edge, req, &host, &id, host_port).await {
@@ -48,7 +49,7 @@ pub(crate) async fn handle(
             e.into_response()
         }
     };
-    cors::apply(&mut resp, origin.as_ref());
+    cors::apply(&mut resp, origin.as_ref(), &allowed);
     resp
 }
 
@@ -59,14 +60,22 @@ async fn serve(
     id: &str,
     host_port: u16,
 ) -> Result<Response> {
-    if let Outcome::Redirect(resp) =
-        auth::authorize(edge, req.headers(), req.uri(), id, host_port).await?
+    if let Outcome::Redirect(resp) = auth::authorize(
+        edge,
+        req.method(),
+        req.headers(),
+        req.uri(),
+        host,
+        id,
+        host_port,
+    )
+    .await?
     {
         return Ok(resp);
     }
     let inst = edge.lifecycle.ensure_awake(id).await?;
     edge.lifecycle.record_activity(id);
-    let ip = edge.lifecycle.endpoint(id).await?;
+    let (ip, token) = edge.lifecycle.gateway_credentials(id).await?;
     let port = if host_port == 0 {
         inst.default_port
     } else {
@@ -75,7 +84,7 @@ async fn serve(
     if port == 0 {
         return Ok((StatusCode::BAD_GATEWAY, NO_DEFAULT_PORT).into_response());
     }
-    forward(edge, req, host, id, &ip, port).await
+    forward(edge, req, host, id, &ip, port, &token).await
 }
 
 /// Send the request to `ip:port` and relay the answer, tunnelling upgrades.
@@ -86,6 +95,7 @@ async fn forward(
     id: &str,
     ip: &str,
     port: u16,
+    token: &str,
 ) -> Result<Response> {
     // hyper parks the client's pending upgrade in the extensions. Taking it
     // out here (what `hyper::upgrade::on` does) tells us whether this request
@@ -109,6 +119,7 @@ async fn forward(
         &edge.config.public_scheme,
         peer,
         upgrade,
+        token,
     )?;
     tracing::debug!(instance = id, %method, target = %target, upstream = %authority, upgrade, "proxying");
 
@@ -153,8 +164,10 @@ async fn forward(
 }
 
 /// The upstream request: same method, path and query; `Host` rewritten to the
-/// instance; hop-by-hop headers, `X-Warren-Key` and the session cookie
-/// removed; `Authorization` kept; `X-Forwarded-*` set. The body streams.
+/// instance; hop-by-hop headers, `X-Warren-Key`, the session cookie and any
+/// client-sent `X-Warren-Instance-Token` removed; `Authorization` kept unless
+/// it carried a Warren key; `X-Forwarded-*` set and the instance token
+/// injected when the lifecycle knows one. The body streams.
 fn build_upstream(
     req: Request,
     authority: &str,
@@ -162,6 +175,7 @@ fn build_upstream(
     scheme: &str,
     peer: Option<IpAddr>,
     upgrade: bool,
+    token: &str,
 ) -> Result<Request<Body>> {
     let (parts, body) = req.into_parts();
     let target = parts.uri.path_and_query().map_or("/", |p| p.as_str());
@@ -170,6 +184,7 @@ fn build_upstream(
         .map_err(|_| Error::invalid("Malformed request target."))?;
 
     let nominated = headers::connection_nominated(&parts.headers);
+    let warren_bearer = headers::is_warren_bearer(&parts.headers);
     let mut out = HeaderMap::with_capacity(parts.headers.len() + 4);
     for (name, value) in &parts.headers {
         let keep_for_upgrade = upgrade && (*name == CONNECTION || *name == UPGRADE);
@@ -177,6 +192,8 @@ fn build_upstream(
         let ours = *name == HOST
             || *name == COOKIE
             || name.as_str() == HEADER_API_KEY
+            || name.as_str() == HEADER_INSTANCE_TOKEN
+            || (*name == AUTHORIZATION && warren_bearer)
             || *name == headers::X_FORWARDED_HOST
             || *name == headers::X_FORWARDED_PROTO
             || *name == headers::X_FORWARDED_FOR;
@@ -204,6 +221,12 @@ fn build_upstream(
     }
     if let Some(v) = headers::forwarded_for(&parts.headers, peer) {
         out.insert(headers::X_FORWARDED_FOR, v);
+    }
+    if !token.is_empty() {
+        out.insert(
+            HeaderName::from_static(HEADER_INSTANCE_TOKEN),
+            HeaderValue::from_str(token).map_err(|_| Error::internal("invalid instance token"))?,
+        );
     }
 
     let mut upstream = Request::builder()

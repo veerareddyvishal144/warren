@@ -14,7 +14,7 @@ This is the contract every component implements against: the daemon's **Sandbox 
 
 Unauthenticated instance requests get `401 invalid_api_key`. A request to a sleeping instance is held while the instance wakes, then forwarded. A request to a stopped instance gets `409 conflict`. A port nothing listens on gets `502 bad_gateway` (a plain-text body is fine; the URL always routes).
 
-CORS: the edge answers `OPTIONS` on instance hosts with `Access-Control-Allow-Origin: <request Origin>`, `Access-Control-Allow-Headers: X-Warren-Key, Content-Type, Authorization`, `Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS`, `Access-Control-Allow-Credentials: true`, and adds `Access-Control-Allow-Origin` to proxied responses when an Origin is present. The API host does the same.
+CORS: only trusted origins are granted. On an instance host the trusted origins are the dashboard (`<scheme>://<base>[:port]`, the root host) and the instance's own origins for the requested host (`instance_url(id)`, plus `preview_url(id, port)` on a port host). The edge answers `OPTIONS` on instance hosts with `204`; when the request `Origin` is trusted it adds `Access-Control-Allow-Origin: <request Origin>`, `Access-Control-Allow-Headers: X-Warren-Key, Content-Type, Authorization` (plus any requested headers), `Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS`, `Access-Control-Allow-Credentials: true`, and adds `Access-Control-Allow-Origin`/`-Credentials` to proxied responses and edge errors. Any other `Origin` gets no `Access-Control-Allow-Origin` at all (only `Vary: Origin`). The API host trusts the dashboard origin only.
 
 ## Conventions
 
@@ -50,9 +50,9 @@ CORS: the edge answers `OPTIONS` on instance hosts with `Access-Control-Allow-Or
 ## Sandbox API (`/v1`)
 
 ### Health, version, signup
-- `GET /v1/health` -> `{ "healthy": true, "version": "...", "runtimes": ["docker"], "time": 1763000000 }`. No auth.
+- `GET /v1/health` -> `{ "healthy": true, "version": "...", "runtimes": ["docker"], "dev_mode": false, "time": 1763000000 }`. No auth.
 - `GET /v1/version` -> `{ "version": "..." }`. No auth.
-- `POST /v1/signup` body `{ "name"?: string }` -> `201 { "workspace": {...}, "api_key": "sk_live_...", "key_id": "...", "wallet_micros": 5000000 }`. No auth. Grants the configured free credit once. In non-dev mode may be disabled by config later; for now always on.
+- `POST /v1/signup` body `{ "name"?: string }` -> `201 { "workspace": {...}, "api_key": "sk_live_...", "key_id": "...", "wallet_micros": 5000000 }`. No auth. Grants the configured free credit once. `404 not_found` when the daemon runs with `--signup-enabled false` (`WARREN_SIGNUP_ENABLED`). Limited to 10 signups per hour per client IP, `429 try_again` beyond that; in dev mode loopback clients are exempt.
 
 ### Workspace, keys, billing
 - `GET /v1/workspace` -> workspace object plus `{ "awake_limit": 3, "awake_count": 1 }`.
@@ -73,7 +73,7 @@ Awake-instance limit by cumulative top-ups: 3 before any top-up; 10 after the fi
 ### Instances
 - `POST /v1/instances` body `CreateInstanceRequest` (all optional; default template `warren-base`, type `default`, `auto_sleep: false`, `idle_timeout_seconds: 900`, `network: "allow-all"`). Validation: template resolves; type allowed by template and a runtime exists for it (`performance` -> `not_supported`); shape per `warren_core::shapes::normalize`; `idle_timeout_seconds` within `[MinIdleTimeoutSec, 86400]`; env keys `[A-Z_][A-Z0-9_]*`, at most 64 entries, values <= 4 KiB; metadata <= 32 entries. Billing: wallet must hold one day of the running rate -> `402 insufficient_balance`; awake limit -> `409 instance_limit_reached`. Returns `201` with status `provisioning` immediately. Nothing is charged until the instance first reaches `running`.
 - `GET /v1/instances` -> list. `GET /v1/instances/{id}` -> instance. `PATCH /v1/instances/{id}` body `PatchInstanceRequest` -> instance (auto-sleep, idle timeout, name, metadata, env, network, budget change live; env changes apply at next start).
-- `DELETE /v1/instances/{id}` -> `{ "id": "...", "status": "deleting" }`; the instance is destroyed and removed, final minutes settled.
+- `DELETE /v1/instances/{id}` -> `{ "id": "...", "status": "deleting" }`; the instance is destroyed and removed; the partial minute since the last tick is not charged.
 
 Lifecycle operations below return `{ "id", "status" }`. In the single-node build they complete synchronously, so the status is the resulting state: `stop` answers `stopped`, `start` and `restart` answer `running`, `sleep` answers `sleeping`, `update` answers `running`; clients must still accept the transitional states (`stopping`, `starting`, `restarting`, `updating`) that a multi-node build may return.
 - `POST /v1/instances/{id}/stop` -> `{ "id", "status": "stopping" }`. Stopped bills disk only and never wakes on request.
@@ -92,9 +92,11 @@ Lifecycle operations below return `{ "id", "status" }`. In the single-node build
 
 ## Agent API (served by the gateway inside the instance on port 3737)
 
-Reachable at the instance URL after edge auth. The daemon reaches it directly by IP with no auth; `/v1/exec` additionally requires `X-Warren-Instance-Token`.
+Reachable at the instance URL after edge auth. The daemon reaches it directly by IP and authenticates with `x-warren-instance-token` on every route except health and version; the edge adds that header to proxied requests, so clients never see or send it. The token is the instance's `WARREN_INSTANCE_TOKEN`; the check is applied as middleware over the whole router before routing, so only the exact paths `GET /v1/health` and `GET /v1/version` answer without it and every other spelling or route (`//v1/files`, `/v1/./files`, `/`, unknown paths) needs it. A missing or wrong token -> `401 invalid_api_key` with a message naming the header. When `WARREN_INSTANCE_TOKEN` is empty (local runs) every route is open and the gateway logs a warning at startup.
 
-- `GET /v1/health` -> `{ "healthy": true, "agent_ready": true, "driver": "openai", "version": "..." }`. When the gateway was injected into a registered image and wraps its entrypoint, the object also carries `"wrapped": { "running": bool, "pid": n, "exit_code": n|null, "started_at": ms|null, "exited_at": ms|null }`.
+Processes the gateway starts for users (`/v1/exec` children, the drivers' shells and commands, the `ttyd` terminal, the wrapped entrypoint) never inherit the `WARREN_*` platform variables except `WARREN_HOME`; the instance token in particular is not visible to agent commands.
+
+- `GET /v1/health` -> `{ "healthy": true, "agent_ready": true, "driver": "openai", "version": "...", "home_owner": { "uid": n, "name": "agent" } }`. `home_owner` is the user agent commands run as and created files belong to (the owner of the persistent home under a root gateway, else the gateway's own user; a root-owned home under a root gateway is reported as uid 0 and logged loudly at startup). When the gateway was injected into a registered image and wraps its entrypoint, the object also carries `"wrapped": { "running": bool, "pid": n, "exit_code": n|null, "started_at": ms|null, "exited_at": ms|null }`.
 - `GET /v1/version` -> `{ "version": "..." }`.
 - `POST /v1/responses` body `{ "input": string, "session_id"?: string, "stream"?: bool, "model"?: string, "files"?: [string], "metadata"?: object }`.
   - Non-stream -> `{ "id", "session_id", "status": "completed" | "failed", "output_text", "created_at", "completed_at", "usage"?: {...}, "error"?: string }`.
@@ -105,7 +107,8 @@ Reachable at the instance URL after edge auth. The daemon reaches it directly by
 - `GET /v1/sessions` -> `{ "data": [{ "id", "name", "created_at", "updated_at", "message_count" }] }` newest first. `GET /v1/sessions/{id}` -> `{ "id", "name", "messages": [{ "role", "content", "at" }] }`. `PATCH /v1/sessions/{id}` body `{ "name" }`. `DELETE /v1/sessions/{id}`.
 - `GET /v1/models` -> `{ "data": [{ "id": "default" }, ...] }`.
 - Files, all paths relative to the persistent home and confined to it (`..` and absolute paths outside home -> `403 forbidden`): `GET /v1/files?path=.` -> `{ "path", "entries": [{ "name", "type": "file"|"dir", "size", "modified_at" }] }`; `GET /v1/files/content?path=` -> raw bytes with a content type guess; `PUT /v1/files/content?path=` raw body -> `{ "path", "size" }` (creates parents); `DELETE /v1/files?path=` -> `{ "path", "deleted": true }`; `POST /v1/files/move` body `{ "from", "to" }`; `GET /v1/files/download?path=` -> `application/gzip` tarball of a directory.
-- `POST /v1/exec` header `X-Warren-Instance-Token` body `ExecRequest` -> `ExecResult`. Used by the daemon for vm-type instances; the docker runtime uses Docker exec instead.
+- `POST /v1/exec` body `ExecRequest` -> `ExecResult`. Used by the daemon for vm-type instances and by the cron scheduler; the docker runtime uses Docker exec instead. The child's environment is the gateway's minus the `WARREN_*` variables (except `WARREN_HOME`), plus `HOME`, `USER`/`LOGNAME` when switching user, and the request's `env`.
+- `POST /v1/shutdown` -> `{ "status": "powering_off" }` in microVM init mode, else `400 not_supported`.
 
 Agent drivers (selected by `WARREN_AGENT_DRIVER`):
 - `echo`: deterministic for tests. Replies `echo: <input>`; an input starting with `!` runs the rest as a shell command and replies with its combined output; `!!sleep N` style commands are allowed. Streams the reply in at least two deltas.
@@ -117,8 +120,8 @@ Sessions and responses persist as JSON files under `<home>/.warren/`.
 ## Edge rules
 
 1. Parse Host with `Config::parse_host`. `root` -> dashboard, except paths under `/v1/` which go to the API. `api` -> API.
-2. `instance`: resolve auth: `X-Warren-Key` or `Authorization: Bearer` -> `Authenticator`; else `?warren_token=` -> `Signer.Verify` (id and port must match the host; port 0 in the token means the default port) -> set cookie `warren_session=<token>` (HttpOnly, SameSite=Lax, Path=/) and `302` to the same URL without the token; else cookie `warren_session` -> verify likewise. Failures -> `401 invalid_api_key` JSON.
+2. `instance`: resolve auth: `X-Warren-Key` or `Authorization: Bearer` -> `Authenticator`; else `?warren_token=` -> `Signer.Verify` (id and port must match the host; port 0 in the token means the default port) -> set cookie `warren_session=<token>` (HttpOnly, SameSite=Lax, Path=/, Secure on https) and `302` to the same URL without the token. The `Location` is absolute (`<scheme>://<request Host><path>[?rest]`); a path starting with `//` is refused with `400 invalid_request`. Else cookie `warren_session` -> verify likewise, and the request must be same-origin: `Origin` and `Referer`, when present, must be the instance's own origin (`instance_url(id)`, `preview_url(id, port)` on a port host, or `<scheme>://<request Host>`), and `Sec-Fetch-Site`, when present, must be `same-origin` or `none`. A top-level document navigation with GET/HEAD (`Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`) is accepted regardless, which is how a signed URL opened from the dashboard becomes a cookie request after the 302. A cookie on a cross-origin request -> `401 invalid_api_key` and nothing is proxied. Other failures -> `401 invalid_api_key` JSON.
 3. The instance must belong to the authenticated workspace (key auth) -> else `404 not_found`.
 4. `Lifecycle.EnsureAwake(id)`; `Lifecycle.RecordActivity(id)` on every proxied request and response.
-5. Proxy to `http://<ip>:<port>` with `httputil.ReverseProxy`, preserving path and query, setting `X-Forwarded-Host`, `X-Forwarded-Proto`, stripping `X-Warren-Key`, `Authorization` is preserved for the instance's own use, `warren_session` cookie stripped from the forwarded Cookie header. WebSocket upgrades pass through.
+5. Proxy to `http://<ip>:<port>` with `httputil.ReverseProxy`, preserving path and query, setting `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Forwarded-For`, stripping `X-Warren-Key` and any client-sent `X-Warren-Instance-Token`; `Authorization` is forwarded only when it is not a Warren key (a `Bearer sk_live_...` is the edge's credential and is removed whether or not it authenticated; any other value is the instance's own and passes through); the `warren_session` cookie is stripped from the forwarded Cookie header. The edge resolves `Lifecycle.GatewayCredentials(id)` and, when the instance token is non-empty, sets `X-Warren-Instance-Token` on the upstream request. WebSocket upgrades pass through. Proxied requests stream and have no overall deadline; Sandbox API requests have a 60 s deadline (`504 timeout`) except `POST /v1/instances/{id}/exec`, which runs to its own `timeout_sec`. The listener caps requests in flight (4096); further requests queue.
 6. Port: 0 -> `Instance.DefaultPort`; if the default port is 0 -> `502` with text "this template has no default port".

@@ -2,6 +2,16 @@
 //! forwarding and NAT, tap devices, and per-guest egress rules. Everything shells
 //! out to `ip` and `iptables`, which is what the kernel netlink API looks like
 //! from a daemon that must also run unprivileged for development.
+//!
+//! Guest isolation: every tap is a *isolated* bridge port, so frames are only
+//! forwarded between a tap and the bridge itself, never tap to tap, and guests
+//! cannot reach each other. Forwarded traffic from the guest subnet to the
+//! link-local range (the cloud metadata service) is dropped always, and to the
+//! RFC1918 ranges unless `Config::allow_private_egress`; new connections from
+//! the guest subnet to the host's own addresses are dropped in `INPUT` under
+//! the same flag (traffic to a local address never traverses `FORWARD`). The
+//! rules are checked with `-C` before they are inserted and are left in place
+//! on shutdown.
 
 use std::{
     net::Ipv4Addr,
@@ -130,10 +140,113 @@ pub fn link_exists(name: &str) -> bool {
     Path::new("/sys/class/net").join(name).exists()
 }
 
+/// Link-local range, which holds the cloud metadata service (169.254.169.254).
+pub const LINK_LOCAL: &str = "169.254.0.0/16";
+/// RFC1918 ranges guests may not reach unless `Config::allow_private_egress`.
+pub const PRIVATE_RANGES: [&str; 3] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
+
+/// `ip link set dev <tap> type bridge_slave isolated on`: the arguments that make
+/// a tap an isolated bridge port (no tap-to-tap forwarding).
+pub fn tap_isolate_args(tap: &str) -> [&str; 8] {
+    [
+        "link",
+        "set",
+        "dev",
+        tap,
+        "type",
+        "bridge_slave",
+        "isolated",
+        "on",
+    ]
+}
+
+/// The egress policy rules for the guest subnet (chain first, no operation
+/// flag). Link-local is always dropped in `FORWARD`; with private egress
+/// disallowed the RFC1918 ranges join it and new connections to each host
+/// address are dropped in `INPUT`.
+pub fn egress_policy_rules(
+    allow_private_egress: bool,
+    host_addrs: &[Ipv4Addr],
+) -> Vec<Vec<String>> {
+    let forward_drop = |dest: &str| -> Vec<String> {
+        [
+            "FORWARD", "-i", BRIDGE, "-s", SUBNET, "-d", dest, "-j", "DROP",
+        ]
+        .map(String::from)
+        .to_vec()
+    };
+    let mut rules = vec![forward_drop(LINK_LOCAL)];
+    if allow_private_egress {
+        return rules;
+    }
+    rules.extend(PRIVATE_RANGES.iter().map(|r| forward_drop(r)));
+    for addr in host_addrs {
+        let dest = format!("{addr}/32");
+        rules.push(
+            [
+                "INPUT",
+                "-i",
+                BRIDGE,
+                "-s",
+                SUBNET,
+                "-d",
+                &dest,
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "NEW",
+                "-j",
+                "DROP",
+            ]
+            .map(String::from)
+            .to_vec(),
+        );
+    }
+    rules
+}
+
+/// Addresses from the JSON of `ip -j -4 addr`: every `inet` address whose scope
+/// is not `host`, deduplicated, loopback excluded.
+pub fn parse_ip_addr_json(text: &str) -> Vec<Ipv4Addr> {
+    let Ok(serde_json::Value::Array(links)) = serde_json::from_str::<serde_json::Value>(text)
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    for info in links
+        .iter()
+        .filter_map(|l| l.get("addr_info")?.as_array())
+        .flatten()
+    {
+        if info.get("family").and_then(|f| f.as_str()) != Some("inet")
+            || info.get("scope").and_then(|s| s.as_str()) == Some("host")
+        {
+            continue;
+        }
+        if let Some(addr) = info
+            .get("local")
+            .and_then(|l| l.as_str())
+            .and_then(|l| l.parse::<Ipv4Addr>().ok())
+            && !addr.is_loopback()
+            && !out.contains(&addr)
+        {
+            out.push(addr);
+        }
+    }
+    out
+}
+
+/// The host's non-loopback IPv4 addresses, via `ip -j -4 addr`.
+pub async fn host_addresses(ip: &Path) -> Result<Vec<Ipv4Addr>> {
+    let out = run(ip, &["-j", "-4", "addr"]).await?;
+    Ok(parse_ip_addr_json(&String::from_utf8_lossy(&out.stdout)))
+}
+
 /// Bring the guest network up: the bridge with the host address, IPv4
-/// forwarding, MASQUERADE for the subnet, and FORWARD accepts for the bridge
-/// (Docker sets the FORWARD policy to DROP). Idempotent; needs root.
-pub async fn ensure_network() -> Result<()> {
+/// forwarding, MASQUERADE for the subnet, FORWARD accepts for the bridge
+/// (Docker sets the FORWARD policy to DROP) and, above them, the egress policy
+/// drops of [`egress_policy_rules`]. Idempotent; needs root.
+pub async fn ensure_network(allow_private_egress: bool) -> Result<()> {
     require_root("configure the guest network")?;
     let ip = tool("ip")?;
     let iptables = tool("iptables")?;
@@ -162,6 +275,15 @@ pub async fn ensure_network() -> Result<()> {
     ensure_rule(&iptables, &nat).await?;
     ensure_rule(&iptables, &["FORWARD", "-i", BRIDGE, "-j", "ACCEPT"]).await?;
     ensure_rule(&iptables, &["FORWARD", "-o", BRIDGE, "-j", "ACCEPT"]).await?;
+    // Inserted after the accepts, so `-I` places them ahead.
+    let host_addrs = host_addresses(&ip).await?;
+    if host_addrs.is_empty() && !allow_private_egress {
+        tracing::warn!("no host addresses found; guests are not kept from reaching the host");
+    }
+    for rule in egress_policy_rules(allow_private_egress, &host_addrs) {
+        let parts: Vec<&str> = rule.iter().map(String::as_str).collect();
+        ensure_rule(&iptables, &parts).await?;
+    }
     Ok(())
 }
 
@@ -205,7 +327,31 @@ pub async fn tap_create(name: &str) -> Result<()> {
     }
     run(&ip, &["tuntap", "add", name, "mode", "tap"]).await?;
     run(&ip, &["link", "set", name, "master", BRIDGE, "up"]).await?;
+    // Isolated port: the kernel never forwards frames between two isolated
+    // ports, so guests cannot reach each other even on the same bridge.
+    run(&ip, &tap_isolate_args(name)).await?;
+    if !tap_is_isolated(name).await? {
+        let _ = run(&ip, &["link", "del", name]).await;
+        return Err(Error::internal(format!(
+            "tap {name} did not become an isolated bridge port; guests could reach each other"
+        )));
+    }
     Ok(())
+}
+
+/// True when the bridge port `name` is isolated (from `ip -d -j link show`).
+pub async fn tap_is_isolated(name: &str) -> Result<bool> {
+    let ip = tool("ip")?;
+    let out = run(&ip, &["-d", "-j", "link", "show", "dev", name]).await?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| Error::internal(format!("ip -d -j link show {name}: {e}")))?;
+    Ok(parsed
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|l| l.get("linkinfo")?.get("info_slave_data")?.get("isolated"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false))
 }
 
 /// Delete a tap device if it exists. Needs root only when there is one.
@@ -274,6 +420,59 @@ mod tests {
     }
 
     #[test]
+    fn tap_isolation_command_is_composed() {
+        assert_eq!(
+            tap_isolate_args("tap-ab12cd34").join(" "),
+            "link set dev tap-ab12cd34 type bridge_slave isolated on"
+        );
+    }
+
+    #[test]
+    fn egress_policy_covers_metadata_private_ranges_and_host() {
+        let host = [Ipv4Addr::new(10, 0, 0, 13), Ipv4Addr::new(172, 30, 0, 1)];
+        let rules = egress_policy_rules(false, &host);
+        assert_eq!(rules.len(), 1 + PRIVATE_RANGES.len() + host.len());
+        assert_eq!(
+            rules[0].join(" "),
+            "FORWARD -i warren-fc0 -s 172.30.0.0/24 -d 169.254.0.0/16 -j DROP"
+        );
+        for (rule, range) in rules[1..].iter().zip(PRIVATE_RANGES) {
+            assert_eq!(
+                rule.join(" "),
+                format!("FORWARD -i warren-fc0 -s 172.30.0.0/24 -d {range} -j DROP")
+            );
+        }
+        assert_eq!(
+            rules[1 + PRIVATE_RANGES.len()].join(" "),
+            "INPUT -i warren-fc0 -s 172.30.0.0/24 -d 10.0.0.13/32 -m conntrack --ctstate NEW -j DROP"
+        );
+        // `-C`/`-I` go in front of the chain name.
+        let parts: Vec<&str> = rules[0].iter().map(String::as_str).collect();
+        assert_eq!(with_op(&parts, "-C")[..2], ["-C", "FORWARD"]);
+        // Private egress allowed: only the metadata range is dropped.
+        let open = egress_policy_rules(true, &host);
+        assert_eq!(open.len(), 1);
+        assert!(open[0].contains(&LINK_LOCAL.to_string()));
+    }
+
+    #[test]
+    fn parses_ip_addr_json() {
+        let json = r#"[
+          {"ifname":"lo","addr_info":[{"family":"inet","local":"127.0.0.1","scope":"host"}]},
+          {"ifname":"eth0","addr_info":[
+             {"family":"inet","local":"10.0.0.13","scope":"global"},
+             {"family":"inet6","local":"fe80::1","scope":"link"}]},
+          {"ifname":"warren-fc0","addr_info":[{"family":"inet","local":"172.30.0.1","scope":"global"},
+                                              {"family":"inet","local":"172.30.0.1","scope":"global"}]}
+        ]"#;
+        assert_eq!(
+            parse_ip_addr_json(json),
+            vec![Ipv4Addr::new(10, 0, 0, 13), Ipv4Addr::new(172, 30, 0, 1)]
+        );
+        assert!(parse_ip_addr_json("nope").is_empty());
+    }
+
+    #[test]
     fn finds_common_tools() {
         assert!(find_tool("sh").is_some());
         assert!(find_tool("definitely-not-a-tool-zzz").is_none());
@@ -322,19 +521,36 @@ mod tests {
     #[tokio::test]
     async fn network_setup_requires_root_or_works() {
         if !is_root() {
-            let err = ensure_network().await.unwrap_err();
+            let err = ensure_network(false).await.unwrap_err();
             assert!(err.message.contains("needs root"));
             assert!(tap_create("tap-test0").await.is_err());
             // Deleting a tap that does not exist needs no privilege.
             tap_delete("tap-does-not-exist").await.unwrap();
+            eprintln!("skipping the live bridge, tap isolation and iptables checks: needs root");
             return;
         }
-        ensure_network().await.unwrap();
-        ensure_network().await.unwrap();
+        ensure_network(false).await.unwrap();
+        ensure_network(false).await.unwrap();
         assert!(link_exists(BRIDGE));
+        let iptables = tool("iptables").unwrap();
+        let ip = tool("ip").unwrap();
+        let host_addrs = host_addresses(&ip).await.unwrap();
+        assert!(!host_addrs.is_empty());
+        for rule in egress_policy_rules(false, &host_addrs) {
+            let parts: Vec<&str> = rule.iter().map(String::as_str).collect();
+            assert!(
+                succeeds(&iptables, &with_op(&parts, "-C")).await.unwrap(),
+                "rule present: {}",
+                rule.join(" ")
+            );
+        }
         tap_create("tap-wtest0").await.unwrap();
         tap_create("tap-wtest0").await.unwrap();
         assert!(link_exists("tap-wtest0"));
+        assert!(
+            tap_is_isolated("tap-wtest0").await.unwrap(),
+            "the tap is an isolated bridge port"
+        );
         tap_delete("tap-wtest0").await.unwrap();
         assert!(!link_exists("tap-wtest0"));
         let guest = Ipv4Addr::new(172, 30, 0, 253);

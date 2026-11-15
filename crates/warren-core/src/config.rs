@@ -24,6 +24,13 @@ pub struct Config {
     pub gateway_bin: Option<PathBuf>,
     /// Dev top-ups without a payment provider, short idle timeouts, host.docker.internal.
     pub dev_mode: bool,
+    /// Whether POST /v1/signup is served. Hosted deployments usually gate signup
+    /// behind their own flow and turn this off.
+    pub signup_enabled: bool,
+    /// Let instances reach RFC 1918 ranges and the host's own addresses. Off by
+    /// default; the cloud metadata range 169.254.0.0/16 is always blocked when the
+    /// daemon can install firewall rules.
+    pub allow_private_egress: bool,
     pub free_credit_micros: Money,
     pub min_idle_timeout_sec: u32,
     pub rates: Rates,
@@ -50,6 +57,8 @@ impl Default for Config {
             kernel_image: None,
             gateway_bin: None,
             dev_mode: false,
+            signup_enabled: true,
+            allow_private_egress: false,
             free_credit_micros: 5 * MICROS_PER_DOLLAR,
             min_idle_timeout_sec: MIN_IDLE_TIMEOUT_SEC,
             rates: Rates::default(),

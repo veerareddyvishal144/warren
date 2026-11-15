@@ -113,6 +113,9 @@ pub struct HealthResponse {
     pub version: String,
     #[serde(default)]
     pub runtimes: Vec<String>,
+    /// True when the daemon runs with `--dev` (dev top-ups accepted).
+    #[serde(default)]
+    pub dev_mode: bool,
     /// Unix seconds.
     #[serde(default)]
     pub time: i64,

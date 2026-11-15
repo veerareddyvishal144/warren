@@ -24,12 +24,13 @@ Warren is a single Rust binary (`warrend`) that runs the whole platform on one L
 
 ## Quickstart (90 seconds)
 
-Prerequisites: a Linux x86_64 host with Docker (24 or newer) that your user can talk to, a Rust toolchain (1.90 or newer), `git`, `curl` and, for the examples below, `jq`.
+Prerequisites: a Linux x86_64 host with Docker (24 or newer) that your user can talk to, a Rust toolchain (1.90 or newer), the musl target for the static gateway (`make musl-setup` installs `musl-tools` and `rustup target add x86_64-unknown-linux-musl`), `git`, `curl` and, for the examples below, `jq`.
 
 ```bash
 git clone https://github.com/veerareddyvishal144/warren.git && cd warren
 sudo scripts/install-gvisor.sh    # optional but recommended: runs default instances under gVisor
-make images                        # builds warren-gateway and the warren/base, warren/agent, warren/opencode images
+make musl-setup                    # one-time: musl-tools and the x86_64-unknown-linux-musl target
+make images                        # builds the static warren-gateway and the warren/base, warren/agent, warren/opencode images
 make dev-up                        # runs warrend --dev on :7337 with data under ./data
 ```
 
@@ -59,7 +60,7 @@ curl -s "$WARREN_API/instances/$ID/signed-url?port=7681&ttl=3600" -H "$AUTH"
 # {"url":"http://ab12cd34ef-7681.warren.localhost:7337/?warren_token=...","expires_at":...}
 ```
 
-`*.localhost` resolves to the loopback address on Linux, so the instance URLs work in curl and in a browser without any DNS setup. The dashboard is at `http://warren.localhost:7337/`; paste the key there to see the instance, its wallet and the ledger. [docs/quickstart.md](docs/quickstart.md) continues with the built-in agent, files, sleep and wake.
+Chrome, Firefox and hosts running systemd-resolved resolve `*.localhost` to the loopback address, so the instance URLs work in a browser and in curl without DNS setup; on other hosts add `--resolve api.warren.localhost:7337:127.0.0.1` (and the same for each instance host) to curl, or add the names to `/etc/hosts`. The dashboard is at `http://warren.localhost:7337/`; paste the key there to see the instance, its wallet and the ledger. [docs/quickstart.md](docs/quickstart.md) continues with the built-in agent, files, sleep and wake.
 
 ## Architecture
 
@@ -137,7 +138,7 @@ Shapes are the four CPU/RAM pairs above (`2/4`, `4/8`, `4/16`, `4/32`); a reques
 
 ## Clients
 
-- **CLI**: `cargo build --release -p warren-cli` builds `target/release/cli`; install it as `warren`. `warren signup`, `warren instances create --template warren-agent --wait`, `warren instances exec <id> -- uname -a`, `warren chat <id> "hello"`, `warren instances open <id> --port 7681`.
+- **CLI**: `cargo build --release -p warren-cli` builds `target/release/warren`. `warren signup`, `warren instances create --template warren-agent --wait`, `warren instances exec <id> -- uname -a`, `warren chat <id> "hello"`, `warren instances open <id> --port 7681`.
 - **MCP server** for Claude Code, Cursor, Claude Desktop and Windsurf: [mcp/README.md](mcp/README.md).
 - **Rust SDK**: `warren-sdk`, a client for both the Sandbox API and the Agent API, used by the CLI, the MCP server and the end-to-end tests.
 - **Python and TypeScript**: one-file, dependency-free clients for both APIs, including streaming chat: [sdk/python](sdk/python/README.md) (Python 3.8+, standard library only) and [sdk/typescript](sdk/typescript/README.md) (`fetch`-based; Node 20+, Deno, Bun, browsers).
@@ -152,7 +153,7 @@ Shapes are the four CPU/RAM pairs above (`2/4`, `4/8`, `4/16`, `4/32`); a reques
 
 - **Memory checkpoints**: gVisor checkpoint/restore and Firecracker snapshots so sleep keeps processes and memory, not only files. The API does not change.
 - **Multi-node scheduler**: place instances across hosts; the `region` field is already on every instance.
-- **Allowlist egress**: per-instance outbound rules beyond today's `allow-all` and `deny-all`.
+- **Allowlist egress**: per-instance outbound rules beyond today's `allow-all` and `deny-all`. 0.1.0 already blocks cloud metadata (`169.254.0.0/16`) and, unless `--allow-private-egress` is set, private ranges host-wide; the allowlist adds per-instance destinations.
 - **Stripe**: real top-ups next to the `dev` provider.
 - **Cloudflare edge**: terminate TLS and authenticate at the edge, with the daemon as origin.
 

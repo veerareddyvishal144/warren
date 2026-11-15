@@ -6,7 +6,7 @@ This page takes a fresh Linux machine to a running instance with a shell, a brow
 
 - A Linux x86_64 host. Debian 12 and Ubuntu 22.04 or newer are what the images and scripts are tested with.
 - Docker 24 or newer, and a user that can talk to it (`docker info` works without `sudo`, or run the daemon as root).
-- A Rust toolchain, 1.90 or newer (`curl https://sh.rustup.rs -sSf | sh`).
+- A Rust toolchain, 1.90 or newer (`curl https://sh.rustup.rs -sSf | sh`), plus the musl target for the static gateway: `make musl-setup` (runs `sudo apt-get install musl-tools` and `rustup target add x86_64-unknown-linux-musl`).
 - `git`, `curl`, and `jq` for the examples.
 
 Optional, recommended: gVisor, so default instances run under `runsc` instead of `runc`:
@@ -23,7 +23,8 @@ Without gVisor the daemon logs a warning and uses `runc`, which is fine for deve
 
 ```bash
 git clone https://github.com/veerareddyvishal144/warren.git && cd warren
-make images     # cargo build --release -p warren-gateway, then docker build warren/base:dev, warren/agent:dev, warren/opencode:dev
+make musl-setup # one-time: musl-tools and the x86_64-unknown-linux-musl target
+make images     # static musl build of warren-gateway, then docker build warren/base:dev, warren/agent:dev, warren/opencode:dev
 make dev-up     # cargo build --release of the binaries, then warrend --dev on :7337 with data under ./data
 ```
 
@@ -37,10 +38,10 @@ The script accepts `--no-build` and `WARREN_PORT`, `WARREN_DATA_DIR`, `WARREN_BA
 
 ```bash
 curl -s http://api.warren.localhost:7337/v1/health
-# {"healthy":true,"version":"0.1.0","runtimes":["docker"],"time":1763000000}
+# {"healthy":true,"version":"0.1.0","runtimes":["docker"],"dev_mode":true,"time":1763000000}
 ```
 
-`*.localhost` resolves to the loopback address on Linux, so `api.warren.localhost`, `warren.localhost` and every instance host work without DNS changes.
+Browsers and hosts running systemd-resolved resolve `*.localhost` to the loopback address, so `api.warren.localhost`, `warren.localhost` and every instance host work without DNS changes. On a host without systemd-resolved, add `--resolve api.warren.localhost:7337:127.0.0.1` to curl (one entry per hostname) or put the names in `/etc/hosts`.
 
 ## 3. Sign up
 

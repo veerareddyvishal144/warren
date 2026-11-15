@@ -25,5 +25,21 @@ The first release: a single-node platform in one Rust binary.
 - Scripts: `install-gvisor.sh`, `build-images.sh`, `dev-up.sh`, `e2e.sh`, `fetch-firecracker-assets.sh`; Makefile targets for building, testing, images and end-to-end runs.
 - Documentation: README, quickstart, concepts, instances, templates, billing, URLs, Agent API, files, exec, crons, VM instances, self-hosting, for-agents, security, `llms.txt`; CI with fmt, clippy, unit tests, image builds and end-to-end tests; Dependabot for Cargo and GitHub Actions.
 
+### Security
+
+- Tenant network isolation: `warren-net` and `warren-internal` are created with inter-container communication disabled, so instances cannot reach each other over the bridge; Firecracker taps use bridge port isolation. Operators upgrading from an earlier build must remove the old networks once: stop instances, `docker network rm warren-net warren-internal`, restart `warrend`.
+- Egress policy: when `warrend` runs as root it installs iptables rules in the `DOCKER-USER` chain (and `FORWARD` rules for the Firecracker bridge) that drop traffic from instances to `169.254.0.0/16` (cloud metadata) always, and to the RFC 1918 ranges and the host's own addresses unless `--allow-private-egress` is set. When not root it logs a warning and installs nothing.
+- Gateway authentication: every gateway route except `GET /v1/health` and `/v1/version` requires the per-instance token. The edge and the cron scheduler add it to the requests they forward, so clients never see or send it. The token is no longer inherited by exec shells, agent tool shells or the terminal.
+- Edge hardening: a workspace API key sent as `Authorization: Bearer` to an instance URL is no longer forwarded into the instance; CORS on instance hosts allows only the dashboard origin and the instance's own origins; cookie (signed URL) sessions are accepted only for same-origin requests; the signed-URL redirect uses an absolute `Location`; API requests have a 60 s timeout and the listener a global concurrency limit.
+- Signup: `--signup-enabled` (default `true`) and a per-IP limit of 10 signups per hour (loopback exempt in `--dev`). Hosted deployments should turn open signup off or put it behind their own flow, and set `--free-credit-micros` deliberately.
+
+### Known limitations
+
+- The base domain should be registered on the Public Suffix List, or each tenant given its own domain, so that instance subdomains are cross-site to each other; browsers otherwise treat `<id>.<base-domain>` hosts as same-site.
+- No per-instance egress allowlist; only `allow-all`, `deny-all` and the host-wide block above.
+- The ledger writes one row per instance per meter tick, so it grows linearly in instances x ticks; use a longer `--meter-interval` or prune old rows.
+- The `agent` user has passwordless sudo inside its own instance, and `exec` as `root` is allowed, both by design; there is no privilege boundary inside an instance.
+- See [docs/security.md](docs/security.md) for the full list (`runc` fallback, disk quotas, TLS, bearer URLs, side channels, audit log).
+
 [Unreleased]: https://github.com/veerareddyvishal144/warren/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/veerareddyvishal144/warren/releases/tag/v0.1.0

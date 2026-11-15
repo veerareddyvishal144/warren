@@ -138,6 +138,10 @@ async fn fires_a_due_cron_and_records_ok() {
         requests[0].body,
         serde_json::json!({ "input": "run c1", "metadata": { "cron_id": "c1" } })
     );
+    assert_eq!(
+        requests[0].instance_token, None,
+        "no token known, none sent"
+    );
 
     let updated = h.store.cron("c1");
     assert_eq!(updated.last_status, STATUS_OK);
@@ -151,6 +155,24 @@ async fn fires_a_due_cron_and_records_ok() {
     assert_eq!(updated.updated_at, NOW);
     assert_eq!(h.lifecycle.awake_calls(), vec![INSTANCE.to_string()]);
     assert!(h.lifecycle.activity.load(Ordering::SeqCst) >= 1);
+}
+
+#[tokio::test]
+async fn sends_the_instance_token_when_the_lifecycle_knows_one() {
+    let gateway = FakeGateway::spawn(Reply::completed()).await;
+    let lifecycle = FakeLifecycle::with_token("127.0.0.1", "it_secret_token");
+    let mut h =
+        Harness::start_with(vec![cron("c1", "*/15 * * * *")], gateway, lifecycle, |s| s).await;
+    h.wait_updates(1).await;
+    h.stop().await.unwrap();
+
+    let requests = h.gateway.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].instance_token.as_deref(),
+        Some("it_secret_token")
+    );
+    assert_eq!(h.store.cron("c1").last_status, STATUS_OK);
 }
 
 #[tokio::test]

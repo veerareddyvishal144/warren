@@ -1,9 +1,10 @@
 //! Every state transition: the `Lifecycle` and `InstanceStopper` implementations
 //! and the locked primitives they share (boot, stop, sleep, delete, provision).
 //!
-//! Public trait methods take the per-instance lock first, load the row, check
-//! the state machine, call the runtime and persist the result. Primitives named
-//! `*_locked` expect the caller to hold that lock.
+//! Public trait methods that change state run their body on a detached task
+//! (see [`Manager::detached`]) that owns the per-instance lock, so a client
+//! disconnecting mid-request cannot strand an instance in a transitional state.
+//! Primitives named `*_locked` expect the caller to hold that lock.
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -12,8 +13,9 @@ use tokio::sync::OwnedMutexGuard;
 use warren_core::{
     Backup, CreateInstanceRequest, DEFAULT_EXEC_TIMEOUT_SEC, DEFAULT_IDLE_TIMEOUT_SEC, Error,
     ExecRequest, ExecResult, ForkRequest, Instance, InstanceStatus, InstanceStopper, InstanceType,
-    Lifecycle, LogsOptions, MetricPoint, NetworkMode, PatchInstanceRequest, Result, Runtime,
-    STOP_GRACE_SECS, ShapeRequest, Template, Workspace, errors::is_requires_restart, ids, shapes,
+    Lifecycle, LogsOptions, MAX_BACKUP_BYTES_PER_WORKSPACE, MAX_BACKUPS_PER_INSTANCE, MetricPoint,
+    NetworkMode, PatchInstanceRequest, Result, Runtime, STOP_GRACE_SECS, ShapeRequest, Template,
+    Workspace, errors::is_requires_restart, ids, shapes,
 };
 
 use crate::{
@@ -32,6 +34,8 @@ pub const WAKE_POLL: Duration = Duration::from_millis(250);
 pub const WAKE_DEADLINE: Duration = Duration::from_secs(90);
 /// Longest metrics window, in hours (one week).
 pub const MAX_METRIC_HOURS: u32 = 168;
+/// Refusal when a workspace's backups would exceed [`MAX_BACKUP_BYTES_PER_WORKSPACE`].
+pub const BACKUP_QUOTA_MESSAGE: &str = "backup storage quota reached";
 
 fn grace() -> Duration {
     Duration::from_secs(STOP_GRACE_SECS)
@@ -48,12 +52,52 @@ fn transitional(status: InstanceStatus) -> bool {
     )
 }
 
+/// States in which the disk may be read, written or the runtime rebuilt.
+fn settled(status: InstanceStatus) -> bool {
+    matches!(
+        status,
+        InstanceStatus::Running
+            | InstanceStatus::Stopped
+            | InstanceStatus::Sleeping
+            | InstanceStatus::Failed
+    )
+}
+
+fn bytes_of(b: &Backup) -> u64 {
+    b.size_bytes.max(0) as u64
+}
+
 impl Manager {
     /// Start the runtime and move the instance through `via` into `Running`.
     /// A start failure leaves the instance `Failed` with the error as reason.
+    /// For an instance that already holds an awake slot (restart, update,
+    /// restore, the fork source); new admissions go through [`Self::boot_admitted`].
     pub(crate) async fn boot(&self, inst: &mut Instance, via: InstanceStatus) -> Result<()> {
         let rt = self.runtime_for(inst)?;
         self.transition(inst, via, "").await?;
+        self.start_runtime(rt, inst).await
+    }
+
+    /// Admit the instance to the workspace's awake set and boot it. The
+    /// biller's wake check and the transition into `via` (which is what the
+    /// awake count sees) happen under the workspace lock, so concurrent
+    /// create/start/wake/fork requests cannot together exceed the ladder.
+    pub(crate) async fn boot_admitted(
+        &self,
+        inst: &mut Instance,
+        via: InstanceStatus,
+    ) -> Result<()> {
+        let rt = self.runtime_for(inst)?;
+        {
+            let _ws = self.ws_lock(&inst.workspace_id).await;
+            let ws = self.deps.store.get_workspace(&inst.workspace_id).await?;
+            self.deps.biller.assert_can_wake(&ws).await?;
+            self.transition(inst, via, "").await?;
+        }
+        self.start_runtime(rt, inst).await
+    }
+
+    async fn start_runtime(&self, rt: Arc<dyn Runtime>, inst: &mut Instance) -> Result<()> {
         match rt.start(inst).await {
             Ok(info) => {
                 if !info.ip.is_empty() {
@@ -90,7 +134,7 @@ impl Manager {
             if let Err(e) = rt.stop(inst, grace()).await
                 && !e.is_not_found()
             {
-                self.fail(inst, &e, "stop").await;
+                self.fail_force(inst, &e, "stop").await;
                 return Err(e);
             }
         }
@@ -110,18 +154,18 @@ impl Manager {
         if let Err(e) = rt.stop(inst, grace()).await
             && !e.is_not_found()
         {
-            self.fail(inst, &e, "sleep").await;
+            self.fail_force(inst, &e, "sleep").await;
             return Err(e);
         }
         inst.ip.clear();
         self.save(inst).await
     }
 
-    /// Wake a sleeping instance once the biller allows one more awake instance.
+    /// Wake a sleeping instance once the biller allows one more awake instance
+    /// and the wallet can carry it. Biller refusals (`instance_limit`,
+    /// `insufficient_balance`) pass through unchanged.
     pub(crate) async fn wake_locked(&self, inst: &mut Instance) -> Result<()> {
-        let ws = self.deps.store.get_workspace(&inst.workspace_id).await?;
-        self.deps.biller.assert_can_wake(&ws).await?;
-        self.boot(inst, InstanceStatus::Waking).await
+        self.boot_admitted(inst, InstanceStatus::Waking).await
     }
 
     /// Destroy the runtime object and its disk, then remove every record.
@@ -134,7 +178,7 @@ impl Manager {
                     tracing::debug!(instance = %inst.id, "runtime object already gone");
                 }
                 Err(e) => {
-                    self.fail(inst, &e, "destroy").await;
+                    self.fail_force(inst, &e, "destroy").await;
                     return Err(e);
                 }
             },
@@ -189,7 +233,7 @@ impl Manager {
             if let Err(e) = rt.stop(inst, grace()).await
                 && !e.is_not_found()
             {
-                self.fail(inst, &e, "stop").await;
+                self.fail_force(inst, &e, "stop").await;
                 return Err(e);
             }
         }
@@ -240,6 +284,370 @@ impl Manager {
         }
         req
     }
+
+    /// Where a backup's archive lives: the stored path, or the conventional
+    /// one for rows written without it.
+    fn backup_path(&self, b: &Backup) -> PathBuf {
+        if b.path.is_empty() {
+            self.deps
+                .config
+                .backups_dir()
+                .join(&b.instance_id)
+                .join(format!("{}.tar.gz", b.id))
+        } else {
+            PathBuf::from(&b.path)
+        }
+    }
+
+    /// Bytes held by every backup of every instance in the workspace, summed
+    /// from the per-instance lists (the store has no workspace-level query).
+    pub(crate) async fn workspace_backup_bytes(&self, workspace_id: &str) -> Result<u64> {
+        let mut total = 0u64;
+        for inst in self.deps.store.list_instances(workspace_id).await? {
+            for b in self.deps.store.list_backups(&inst.id).await? {
+                total = total.saturating_add(bytes_of(&b));
+            }
+        }
+        Ok(total)
+    }
+
+    // ------------------------------------------------------------ locked bodies
+
+    async fn start_locked(&self, workspace_id: &str, id: &str) -> Result<Instance> {
+        let mut inst = self.load(workspace_id, id).await?;
+        match inst.status {
+            InstanceStatus::Running => {}
+            InstanceStatus::Stopped | InstanceStatus::Sleeping | InstanceStatus::Failed => {
+                self.boot_admitted(&mut inst, InstanceStatus::Starting)
+                    .await?;
+            }
+            _ => return Err(conflict_for(&inst)),
+        }
+        self.overlay(&mut inst);
+        Ok(inst)
+    }
+
+    async fn stop_op_locked(&self, workspace_id: &str, id: &str) -> Result<Instance> {
+        let mut inst = self.load(workspace_id, id).await?;
+        match inst.status {
+            InstanceStatus::Stopped => {}
+            InstanceStatus::Running | InstanceStatus::Sleeping => {
+                self.stop_locked(&mut inst, "").await?;
+            }
+            _ => return Err(conflict_for(&inst)),
+        }
+        self.overlay(&mut inst);
+        Ok(inst)
+    }
+
+    async fn sleep_op_locked(&self, workspace_id: &str, id: &str) -> Result<Instance> {
+        let mut inst = self.load(workspace_id, id).await?;
+        match inst.status {
+            InstanceStatus::Sleeping => {}
+            InstanceStatus::Running => self.sleep_locked(&mut inst, "").await?,
+            _ => return Err(conflict_for(&inst)),
+        }
+        self.overlay(&mut inst);
+        Ok(inst)
+    }
+
+    async fn restart_locked(&self, workspace_id: &str, id: &str) -> Result<Instance> {
+        let mut inst = self.load(workspace_id, id).await?;
+        if inst.status != InstanceStatus::Running {
+            return Err(conflict_for(&inst));
+        }
+        let rt = self.runtime_for(&inst)?;
+        self.transition(&mut inst, InstanceStatus::Restarting, "")
+            .await?;
+        if let Err(e) = rt.stop(&inst, grace()).await
+            && !e.is_not_found()
+        {
+            self.fail_force(&mut inst, &e, "stop").await;
+            return Err(e);
+        }
+        self.boot(&mut inst, InstanceStatus::Restarting).await?;
+        self.overlay(&mut inst);
+        Ok(inst)
+    }
+
+    async fn resize_locked(
+        &self,
+        workspace_id: &str,
+        id: &str,
+        req: &ShapeRequest,
+    ) -> Result<Instance> {
+        let mut inst = self.load(workspace_id, id).await?;
+        if !settled(inst.status) {
+            return Err(conflict_for(&inst));
+        }
+        let rt = self.runtime_for(&inst)?;
+        // Normalize against the current shape: omitted fields keep their values.
+        let base = Template {
+            default_shape: inst.shape,
+            ..Default::default()
+        };
+        let mut shape = shapes::normalize(Some(req), Some(&base), inst.kind)?;
+        if req.disk.is_none() && shape.disk < inst.shape.disk {
+            shape.disk = inst.shape.disk;
+            let max = shapes::max_disk(shape, inst.kind);
+            if shape.disk > max {
+                return Err(Error::invalid(format!(
+                    "the current {} GB disk exceeds the {max} GB maximum of the {} vCPU / {} GB shape",
+                    shape.disk, shape.cpu, shape.memory
+                )));
+            }
+        }
+        if shape.disk < inst.shape.disk {
+            return Err(Error::invalid(format!(
+                "disk may not shrink below the current {} GB",
+                inst.shape.disk
+            )));
+        }
+        if shape == inst.shape {
+            self.overlay(&mut inst);
+            return Ok(inst);
+        }
+        // Growing costs more per month: the same one-day-of-balance rule as a
+        // create applies to the new shape.
+        let biller = &self.deps.biller;
+        if biller.monthly_running_micros(shape, inst.kind)
+            > biller.monthly_running_micros(inst.shape, inst.kind)
+        {
+            let ws = self.deps.store.get_workspace(workspace_id).await?;
+            biller.assert_can_create(&ws, shape, inst.kind).await?;
+        }
+        match rt.resize(&mut inst, shape).await {
+            Ok(()) => {}
+            Err(e) if is_requires_restart(&e) => {
+                if inst.status == InstanceStatus::Running {
+                    self.transition(&mut inst, InstanceStatus::Restarting, "")
+                        .await?;
+                    if let Err(e) = rt.stop(&inst, grace()).await
+                        && !e.is_not_found()
+                    {
+                        self.fail_force(&mut inst, &e, "stop").await;
+                        return Err(e);
+                    }
+                    if let Err(e) = rt.resize(&mut inst, shape).await {
+                        self.fail(&mut inst, &e, "resize").await;
+                        return Err(e);
+                    }
+                    inst.shape = shape;
+                    self.boot(&mut inst, InstanceStatus::Restarting).await?;
+                    self.overlay(&mut inst);
+                    return Ok(inst);
+                }
+                rt.resize(&mut inst, shape).await?;
+            }
+            Err(e) => return Err(e),
+        }
+        inst.shape = shape;
+        self.save(&mut inst).await?;
+        tracing::info!(instance = %inst.id, shape = %shape, "resized");
+        self.overlay(&mut inst);
+        Ok(inst)
+    }
+
+    async fn update_locked(
+        &self,
+        workspace_id: &str,
+        id: &str,
+        template: Option<&str>,
+    ) -> Result<Instance> {
+        let mut inst = self.load(workspace_id, id).await?;
+        if !settled(inst.status) {
+            return Err(conflict_for(&inst));
+        }
+        // No pin follows the latest revision of the current template.
+        let target = template
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| inst.template_name.clone());
+        let tpl = self.deps.templates.resolve(workspace_id, &target).await?;
+        if !tpl.allows(inst.kind) {
+            return Err(Error::invalid(format!(
+                "template {} does not allow type {}",
+                tpl.name, inst.kind
+            )));
+        }
+        let rt = self.runtime_for(&inst)?;
+        rt.ensure_image(&tpl.image_ref).await?;
+        let previous = inst.status;
+        let was_running = previous == InstanceStatus::Running;
+        self.transition(&mut inst, InstanceStatus::Updating, "")
+            .await?;
+        if was_running
+            && let Err(e) = rt.stop(&inst, grace()).await
+            && !e.is_not_found()
+        {
+            self.fail_force(&mut inst, &e, "stop").await;
+            return Err(e);
+        }
+        if let Err(e) = rt.recreate(&mut inst, &tpl).await {
+            self.fail(&mut inst, &e, "recreate").await;
+            return Err(e);
+        }
+        inst.template = target;
+        inst.template_name = tpl.name.clone();
+        inst.template_revision = tpl.revision;
+        inst.image_ref = tpl.image_ref.clone();
+        inst.default_port = tpl.default_port;
+        inst.mount_path = tpl.mount_path.clone();
+        inst.agent_api = tpl.agent;
+        if was_running {
+            self.boot(&mut inst, InstanceStatus::Updating).await?;
+        } else {
+            let back = if previous == InstanceStatus::Failed {
+                InstanceStatus::Stopped
+            } else {
+                previous
+            };
+            self.transition(&mut inst, back, "").await?;
+        }
+        tracing::info!(instance = %inst.id, template = %inst.template_name, revision = inst.template_revision, image = %inst.image_ref, "updated");
+        self.overlay(&mut inst);
+        Ok(inst)
+    }
+
+    async fn fork_locked(&self, ws: &Workspace, id: &str, req: &ForkRequest) -> Result<Instance> {
+        let mut src = self.load(&ws.id, id).await?;
+        if !matches!(
+            src.status,
+            InstanceStatus::Running | InstanceStatus::Stopped | InstanceStatus::Sleeping
+        ) {
+            return Err(conflict_for(&src));
+        }
+        let rt = self.runtime_for(&src)?;
+        let tpl = self.effective_template(&src).await?;
+        let base = Template {
+            default_shape: src.shape,
+            ..Default::default()
+        };
+        let shape = shapes::normalize(req.shape.as_ref(), Some(&base), src.kind)?;
+
+        // The workspace lock spans the biller's check and the insert of the
+        // child, which is what consumes the awake slot.
+        let ws_guard = self.ws_lock(&ws.id).await;
+        self.deps
+            .biller
+            .assert_can_create(ws, shape, src.kind)
+            .await?;
+
+        let was_running = src.status == InstanceStatus::Running;
+        if was_running {
+            self.sleep_locked(&mut src, "fork").await?;
+        }
+        let now = self.now();
+        let dst_id = ids::new_instance_id();
+        let mut dst = Instance {
+            url: self.deps.config.instance_url(&dst_id),
+            id: dst_id,
+            workspace_id: ws.id.clone(),
+            name: req.name.clone().unwrap_or_else(|| src.name.clone()),
+            template: src.template.clone(),
+            template_name: src.template_name.clone(),
+            template_revision: src.template_revision,
+            image_ref: src.image_ref.clone(),
+            kind: src.kind,
+            status: InstanceStatus::Provisioning,
+            status_reason: String::new(),
+            shape,
+            region: src.region.clone(),
+            metadata: req.metadata.clone().unwrap_or_else(|| src.metadata.clone()),
+            env: src.env.clone(),
+            network: src.network,
+            auto_sleep: req.auto_sleep.unwrap_or(src.auto_sleep),
+            idle_timeout_seconds: req.idle_timeout_seconds.unwrap_or(src.idle_timeout_seconds),
+            budget: src.budget,
+            default_port: src.default_port,
+            mount_path: src.mount_path.clone(),
+            agent_api: src.agent_api,
+            parent_id: src.id.clone(),
+            created_at: now,
+            updated_at: now,
+            runtime: src.runtime.clone(),
+            instance_token: ids::new_instance_token(),
+            ..Default::default()
+        };
+        let dst_guard = self.lock(&dst.id).await;
+        self.deps.store.create_instance(&dst).await?;
+        drop(ws_guard);
+        tracing::info!(instance = %dst.id, parent = %src.id, "forking");
+        let result: Result<()> = async {
+            rt.clone_storage(&src, &mut dst).await?;
+            rt.create(&mut dst, &tpl).await?;
+            self.save(&mut dst).await?;
+            self.boot(&mut dst, InstanceStatus::Provisioning).await
+        }
+        .await;
+        if let Err(e) = result
+            && dst.status != InstanceStatus::Failed
+        {
+            self.fail(&mut dst, &e, "fork").await;
+        }
+        drop(dst_guard);
+        if was_running && let Err(e) = self.boot(&mut src, InstanceStatus::Waking).await {
+            tracing::error!(instance = %src.id, error = %e, "could not wake the fork source");
+        }
+        self.overlay(&mut dst);
+        Ok(dst)
+    }
+
+    async fn restore_locked(
+        &self,
+        workspace_id: &str,
+        id: &str,
+        backup_id: &str,
+    ) -> Result<Instance> {
+        let mut inst = self.load(workspace_id, id).await?;
+        let backup = self.deps.store.get_backup(&inst.id, backup_id).await?;
+        if !settled(inst.status) {
+            return Err(conflict_for(&inst));
+        }
+        let rt = self.runtime_for(&inst)?;
+        let path = self.backup_path(&backup);
+        if tokio::fs::metadata(&path).await.is_err() {
+            return Err(Error::not_found("backup file"));
+        }
+        let was_running = inst.status == InstanceStatus::Running;
+        if was_running {
+            self.stop_locked(&mut inst, "restore").await?;
+        }
+        if let Err(e) = rt.restore_storage(&inst, &path).await {
+            self.fail(&mut inst, &e, "restore").await;
+            return Err(e);
+        }
+        tracing::info!(instance = %inst.id, backup = %backup.id, "restored");
+        if was_running {
+            self.boot(&mut inst, InstanceStatus::Starting).await?;
+        }
+        self.overlay(&mut inst);
+        Ok(inst)
+    }
+
+    async fn stop_for_billing_locked(&self, instance_id: &str, reason: &str) -> Result<()> {
+        let mut inst = self.deps.store.get_instance(instance_id).await?;
+        match inst.status {
+            InstanceStatus::Running | InstanceStatus::Sleeping => {
+                tracing::warn!(instance = instance_id, reason, "stopping for billing");
+                self.stop_locked(&mut inst, reason).await
+            }
+            InstanceStatus::Stopped | InstanceStatus::Failed => Ok(()),
+            _ => Err(conflict_for(&inst)),
+        }
+    }
+
+    /// The wake step of `ensure_awake`: under the lock, wake the instance if it
+    /// is still sleeping and return the row as it is afterwards.
+    async fn wake_if_sleeping_locked(&self, id: &str) -> Result<Instance> {
+        let mut inst = self.deps.store.get_instance(id).await?;
+        if inst.status == InstanceStatus::Sleeping {
+            tracing::info!(instance = id, "waking on request");
+            self.wake_locked(&mut inst).await?;
+        }
+        Ok(inst)
+    }
 }
 
 #[async_trait]
@@ -278,7 +686,6 @@ impl Lifecycle for Manager {
         }
         let rt = self.runtime_for_kind(kind)?;
         let shape = shapes::normalize(req.shape.as_ref(), Some(&tpl), kind)?;
-        self.deps.biller.assert_can_create(ws, shape, kind).await?;
 
         let now = self.now();
         let id = ids::new_instance_id();
@@ -312,9 +719,14 @@ impl Lifecycle for Manager {
             instance_token: ids::new_instance_token(),
             ..Default::default()
         };
-        // Take the lock before the row exists so nothing interleaves with provisioning.
+        // The workspace lock spans the biller's check and the insert that
+        // consumes the awake slot; the instance lock is taken before the row
+        // exists so nothing interleaves with provisioning.
+        let ws_guard = self.ws_lock(&ws.id).await;
+        self.deps.biller.assert_can_create(ws, shape, kind).await?;
         let guard = self.lock(&inst.id).await;
         self.deps.store.create_instance(&inst).await?;
+        drop(ws_guard);
         tracing::info!(
             instance = %inst.id,
             workspace = %ws.id,
@@ -353,185 +765,99 @@ impl Lifecycle for Manager {
         id: &str,
         req: &PatchInstanceRequest,
     ) -> Result<Instance> {
-        let _g = self.lock(id).await;
-        let mut inst = self.load(workspace_id, id).await?;
-        if let Some(name) = &req.name {
-            validate_name(name)?;
-            inst.name = name.clone();
-        }
-        if let Some(metadata) = &req.metadata {
-            validate_metadata(metadata)?;
-            inst.metadata = metadata.clone();
-        }
-        if let Some(env) = &req.env {
-            validate_env(env)?;
-            inst.env = env.clone();
-        }
-        if let Some(auto_sleep) = req.auto_sleep {
-            inst.auto_sleep = auto_sleep;
-        }
-        if let Some(idle) = req.idle_timeout_seconds {
-            validate_idle_timeout(idle, self.deps.config.min_idle_timeout_sec)?;
-            inst.idle_timeout_seconds = idle;
-        }
-        if let Some(budget) = req.budget {
-            validate_budget(&budget)?;
-            inst.budget = budget;
-        }
-        if let Some(network) = req.network.filter(|n| *n != inst.network) {
-            if !matches!(
-                inst.status,
-                InstanceStatus::Running
-                    | InstanceStatus::Stopped
-                    | InstanceStatus::Sleeping
-                    | InstanceStatus::Failed
-            ) {
-                return Err(conflict_for(&inst));
+        let (ws, id, req) = (workspace_id.to_string(), id.to_string(), req.clone());
+        let key = id.clone();
+        self.detached(&key, move |me, _g| async move {
+            let mut inst = me.load(&ws, &id).await?;
+            if let Some(name) = &req.name {
+                validate_name(name)?;
+                inst.name = name.clone();
             }
-            self.apply_network(&mut inst, network).await?;
-        }
-        self.save(&mut inst).await?;
-        self.overlay(&mut inst);
-        Ok(inst)
+            if let Some(metadata) = &req.metadata {
+                validate_metadata(metadata)?;
+                inst.metadata = metadata.clone();
+            }
+            if let Some(env) = &req.env {
+                validate_env(env)?;
+                inst.env = env.clone();
+            }
+            if let Some(auto_sleep) = req.auto_sleep {
+                inst.auto_sleep = auto_sleep;
+            }
+            if let Some(idle) = req.idle_timeout_seconds {
+                validate_idle_timeout(idle, me.deps.config.min_idle_timeout_sec)?;
+                inst.idle_timeout_seconds = idle;
+            }
+            if let Some(budget) = req.budget {
+                validate_budget(&budget)?;
+                inst.budget = budget;
+            }
+            if let Some(network) = req.network.filter(|n| *n != inst.network) {
+                if !settled(inst.status) {
+                    return Err(conflict_for(&inst));
+                }
+                me.apply_network(&mut inst, network).await?;
+            }
+            me.save(&mut inst).await?;
+            me.overlay(&mut inst);
+            Ok(inst)
+        })
+        .await
     }
 
     async fn start(&self, workspace_id: &str, id: &str) -> Result<Instance> {
-        let _g = self.lock(id).await;
-        let mut inst = self.load(workspace_id, id).await?;
-        match inst.status {
-            InstanceStatus::Running => {}
-            InstanceStatus::Stopped | InstanceStatus::Sleeping | InstanceStatus::Failed => {
-                let ws = self.deps.store.get_workspace(workspace_id).await?;
-                self.deps.biller.assert_can_wake(&ws).await?;
-                self.boot(&mut inst, InstanceStatus::Starting).await?;
-            }
-            _ => return Err(conflict_for(&inst)),
-        }
-        self.overlay(&mut inst);
-        Ok(inst)
+        let (ws, id) = (workspace_id.to_string(), id.to_string());
+        let key = id.clone();
+        self.detached(&key, move |me, _g| async move {
+            me.start_locked(&ws, &id).await
+        })
+        .await
     }
 
     async fn stop(&self, workspace_id: &str, id: &str) -> Result<Instance> {
-        let _g = self.lock(id).await;
-        let mut inst = self.load(workspace_id, id).await?;
-        match inst.status {
-            InstanceStatus::Stopped => {}
-            InstanceStatus::Running | InstanceStatus::Sleeping => {
-                self.stop_locked(&mut inst, "").await?;
-            }
-            _ => return Err(conflict_for(&inst)),
-        }
-        self.overlay(&mut inst);
-        Ok(inst)
+        let (ws, id) = (workspace_id.to_string(), id.to_string());
+        let key = id.clone();
+        self.detached(&key, move |me, _g| async move {
+            me.stop_op_locked(&ws, &id).await
+        })
+        .await
     }
 
     async fn sleep(&self, workspace_id: &str, id: &str) -> Result<Instance> {
-        let _g = self.lock(id).await;
-        let mut inst = self.load(workspace_id, id).await?;
-        match inst.status {
-            InstanceStatus::Sleeping => {}
-            InstanceStatus::Running => self.sleep_locked(&mut inst, "").await?,
-            _ => return Err(conflict_for(&inst)),
-        }
-        self.overlay(&mut inst);
-        Ok(inst)
+        let (ws, id) = (workspace_id.to_string(), id.to_string());
+        let key = id.clone();
+        self.detached(&key, move |me, _g| async move {
+            me.sleep_op_locked(&ws, &id).await
+        })
+        .await
     }
 
     async fn restart(&self, workspace_id: &str, id: &str) -> Result<Instance> {
-        let _g = self.lock(id).await;
-        let mut inst = self.load(workspace_id, id).await?;
-        if inst.status != InstanceStatus::Running {
-            return Err(conflict_for(&inst));
-        }
-        let rt = self.runtime_for(&inst)?;
-        self.transition(&mut inst, InstanceStatus::Restarting, "")
-            .await?;
-        if let Err(e) = rt.stop(&inst, grace()).await
-            && !e.is_not_found()
-        {
-            self.fail(&mut inst, &e, "stop").await;
-            return Err(e);
-        }
-        self.boot(&mut inst, InstanceStatus::Restarting).await?;
-        self.overlay(&mut inst);
-        Ok(inst)
+        let (ws, id) = (workspace_id.to_string(), id.to_string());
+        let key = id.clone();
+        self.detached(&key, move |me, _g| async move {
+            me.restart_locked(&ws, &id).await
+        })
+        .await
     }
 
     async fn delete(&self, workspace_id: &str, id: &str) -> Result<()> {
-        let _g = self.lock(id).await;
-        let mut inst = self.load(workspace_id, id).await?;
-        self.delete_locked(&mut inst).await
+        let (ws, id) = (workspace_id.to_string(), id.to_string());
+        let key = id.clone();
+        self.detached(&key, move |me, _g| async move {
+            let mut inst = me.load(&ws, &id).await?;
+            me.delete_locked(&mut inst).await
+        })
+        .await
     }
 
     async fn resize(&self, workspace_id: &str, id: &str, req: &ShapeRequest) -> Result<Instance> {
-        let _g = self.lock(id).await;
-        let mut inst = self.load(workspace_id, id).await?;
-        if !matches!(
-            inst.status,
-            InstanceStatus::Running
-                | InstanceStatus::Stopped
-                | InstanceStatus::Sleeping
-                | InstanceStatus::Failed
-        ) {
-            return Err(conflict_for(&inst));
-        }
-        let rt = self.runtime_for(&inst)?;
-        // Normalize against the current shape: omitted fields keep their values.
-        let base = Template {
-            default_shape: inst.shape,
-            ..Default::default()
-        };
-        let mut shape = shapes::normalize(Some(req), Some(&base), inst.kind)?;
-        if req.disk.is_none() && shape.disk < inst.shape.disk {
-            shape.disk = inst.shape.disk;
-            let max = shapes::max_disk(shape, inst.kind);
-            if shape.disk > max {
-                return Err(Error::invalid(format!(
-                    "the current {} GB disk exceeds the {max} GB maximum of the {} vCPU / {} GB shape",
-                    shape.disk, shape.cpu, shape.memory
-                )));
-            }
-        }
-        if shape.disk < inst.shape.disk {
-            return Err(Error::invalid(format!(
-                "disk may not shrink below the current {} GB",
-                inst.shape.disk
-            )));
-        }
-        if shape == inst.shape {
-            self.overlay(&mut inst);
-            return Ok(inst);
-        }
-        match rt.resize(&mut inst, shape).await {
-            Ok(()) => {}
-            Err(e) if is_requires_restart(&e) => {
-                if inst.status == InstanceStatus::Running {
-                    self.transition(&mut inst, InstanceStatus::Restarting, "")
-                        .await?;
-                    if let Err(e) = rt.stop(&inst, grace()).await
-                        && !e.is_not_found()
-                    {
-                        self.fail(&mut inst, &e, "stop").await;
-                        return Err(e);
-                    }
-                    if let Err(e) = rt.resize(&mut inst, shape).await {
-                        self.fail(&mut inst, &e, "resize").await;
-                        return Err(e);
-                    }
-                    inst.shape = shape;
-                    self.boot(&mut inst, InstanceStatus::Restarting).await?;
-                    self.overlay(&mut inst);
-                    return Ok(inst);
-                }
-                rt.resize(&mut inst, shape).await?;
-            }
-            Err(e) => return Err(e),
-        }
-        inst.shape = shape;
-        self.save(&mut inst).await?;
-        tracing::info!(instance = %inst.id, shape = %shape, "resized");
-        self.overlay(&mut inst);
-        Ok(inst)
+        let (ws, id, req) = (workspace_id.to_string(), id.to_string(), *req);
+        let key = id.clone();
+        self.detached(&key, move |me, _g| async move {
+            me.resize_locked(&ws, &id, &req).await
+        })
+        .await
     }
 
     async fn update(
@@ -540,72 +866,17 @@ impl Lifecycle for Manager {
         id: &str,
         template: Option<&str>,
     ) -> Result<Instance> {
-        let _g = self.lock(id).await;
-        let mut inst = self.load(workspace_id, id).await?;
-        if !matches!(
-            inst.status,
-            InstanceStatus::Running
-                | InstanceStatus::Stopped
-                | InstanceStatus::Sleeping
-                | InstanceStatus::Failed
-        ) {
-            return Err(conflict_for(&inst));
-        }
-        // No pin follows the latest revision of the current template.
-        let target = template
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| inst.template_name.clone());
-        let tpl = self.deps.templates.resolve(workspace_id, &target).await?;
-        if !tpl.allows(inst.kind) {
-            return Err(Error::invalid(format!(
-                "template {} does not allow type {}",
-                tpl.name, inst.kind
-            )));
-        }
-        let rt = self.runtime_for(&inst)?;
-        rt.ensure_image(&tpl.image_ref).await?;
-        let previous = inst.status;
-        let was_running = previous == InstanceStatus::Running;
-        self.transition(&mut inst, InstanceStatus::Updating, "")
-            .await?;
-        if was_running
-            && let Err(e) = rt.stop(&inst, grace()).await
-            && !e.is_not_found()
-        {
-            self.fail(&mut inst, &e, "stop").await;
-            return Err(e);
-        }
-        if let Err(e) = rt.recreate(&mut inst, &tpl).await {
-            self.fail(&mut inst, &e, "recreate").await;
-            return Err(e);
-        }
-        inst.template = target;
-        inst.template_name = tpl.name.clone();
-        inst.template_revision = tpl.revision;
-        inst.image_ref = tpl.image_ref.clone();
-        inst.default_port = tpl.default_port;
-        inst.mount_path = tpl.mount_path.clone();
-        inst.agent_api = tpl.agent;
-        if was_running {
-            self.boot(&mut inst, InstanceStatus::Updating).await?;
-        } else {
-            let back = if previous == InstanceStatus::Failed {
-                InstanceStatus::Stopped
-            } else {
-                previous
-            };
-            self.transition(&mut inst, back, "").await?;
-        }
-        tracing::info!(instance = %inst.id, template = %inst.template_name, revision = inst.template_revision, image = %inst.image_ref, "updated");
-        self.overlay(&mut inst);
-        Ok(inst)
+        let (ws, id) = (workspace_id.to_string(), id.to_string());
+        let template = template.map(str::to_string);
+        let key = id.clone();
+        self.detached(&key, move |me, _g| async move {
+            me.update_locked(&ws, &id, template.as_deref()).await
+        })
+        .await
     }
 
     async fn fork(&self, ws: &Workspace, id: &str, req: &ForkRequest) -> Result<Instance> {
-        let name = req.name.clone();
-        if let Some(n) = &name {
+        if let Some(n) = &req.name {
             validate_name(n)?;
         }
         if let Some(m) = &req.metadata {
@@ -614,83 +885,12 @@ impl Lifecycle for Manager {
         if let Some(idle) = req.idle_timeout_seconds {
             validate_idle_timeout(idle, self.deps.config.min_idle_timeout_sec)?;
         }
-        let _g = self.lock(id).await;
-        let mut src = self.load(&ws.id, id).await?;
-        if !matches!(
-            src.status,
-            InstanceStatus::Running | InstanceStatus::Stopped | InstanceStatus::Sleeping
-        ) {
-            return Err(conflict_for(&src));
-        }
-        let rt = self.runtime_for(&src)?;
-        let tpl = self.effective_template(&src).await?;
-        let base = Template {
-            default_shape: src.shape,
-            ..Default::default()
-        };
-        let shape = shapes::normalize(req.shape.as_ref(), Some(&base), src.kind)?;
-        self.deps
-            .biller
-            .assert_can_create(ws, shape, src.kind)
-            .await?;
-
-        let was_running = src.status == InstanceStatus::Running;
-        if was_running {
-            self.sleep_locked(&mut src, "fork").await?;
-        }
-        let now = self.now();
-        let dst_id = ids::new_instance_id();
-        let mut dst = Instance {
-            url: self.deps.config.instance_url(&dst_id),
-            id: dst_id,
-            workspace_id: ws.id.clone(),
-            name: name.unwrap_or_else(|| src.name.clone()),
-            template: src.template.clone(),
-            template_name: src.template_name.clone(),
-            template_revision: src.template_revision,
-            image_ref: src.image_ref.clone(),
-            kind: src.kind,
-            status: InstanceStatus::Provisioning,
-            status_reason: String::new(),
-            shape,
-            region: src.region.clone(),
-            metadata: req.metadata.clone().unwrap_or_else(|| src.metadata.clone()),
-            env: src.env.clone(),
-            network: src.network,
-            auto_sleep: req.auto_sleep.unwrap_or(src.auto_sleep),
-            idle_timeout_seconds: req.idle_timeout_seconds.unwrap_or(src.idle_timeout_seconds),
-            budget: src.budget,
-            default_port: src.default_port,
-            mount_path: src.mount_path.clone(),
-            agent_api: src.agent_api,
-            parent_id: src.id.clone(),
-            created_at: now,
-            updated_at: now,
-            runtime: src.runtime.clone(),
-            instance_token: ids::new_instance_token(),
-            ..Default::default()
-        };
-        let dst_guard = self.lock(&dst.id).await;
-        self.deps.store.create_instance(&dst).await?;
-        tracing::info!(instance = %dst.id, parent = %src.id, "forking");
-        let result: Result<()> = async {
-            rt.clone_storage(&src, &mut dst).await?;
-            rt.create(&mut dst, &tpl).await?;
-            self.save(&mut dst).await?;
-            self.boot(&mut dst, InstanceStatus::Provisioning).await
-        }
-        .await;
-        if let Err(e) = result
-            && dst.status != InstanceStatus::Failed
-        {
-            self.fail(&mut dst, &e, "fork").await;
-        }
-        drop(dst_guard);
-        if was_running && let Err(e) = self.boot(&mut src, InstanceStatus::Waking).await {
-            tracing::error!(instance = %src.id, error = %e, "could not wake the fork source");
-        }
-        self.overlay(&mut dst);
-        Ok(dst)
+        let (ws, id, req) = (ws.clone(), id.to_string(), req.clone());
+        let key = id.clone();
+        self.detached(&key, move |me, _g| async move {
+            me.fork_locked(&ws, &id, &req).await
+        })
+        .await
     }
 
     async fn exec(&self, workspace_id: &str, id: &str, req: &ExecRequest) -> Result<ExecResult> {
@@ -729,28 +929,49 @@ impl Lifecycle for Manager {
         Ok(points)
     }
 
+    /// Take a backup, keeping at most [`MAX_BACKUPS_PER_INSTANCE`] per instance
+    /// (the oldest are dropped, file and row) and refusing once the workspace's
+    /// backups would exceed [`MAX_BACKUP_BYTES_PER_WORKSPACE`].
     async fn backup(&self, workspace_id: &str, id: &str, note: &str) -> Result<Backup> {
         validate_note(note)?;
         let _g = self.lock(id).await;
         let inst = self.load(workspace_id, id).await?;
-        if !matches!(
-            inst.status,
-            InstanceStatus::Running
-                | InstanceStatus::Stopped
-                | InstanceStatus::Sleeping
-                | InstanceStatus::Failed
-        ) {
+        if !settled(inst.status) {
             return Err(conflict_for(&inst));
         }
         if inst.runtime_ref.is_empty() && inst.storage_path.is_empty() {
             return Err(Error::conflict("instance has no disk to back up yet"));
         }
         let rt = self.runtime_for(&inst)?;
+
+        let mut existing = self.deps.store.list_backups(&inst.id).await?;
+        existing.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let excess = (existing.len() + 1).saturating_sub(MAX_BACKUPS_PER_INSTANCE);
+        let (pruned, kept) = existing.split_at(excess.min(existing.len()));
+        let pruned_bytes = pruned.iter().map(bytes_of).fold(0u64, u64::saturating_add);
+        let ws_bytes = self
+            .workspace_backup_bytes(workspace_id)
+            .await?
+            .saturating_sub(pruned_bytes);
+        if ws_bytes >= MAX_BACKUP_BYTES_PER_WORKSPACE {
+            return Err(Error::conflict(BACKUP_QUOTA_MESSAGE));
+        }
+
         let backup_id = ids::new_id();
         let dir = self.deps.config.backups_dir().join(&inst.id);
         tokio::fs::create_dir_all(&dir).await?;
         let path = dir.join(format!("{backup_id}.tar.gz"));
         let size = rt.backup_storage(&inst, &path).await?;
+        if ws_bytes.saturating_add(size.max(0) as u64) > MAX_BACKUP_BYTES_PER_WORKSPACE {
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                tracing::warn!(instance = %inst.id, path = %path.display(), error = %e, "could not remove an over-quota backup");
+            }
+            return Err(Error::conflict(BACKUP_QUOTA_MESSAGE));
+        }
         let backup = Backup {
             id: backup_id,
             instance_id: inst.id.clone(),
@@ -760,7 +981,30 @@ impl Lifecycle for Manager {
             created_at: self.now(),
             note: note.to_string(),
         };
-        self.deps.store.create_backup(&backup).await?;
+        if pruned.is_empty() {
+            self.deps.store.create_backup(&backup).await?;
+        } else {
+            // The store deletes backup rows per instance only, so the kept rows
+            // are written back after the whole set is cleared.
+            self.deps
+                .store
+                .delete_backups_for_instance(&inst.id)
+                .await?;
+            for b in kept.iter().chain(std::iter::once(&backup)) {
+                self.deps.store.create_backup(b).await?;
+            }
+            for b in pruned {
+                let old = self.backup_path(b);
+                match tokio::fs::remove_file(&old).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::warn!(instance = %inst.id, backup = %b.id, error = %e, "could not remove an old backup file")
+                    }
+                }
+                tracing::info!(instance = %inst.id, backup = %b.id, "dropped the oldest backup");
+            }
+        }
         tracing::info!(instance = %inst.id, backup = %backup.id, bytes = size, "backup taken");
         Ok(backup)
     }
@@ -777,45 +1021,16 @@ impl Lifecycle for Manager {
     }
 
     async fn restore(&self, workspace_id: &str, id: &str, backup_id: &str) -> Result<Instance> {
-        let _g = self.lock(id).await;
-        let mut inst = self.load(workspace_id, id).await?;
-        let backup = self.deps.store.get_backup(&inst.id, backup_id).await?;
-        if !matches!(
-            inst.status,
-            InstanceStatus::Running
-                | InstanceStatus::Stopped
-                | InstanceStatus::Sleeping
-                | InstanceStatus::Failed
-        ) {
-            return Err(conflict_for(&inst));
-        }
-        let rt = self.runtime_for(&inst)?;
-        let path = if backup.path.is_empty() {
-            self.deps
-                .config
-                .backups_dir()
-                .join(&inst.id)
-                .join(format!("{}.tar.gz", backup.id))
-        } else {
-            PathBuf::from(&backup.path)
-        };
-        if tokio::fs::metadata(&path).await.is_err() {
-            return Err(Error::not_found("backup file"));
-        }
-        let was_running = inst.status == InstanceStatus::Running;
-        if was_running {
-            self.stop_locked(&mut inst, "restore").await?;
-        }
-        if let Err(e) = rt.restore_storage(&inst, &path).await {
-            self.fail(&mut inst, &e, "restore").await;
-            return Err(e);
-        }
-        tracing::info!(instance = %inst.id, backup = %backup.id, "restored");
-        if was_running {
-            self.boot(&mut inst, InstanceStatus::Starting).await?;
-        }
-        self.overlay(&mut inst);
-        Ok(inst)
+        let (ws, id, backup_id) = (
+            workspace_id.to_string(),
+            id.to_string(),
+            backup_id.to_string(),
+        );
+        let key = id.clone();
+        self.detached(&key, move |me, _g| async move {
+            me.restore_locked(&ws, &id, &backup_id).await
+        })
+        .await
     }
 
     async fn ensure_awake(&self, id: &str) -> Result<Instance> {
@@ -829,22 +1044,16 @@ impl Lifecycle for Manager {
                     return Ok(inst);
                 }
                 InstanceStatus::Sleeping => {
-                    let _g = self.lock(id).await;
-                    inst = self.deps.store.get_instance(id).await?;
-                    match inst.status {
-                        InstanceStatus::Running => {
-                            self.overlay(&mut inst);
-                            return Ok(inst);
-                        }
-                        InstanceStatus::Sleeping => {
-                            tracing::info!(instance = id, "waking on request");
-                            self.wake_locked(&mut inst).await?;
-                            self.overlay(&mut inst);
-                            return Ok(inst);
-                        }
-                        // Changed under us; evaluate the new state without the lock.
-                        _ => continue,
-                    }
+                    // The wake runs detached so a client that gives up waiting
+                    // cannot leave the instance `Waking` forever. Biller
+                    // refusals pass through unchanged.
+                    let key = id.to_string();
+                    inst = self
+                        .detached(id, move |me, _g| async move {
+                            me.wake_if_sleeping_locked(&key).await
+                        })
+                        .await?;
+                    // Running now, or changed under us: the loop re-evaluates.
                 }
                 s if transitional(s) => {
                     if tokio::time::Instant::now() >= deadline {
@@ -866,6 +1075,10 @@ impl Lifecycle for Manager {
     }
 
     async fn endpoint(&self, id: &str) -> Result<String> {
+        self.gateway_credentials(id).await.map(|(ip, _)| ip)
+    }
+
+    async fn gateway_credentials(&self, id: &str) -> Result<(String, String)> {
         let inst = self.deps.store.get_instance(id).await?;
         if inst.status != InstanceStatus::Running {
             return Err(conflict_for(&inst));
@@ -873,22 +1086,18 @@ impl Lifecycle for Manager {
         if inst.ip.is_empty() {
             return Err(Error::bad_gateway("instance has no address"));
         }
-        Ok(inst.ip)
+        Ok((inst.ip, inst.instance_token))
     }
 }
 
 #[async_trait]
 impl InstanceStopper for Manager {
     async fn stop_for_billing(&self, instance_id: &str, reason: &str) -> Result<()> {
-        let _g = self.lock(instance_id).await;
-        let mut inst = self.deps.store.get_instance(instance_id).await?;
-        match inst.status {
-            InstanceStatus::Running | InstanceStatus::Sleeping => {
-                tracing::warn!(instance = instance_id, reason, "stopping for billing");
-                self.stop_locked(&mut inst, reason).await
-            }
-            InstanceStatus::Stopped | InstanceStatus::Failed => Ok(()),
-            _ => Err(conflict_for(&inst)),
-        }
+        let (id, reason) = (instance_id.to_string(), reason.to_string());
+        let key = id.clone();
+        self.detached(&key, move |me, _g| async move {
+            me.stop_for_billing_locked(&id, &reason).await
+        })
+        .await
     }
 }

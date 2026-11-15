@@ -4,8 +4,10 @@ use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path as UrlPath, State},
-    http::HeaderMap,
+    extract::{DefaultBodyLimit, Path as UrlPath, Request, State},
+    http::Method,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::Deserialize;
@@ -14,6 +16,7 @@ use warren_core::{
     Clock, Error, RealClock, Result,
     agentapi::{ModelInfo, SessionDetail, SessionSummary},
     json::List,
+    types::{ENV_INSTANCE_TOKEN, HEADER_INSTANCE_TOKEN},
 };
 
 use crate::{
@@ -65,6 +68,17 @@ pub fn build_state(config: GatewayConfig) -> Result<SharedState> {
         switching = owner.switches(),
         "home owner resolved"
     );
+    if owner.process_uid == 0 && owner.uid == 0 {
+        tracing::warn!(
+            home = %home.display(),
+            "home is owned by root; agent commands will run as root"
+        );
+    }
+    if config.instance_token.is_empty() {
+        tracing::warn!(
+            "{ENV_INSTANCE_TOKEN} is empty; every route answers without an instance token"
+        );
+    }
     let state_dir = config.state_dir();
     // A home the gateway cannot write (a foreign image running as another
     // user, a read-only mount) must not take health, exec and the wrapped
@@ -116,7 +130,33 @@ pub fn build_state(config: GatewayConfig) -> Result<SharedState> {
     }))
 }
 
-/// The router with every route of the Agent API.
+/// Routes that answer without the instance token: `GET /v1/health` and
+/// `GET /v1/version` (and their `HEAD`s), matched on the exact request path.
+/// Everything else, the fallback included, goes through [`require_token`].
+pub fn is_open_route(method: &Method, path: &str) -> bool {
+    matches!(method, &Method::GET | &Method::HEAD) && matches!(path, "/v1/health" | "/v1/version")
+}
+
+/// Middleware over the whole router: when the gateway has an instance token,
+/// every request outside [`is_open_route`] must carry it in
+/// `x-warren-instance-token`, else `401 invalid_api_key`. Applied before
+/// routing, so no spelling of a path (`//v1/files`, `/v1/./files`, unknown
+/// routes) reaches a handler without the token.
+pub async fn require_token(State(state): State<SharedState>, req: Request, next: Next) -> Response {
+    if !is_open_route(req.method(), req.uri().path())
+        && let Err(e) = require_instance_token(req.headers(), &state.config.instance_token)
+    {
+        tracing::debug!(
+            method = %req.method(),
+            path = req.uri().path(),
+            "request without a valid {HEADER_INSTANCE_TOKEN}"
+        );
+        return e.into_response();
+    }
+    next.run(req).await
+}
+
+/// The router with every route of the Agent API, behind [`require_token`].
 pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/", get(health::root_handler))
@@ -147,6 +187,8 @@ pub fn router(state: SharedState) -> Router {
         .fallback(not_found)
         // Bodies are capped explicitly: JSON through `JsonBody`, uploads in `files`.
         .layer(DefaultBodyLimit::disable())
+        // `layer` (not `route_layer`) so the fallback is covered as well.
+        .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state)
 }
 
@@ -201,12 +243,9 @@ async fn list_models(State(state): State<SharedState>) -> Json<List<ModelInfo>> 
     }]))
 }
 
-/// `POST /v1/shutdown`: token-protected power-off, available in microVM init mode.
-async fn shutdown_handler(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>> {
-    require_instance_token(&headers, &state.config.instance_token)?;
+/// `POST /v1/shutdown`: power-off, available in microVM init mode. The
+/// instance token is enforced by [`require_token`].
+async fn shutdown_handler(State(state): State<SharedState>) -> Result<Json<Value>> {
     if !state.config.shutdown_enabled {
         return Err(Error::not_supported(
             "shutdown is only available when the gateway runs as the machine's init",
@@ -371,4 +410,24 @@ pub async fn serve(config: GatewayConfig) -> Result<i32> {
         t.abort();
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_health_and_version_are_open() {
+        assert!(is_open_route(&Method::GET, "/v1/health"));
+        assert!(is_open_route(&Method::HEAD, "/v1/health"));
+        assert!(is_open_route(&Method::GET, "/v1/version"));
+        assert!(!is_open_route(&Method::POST, "/v1/health"));
+        assert!(!is_open_route(&Method::GET, "/"));
+        assert!(!is_open_route(&Method::GET, "/v1/files"));
+        assert!(!is_open_route(&Method::GET, "/v1/health/"));
+        assert!(!is_open_route(&Method::GET, "//v1/health"));
+        assert!(!is_open_route(&Method::GET, "/v1/./health"));
+        assert!(!is_open_route(&Method::GET, "/v1/health/../files"));
+        assert!(!is_open_route(&Method::GET, "/nope"));
+    }
 }

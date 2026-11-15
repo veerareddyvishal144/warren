@@ -9,8 +9,7 @@ It is a thin layer over the Rust SDK (`warren-sdk`): every tool is one Sandbox A
 ```bash
 source scripts/env.sh
 cargo build --release -p warren-mcp
-# the workspace builds the binary as target/release/mcp; install it as warren-mcp
-install -m 755 target/release/mcp ~/.local/bin/warren-mcp
+install -m 755 target/release/warren-mcp ~/.local/bin/
 ```
 
 ## Configuration

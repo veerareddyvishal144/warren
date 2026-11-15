@@ -9,10 +9,10 @@ use std::{
 
 use tokio_util::sync::CancellationToken;
 use warren_core::{
-    Budget, Config, CreateInstanceRequest, Cron, ExecRequest, ForkRequest, GATEWAY_PORT, Instance,
-    InstanceStatus, InstanceStopper, InstanceType, Lifecycle, LogsOptions, MetricPoint,
-    NetworkMode, PatchInstanceRequest, Runtime, Shape, ShapeRequest, Template, Workspace, errors,
-    ids,
+    Backup, Budget, Config, CreateInstanceRequest, Cron, ExecRequest, ForkRequest, GATEWAY_PORT,
+    Instance, InstanceStatus, InstanceStopper, InstanceType, Lifecycle, LogsOptions,
+    MAX_BACKUP_BYTES_PER_WORKSPACE, MAX_BACKUPS_PER_INSTANCE, MetricPoint, NetworkMode,
+    PatchInstanceRequest, Runtime, Shape, ShapeRequest, Store, Template, Workspace, errors, ids,
 };
 
 use crate::{
@@ -1947,4 +1947,449 @@ async fn manager_new_validates_deps() {
     .err()
     .expect("no runtimes is an error");
     assert_eq!(err.code, errors::CODE_INVALID_REQUEST);
+}
+
+// ------------------------------------------------------------------ detached operations
+
+#[tokio::test]
+async fn cancelled_callers_do_not_strand_transitional_states() {
+    let env = Env::new();
+    let inst = env.create_running().await;
+    let id = inst.id.clone();
+
+    // The client goes away while the stop is in flight: the row has already
+    // moved to Stopping, and the detached task still finishes the stop.
+    env.runtime.stop_delay_ms.store(80, Ordering::SeqCst);
+    let dropped = tokio::time::timeout(Duration::from_millis(10), env.mgr.stop(WS, &id)).await;
+    assert!(dropped.is_err(), "the caller gave up");
+    let stopped = env.wait_for(&id, InstanceStatus::Stopped).await;
+    assert!(stopped.ip.is_empty());
+    assert!(!env.runtime.is_running(&id));
+    env.runtime.stop_delay_ms.store(0, Ordering::SeqCst);
+
+    env.runtime.start_delay_ms.store(80, Ordering::SeqCst);
+    let dropped = tokio::time::timeout(Duration::from_millis(10), env.mgr.start(WS, &id)).await;
+    assert!(dropped.is_err());
+    let running = env.wait_for(&id, InstanceStatus::Running).await;
+    assert!(env.runtime.is_running(&id));
+    assert!(!running.ip.is_empty());
+    env.runtime.start_delay_ms.store(0, Ordering::SeqCst);
+
+    // The same for a wake-on-request the edge stopped waiting for.
+    env.mgr.sleep(WS, &id).await.unwrap();
+    env.runtime.start_delay_ms.store(80, Ordering::SeqCst);
+    let dropped = tokio::time::timeout(Duration::from_millis(10), env.mgr.ensure_awake(&id)).await;
+    assert!(dropped.is_err());
+    env.wait_for(&id, InstanceStatus::Running).await;
+    env.runtime.start_delay_ms.store(0, Ordering::SeqCst);
+
+    // And for a restart and the biller's stop.
+    env.runtime.stop_delay_ms.store(80, Ordering::SeqCst);
+    let dropped = tokio::time::timeout(Duration::from_millis(10), env.mgr.restart(WS, &id)).await;
+    assert!(dropped.is_err());
+    env.wait_for(&id, InstanceStatus::Running).await;
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(10),
+        env.mgr.stop_for_billing(&id, "insufficient_balance"),
+    )
+    .await;
+    assert!(dropped.is_err());
+    let after = env.wait_for(&id, InstanceStatus::Stopped).await;
+    assert_eq!(after.status_reason, "insufficient_balance");
+}
+
+// ------------------------------------------------------------------ awake ladder
+
+#[tokio::test]
+async fn concurrent_creates_and_starts_respect_the_awake_limit() {
+    let env = Env::new();
+    env.biller.cap_awake(env.store.clone(), 3);
+    // A pause after the ladder check widens the window between check and insert.
+    env.biller.create_delay_ms.store(15, Ordering::SeqCst);
+    let req = CreateInstanceRequest::default();
+    let results = futures::future::join_all((0..8).map(|_| env.mgr.create(&env.ws, &req))).await;
+    let ok: Vec<&Instance> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+    assert_eq!(ok.len(), 3, "exactly the limit is admitted");
+    for err in results.iter().filter_map(|r| r.as_ref().err()) {
+        assert_eq!(err.code, errors::CODE_INSTANCE_LIMIT_REACHED);
+    }
+    for inst in &ok {
+        env.wait_for(&inst.id, InstanceStatus::Running).await;
+    }
+    assert_eq!(env.store.count_awake_instances(WS).await.unwrap(), 3);
+
+    // Starts of stopped instances race in the same way.
+    for inst in &ok {
+        env.mgr.stop(WS, &inst.id).await.unwrap();
+    }
+    let mut ids: Vec<String> = ok.iter().map(|i| i.id.clone()).collect();
+    ids.push(env.seed(InstanceStatus::Stopped).id);
+    ids.push(env.seed(InstanceStatus::Stopped).id);
+    env.biller.wake_delay_ms.store(15, Ordering::SeqCst);
+    let results = futures::future::join_all(ids.iter().map(|id| env.mgr.start(WS, id))).await;
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 3);
+    for err in results.iter().filter_map(|r| r.as_ref().err()) {
+        assert_eq!(err.code, errors::CODE_INSTANCE_LIMIT_REACHED);
+    }
+    assert_eq!(env.store.count_awake_instances(WS).await.unwrap(), 3);
+}
+
+// ------------------------------------------------------------------ reconcile and repair
+
+#[tokio::test]
+async fn reconcile_leaves_rows_alone_when_liveness_is_unknown() {
+    let env = Env::new();
+    let running = env.seed(InstanceStatus::Running);
+    let starting = env.seed(InstanceStatus::Starting);
+    env.runtime.liveness_unknown.store(true, Ordering::SeqCst);
+
+    env.mgr.reconcile().await.unwrap();
+    env.mgr.repair().await;
+    assert_eq!(
+        env.store.instance(&running.id).status,
+        InstanceStatus::Running
+    );
+    assert_eq!(
+        env.store.instance(&starting.id).status,
+        InstanceStatus::Starting
+    );
+
+    env.runtime.liveness_unknown.store(false, Ordering::SeqCst);
+    env.mgr.reconcile().await.unwrap();
+    let after = env.store.instance(&running.id);
+    assert_eq!(after.status, InstanceStatus::Stopped);
+    assert_eq!(after.status_reason, "runtime not running after restart");
+    assert_eq!(
+        env.store.instance(&starting.id).status,
+        InstanceStatus::Failed
+    );
+}
+
+#[tokio::test]
+async fn repair_pass_fixes_stranded_rows() {
+    let env = Env::new();
+    let old = NOW - 601;
+    let mut stuck = env.seed(InstanceStatus::Starting);
+    stuck.updated_at = old;
+    env.store.put_instance(stuck.clone());
+    env.runtime.set_running(&stuck.id, true);
+    let mut stuck_stop = env.seed(InstanceStatus::Stopping);
+    stuck_stop.updated_at = old;
+    stuck_stop.status_reason = "idle".into();
+    env.store.put_instance(stuck_stop.clone());
+    env.runtime.set_running(&stuck_stop.id, true);
+    let fresh = env.seed(InstanceStatus::Waking);
+    let mut failed_live = env.seed(InstanceStatus::Failed);
+    failed_live.status_reason = "start failed".into();
+    env.store.put_instance(failed_live.clone());
+    env.runtime.set_running(&failed_live.id, true);
+    let running_gone = env.seed(InstanceStatus::Running);
+    let running_ok = env.seed(InstanceStatus::Running);
+    env.runtime.set_running(&running_ok.id, true);
+    let mut busy = env.seed(InstanceStatus::Starting);
+    busy.updated_at = old;
+    env.store.put_instance(busy.clone());
+    let held = env.mgr.lock(&busy.id).await;
+    let mut stale_delete = env.seed(InstanceStatus::Deleting);
+    stale_delete.updated_at = old;
+    env.store.put_instance(stale_delete.clone());
+
+    env.mgr.repair().await;
+
+    let after = env.store.instance(&stuck.id);
+    assert_eq!(after.status, InstanceStatus::Failed);
+    assert_eq!(
+        after.status_reason,
+        "stuck in starting for 601 seconds; runtime stopped"
+    );
+    assert!(!env.runtime.is_running(&stuck.id));
+    let after = env.store.instance(&stuck_stop.id);
+    assert_eq!(after.status, InstanceStatus::Stopped);
+    assert_eq!(
+        after.status_reason,
+        "idle; stop interrupted; runtime stopped"
+    );
+    assert_eq!(after.stopped_at, NOW);
+    assert!(!env.runtime.is_running(&stuck_stop.id));
+    assert_eq!(
+        env.store.instance(&fresh.id).status,
+        InstanceStatus::Waking,
+        "a recent transition is left to its operation"
+    );
+    let after = env.store.instance(&failed_live.id);
+    assert_eq!(after.status, InstanceStatus::Failed);
+    assert_eq!(after.status_reason, "start failed; runtime stopped");
+    assert!(!env.runtime.is_running(&failed_live.id));
+    let after = env.store.instance(&running_gone.id);
+    assert_eq!(after.status, InstanceStatus::Stopped);
+    assert_eq!(after.status_reason, "runtime not running");
+    assert_eq!(after.stopped_at, NOW);
+    assert_eq!(
+        env.store.instance(&running_ok.id).status,
+        InstanceStatus::Running
+    );
+    assert_eq!(
+        env.store.instance(&busy.id).status,
+        InstanceStatus::Starting,
+        "a busy instance is skipped"
+    );
+    assert!(!env.store.has_instance(&stale_delete.id));
+    drop(held);
+
+    // A failed instance whose runtime refuses to stop is destroyed instead.
+    let mut stubborn = env.seed(InstanceStatus::Failed);
+    stubborn.status_reason = "stop failed".into();
+    env.store.put_instance(stubborn.clone());
+    env.runtime.set_running(&stubborn.id, true);
+    env.runtime.fail_stop.store(true, Ordering::SeqCst);
+    env.mgr.repair().await;
+    let after = env.store.instance(&stubborn.id);
+    assert_eq!(after.status_reason, "stop failed; runtime destroyed");
+    assert!(!env.runtime.is_running(&stubborn.id));
+    assert!(
+        env.runtime
+            .ops_for(&stubborn.id)
+            .ends_with(&["stop".to_string(), "destroy".to_string()])
+    );
+}
+
+// ------------------------------------------------------------------ forced destroy
+
+#[tokio::test]
+async fn failed_stop_force_destroys_the_runtime() {
+    let env = Env::new();
+    let inst = env.create_running().await;
+    env.runtime.fail_stop.store(true, Ordering::SeqCst);
+    let err = env.mgr.stop(WS, &inst.id).await.unwrap_err();
+    assert!(err.is_internal());
+    let after = env.store.instance(&inst.id);
+    assert_eq!(after.status, InstanceStatus::Failed);
+    assert_eq!(after.status_reason, "stop failed; runtime destroyed");
+    assert!(after.ip.is_empty());
+    assert!(
+        !env.runtime.is_running(&inst.id),
+        "nothing keeps running behind a failed row"
+    );
+    assert!(
+        env.runtime
+            .ops_for(&inst.id)
+            .ends_with(&["stop".to_string(), "destroy".to_string()])
+    );
+
+    // When even the forced destroy fails the reason says so.
+    let other = env.create_running().await;
+    env.runtime.fail_destroy.store(true, Ordering::SeqCst);
+    env.mgr.sleep(WS, &other.id).await.unwrap_err();
+    let after = env.store.instance(&other.id);
+    assert_eq!(after.status, InstanceStatus::Failed);
+    assert_eq!(
+        after.status_reason,
+        "stop failed; forced destroy failed: destroy failed"
+    );
+    env.runtime.fail_stop.store(false, Ordering::SeqCst);
+    env.runtime.fail_destroy.store(false, Ordering::SeqCst);
+}
+
+// ------------------------------------------------------------------ resize balance
+
+#[tokio::test]
+async fn resize_up_requires_a_day_of_balance() {
+    let env = Env::new();
+    let inst = env.create_running().await;
+    env.biller.create_checks.lock().clear();
+    env.biller.refuse_create.store(true, Ordering::SeqCst);
+    let bigger = ShapeRequest {
+        cpu: Some(4),
+        memory: Some(8),
+        disk: None,
+    };
+    let err = env.mgr.resize(WS, &inst.id, &bigger).await.unwrap_err();
+    assert_eq!(err.code, errors::CODE_INSUFFICIENT_BALANCE);
+    assert_eq!(
+        env.biller.create_checks.lock().as_slice(),
+        &[(
+            Shape {
+                cpu: 4,
+                memory: 8,
+                disk: 6
+            },
+            InstanceType::Default
+        )]
+    );
+    assert_eq!(env.runtime.resize_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(env.store.instance(&inst.id).shape, BASE_SHAPE);
+
+    // The same shape is a no-op and asks the biller nothing.
+    env.mgr
+        .resize(
+            WS,
+            &inst.id,
+            &ShapeRequest {
+                cpu: Some(2),
+                memory: Some(4),
+                disk: Some(4),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(env.biller.create_checks.lock().len(), 1);
+
+    env.biller.refuse_create.store(false, Ordering::SeqCst);
+    let grown = env.mgr.resize(WS, &inst.id, &bigger).await.unwrap();
+    assert_eq!(grown.shape.cpu, 4);
+}
+
+// ------------------------------------------------------------------ backup caps
+
+#[tokio::test]
+async fn backups_are_capped_per_instance_and_per_workspace() {
+    let env = Env::new();
+    let inst = env.create_running().await;
+    let id = inst.id.clone();
+    let dir = env.data_dir.join("backups").join(&id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut seeded = Vec::new();
+    for i in 0..MAX_BACKUPS_PER_INSTANCE {
+        let bid = ids::new_id();
+        let path = dir.join(format!("{bid}.tar.gz"));
+        std::fs::write(&path, b"old").unwrap();
+        env.store.put_backup(Backup {
+            id: bid.clone(),
+            instance_id: id.clone(),
+            workspace_id: WS.into(),
+            path: path.to_string_lossy().into_owned(),
+            size_bytes: 3,
+            created_at: NOW - 1000 + i as i64,
+            note: String::new(),
+        });
+        seeded.push((bid, path));
+    }
+    env.clock.advance(5);
+    let b = env.mgr.backup(WS, &id, "newest").await.unwrap();
+    let list = env.mgr.list_backups(WS, &id).await.unwrap();
+    assert_eq!(list.len(), MAX_BACKUPS_PER_INSTANCE);
+    assert_eq!(list[0].id, b.id, "newest first");
+    let (oldest_id, oldest_path) = &seeded[0];
+    assert!(
+        list.iter().all(|x| &x.id != oldest_id),
+        "the oldest row is gone"
+    );
+    assert!(!oldest_path.exists(), "and its file");
+    assert!(seeded[1].1.exists(), "the next one stays");
+    assert!(PathBuf::from(&b.path).exists());
+
+    // Workspace quota: another instance's backups nearly fill it, so the next
+    // archive would exceed it and is removed again.
+    let other = env.create_running().await;
+    env.store.put_backup(Backup {
+        id: ids::new_id(),
+        instance_id: other.id.clone(),
+        workspace_id: WS.into(),
+        path: String::new(),
+        size_bytes: MAX_BACKUP_BYTES_PER_WORKSPACE as i64 - 10,
+        created_at: NOW,
+        note: String::new(),
+    });
+    let files_before = std::fs::read_dir(&dir).unwrap().count();
+    let err = env.mgr.backup(WS, &id, "").await.unwrap_err();
+    assert_eq!(err.code, errors::CODE_CONFLICT);
+    assert_eq!(err.message, "backup storage quota reached");
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        files_before,
+        "the over-quota archive is removed"
+    );
+    assert_eq!(
+        env.mgr.list_backups(WS, &id).await.unwrap().len(),
+        MAX_BACKUPS_PER_INSTANCE
+    );
+    assert_eq!(
+        env.mgr.backup(WS, &other.id, "").await.unwrap_err().code,
+        errors::CODE_CONFLICT,
+        "every instance of the workspace shares the quota"
+    );
+}
+
+// ------------------------------------------------------------------ credentials and wallet
+
+#[tokio::test]
+async fn gateway_credentials_and_wallet_refusal_on_wake() {
+    let env = Env::new();
+    let inst = env.create_running().await;
+    let (ip, token) = env.mgr.gateway_credentials(&inst.id).await.unwrap();
+    assert_eq!(ip, "10.0.0.1");
+    assert_eq!(token, inst.instance_token);
+    assert!(
+        env.mgr
+            .gateway_credentials("unknown999")
+            .await
+            .unwrap_err()
+            .is_not_found()
+    );
+
+    env.mgr.sleep(WS, &inst.id).await.unwrap();
+    assert_eq!(
+        env.mgr
+            .gateway_credentials(&inst.id)
+            .await
+            .unwrap_err()
+            .code,
+        errors::CODE_CONFLICT
+    );
+
+    env.biller.refuse_wake_balance.store(true, Ordering::SeqCst);
+    let err = env.mgr.ensure_awake(&inst.id).await.unwrap_err();
+    assert_eq!(err.code, errors::CODE_INSUFFICIENT_BALANCE);
+    let err = env
+        .mgr
+        .exec(
+            WS,
+            &inst.id,
+            &ExecRequest {
+                command: "true".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, errors::CODE_INSUFFICIENT_BALANCE);
+    assert_eq!(
+        env.store.instance(&inst.id).status,
+        InstanceStatus::Sleeping,
+        "a refused wake leaves the instance sleeping"
+    );
+    assert!(!env.runtime.is_running(&inst.id));
+    env.biller
+        .refuse_wake_balance
+        .store(false, Ordering::SeqCst);
+    let woken = env.mgr.ensure_awake(&inst.id).await.unwrap();
+    assert_eq!(woken.status, InstanceStatus::Running);
+}
+
+// ------------------------------------------------------------------ meter ownership
+
+#[tokio::test]
+async fn entering_compute_billing_writes_the_meter_through_set_meter() {
+    let env = Env::new();
+    let inst = env.create_running().await;
+    assert_eq!(env.store.instance(&inst.id).metered_through, NOW);
+    assert!(env.store.meter_sets.load(Ordering::SeqCst) >= 1);
+
+    env.mgr.stop(WS, &inst.id).await.unwrap();
+    // The biller advanced the meter while the instance was stopped.
+    env.store
+        .set_meter(&inst.id, NOW + 60, 12.5, None)
+        .await
+        .unwrap();
+    env.clock.advance(120);
+    let before = env.store.meter_sets.load(Ordering::SeqCst);
+    env.mgr.start(WS, &inst.id).await.unwrap();
+    let after = env.store.instance(&inst.id);
+    assert_eq!(
+        after.metered_through,
+        NOW + 120,
+        "compute billing starts now"
+    );
+    assert_eq!(after.meter_carry_micros, 12.5, "the carry is kept");
+    assert!(env.store.meter_sets.load(Ordering::SeqCst) > before);
 }

@@ -29,6 +29,7 @@ use crate::{
     DockerRuntime, HOME_DIR, LABEL_INJECTED, LABEL_INSTANCE, LABEL_SCOPE, LABEL_WORKSPACE,
     NETWORK_INTERNAL, NETWORK_PUBLIC, START_POLL_INTERVAL, START_TIMEOUT, error,
     inject::{Injection, explain_missing_gateway, gateway_bind, wrap_entrypoint},
+    netpolicy::{self, PIDS_LIMIT},
     runtime::{container_name, target},
     storage,
 };
@@ -141,6 +142,7 @@ pub(crate) fn create_body(
         nano_cpus: (shape.cpu > 0).then(|| nano_cpus(shape.cpu)),
         binds: Some(binds),
         network_mode: Some(network_for(inst.network).to_string()),
+        pids_limit: Some(PIDS_LIMIT),
         init: Some(true),
         restart_policy: Some(RestartPolicy {
             name: Some(RestartPolicyNameEnum::NO),
@@ -202,6 +204,12 @@ impl DockerRuntime {
         let home = storage_path.join(HOME_DIR);
         storage::prepare_home(home.clone()).await?;
         let runtime = self.chosen_runtime().await?;
+        let network = network_for(inst.network);
+        if self.network_blocked(network) {
+            return Err(Error::not_supported(netpolicy::blocked_network_hint(
+                network,
+            )));
+        }
         let image = if inst.image_ref.is_empty() {
             tpl.image_ref.clone()
         } else {
@@ -640,6 +648,7 @@ mod tests {
             ])
         );
         assert_eq!(host.network_mode.as_deref(), Some(NETWORK_PUBLIC));
+        assert_eq!(host.pids_limit, Some(PIDS_LIMIT));
         assert_eq!(host.init, Some(true));
         assert_eq!(
             host.restart_policy.unwrap().name,

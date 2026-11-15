@@ -51,6 +51,11 @@ fn free_port() -> u16 {
 /// wrapped `argv` after `--`, in a fresh temp directory that is also the
 /// working directory, with a home inside it.
 async fn start(flags: &[&str], argv: &[&str]) -> Gateway {
+    start_with_driver(flags, argv, None).await
+}
+
+/// [`start`] with `WARREN_AGENT_DRIVER` set to `driver` when given.
+async fn start_with_driver(flags: &[&str], argv: &[&str], driver: Option<&str>) -> Gateway {
     let dir = std::env::temp_dir().join(format!("warren-gw-wrap-{}", warren_core::ids::new_id()));
     let home = dir.join("home");
     std::fs::create_dir_all(&home).expect("mkdir");
@@ -70,10 +75,14 @@ async fn start(flags: &[&str], argv: &[&str]) -> Gateway {
         .env("APP_ENV", "production")
         .env("RUST_LOG", "warn")
         .env_remove("WARREN_AGENT_DRIVER")
+        .env_remove("WARREN_AGENT_COMMAND")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    if let Some(driver) = driver {
+        cmd.env("WARREN_AGENT_DRIVER", driver);
+    }
     let child = cmd.spawn().expect("spawn gateway");
     Gateway {
         child,
@@ -93,8 +102,15 @@ impl Gateway {
         Pid::from_raw(self.child.id().expect("gateway pid") as i32)
     }
 
+    /// `GET path` with the instance token, as the daemon and the edge send it.
     async fn try_get_json(&self, path: &str) -> Option<(u16, Value)> {
-        let r = self.client.get(self.url(path)).send().await.ok()?;
+        let r = self
+            .client
+            .get(self.url(path))
+            .header(HEADER_INSTANCE_TOKEN, TOKEN)
+            .send()
+            .await
+            .ok()?;
         let status = r.status().as_u16();
         let v = r.json().await.unwrap_or(Value::Null);
         Some((status, v))
@@ -213,6 +229,20 @@ async fn wrapped_program_runs_with_a_filtered_environment() {
     let (_, root) = g.get_json("/").await;
     assert_eq!(root["wrapped"]["pid"], pid);
 
+    // Health is open; everything else needs the token the environment set.
+    let r = g.client.get(g.url("/v1/health")).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.json::<Value>().await.unwrap()["wrapped"]["pid"], pid);
+    for path in ["/v1/files", "/", "//v1/files", "/v1/./files"] {
+        let r = g.client.get(g.url(path)).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 401, "{path}");
+        assert_eq!(
+            r.json::<Value>().await.unwrap()["error"]["code"],
+            "invalid_api_key",
+            "{path}"
+        );
+    }
+
     // SIGTERM to the gateway terminates the program and the gateway exits
     // with the program's status (killed by SIGTERM: 143).
     let started = Instant::now();
@@ -235,6 +265,7 @@ async fn exited_program_leaves_the_gateway_serving() {
     let r = g
         .client
         .put(g.url("/v1/files/content?path=notes/a.txt"))
+        .header(HEADER_INSTANCE_TOKEN, TOKEN)
         .body("hello")
         .send()
         .await
@@ -244,6 +275,7 @@ async fn exited_program_leaves_the_gateway_serving() {
     let r = g
         .client
         .get(g.url("/v1/files/content?path=notes/a.txt"))
+        .header(HEADER_INSTANCE_TOKEN, TOKEN)
         .send()
         .await
         .unwrap();
@@ -281,6 +313,68 @@ async fn exited_program_leaves_the_gateway_serving() {
 
     // Stopping the gateway reports the program's exit code.
     assert_eq!(g.terminate().await, 3);
+}
+
+/// Lines of `env` output that are platform variables a user process must
+/// never see.
+fn leaked_platform_vars(env: &str) -> Vec<&str> {
+    env.lines()
+        .filter(|l| l.starts_with("WARREN_") && !l.starts_with("WARREN_HOME="))
+        .collect()
+}
+
+#[tokio::test]
+async fn user_processes_do_not_see_platform_variables() {
+    // The gateway itself has WARREN_INSTANCE_TOKEN, WARREN_GATEWAY_BIND and
+    // friends in its environment; exec children and the echo driver's shell
+    // (the same path the openai driver's run_shell takes) must not.
+    let mut g = start_with_driver(&["--wrap"], &[], Some("echo")).await;
+    let health = g.health_when(|h| h["agent_ready"] == true).await;
+    assert_eq!(health["driver"], "echo");
+    assert_eq!(
+        health["home_owner"]["uid"],
+        warren_gateway::exec::effective_uid()
+    );
+
+    let r = g
+        .client
+        .post(g.url("/v1/exec"))
+        .header(HEADER_INSTANCE_TOKEN, TOKEN)
+        .json(&json!({ "command": "env", "env": { "EXTRA": "kept" } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let result: Value = r.json().await.unwrap();
+    assert_eq!(result["exit_code"], 0);
+    let env = result["stdout"].as_str().unwrap();
+    assert_eq!(leaked_platform_vars(env), Vec::<&str>::new(), "{env}");
+    assert!(!env.contains(TOKEN), "{env}");
+    assert!(
+        env.contains(&format!("WARREN_HOME={}", g.home.display())),
+        "{env}"
+    );
+    assert!(env.lines().any(|l| l == "APP_ENV=production"), "{env}");
+    assert!(env.lines().any(|l| l == "EXTRA=kept"), "{env}");
+
+    let r = g
+        .client
+        .post(g.url("/v1/responses"))
+        .header(HEADER_INSTANCE_TOKEN, TOKEN)
+        .json(&json!({ "input": "!env" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let reply: Value = r.json().await.unwrap();
+    assert_eq!(reply["status"], "completed", "{reply}");
+    let env = reply["output_text"].as_str().unwrap();
+    assert_eq!(leaked_platform_vars(env), Vec::<&str>::new(), "{env}");
+    assert!(!env.contains(TOKEN), "{env}");
+    assert!(env.contains("WARREN_HOME="), "{env}");
+    assert!(env.lines().any(|l| l == "APP_ENV=production"), "{env}");
+
+    assert_eq!(g.terminate().await, 0);
 }
 
 #[tokio::test]

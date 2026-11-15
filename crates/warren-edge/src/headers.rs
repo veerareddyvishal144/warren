@@ -6,9 +6,9 @@ use std::net::IpAddr;
 
 use http::{
     HeaderMap, HeaderValue,
-    header::{CONNECTION, COOKIE, HeaderName},
+    header::{AUTHORIZATION, CONNECTION, COOKIE, HeaderName},
 };
-use warren_core::{COOKIE_NAME, QUERY_TOKEN};
+use warren_core::{COOKIE_NAME, QUERY_TOKEN, ids::KEY_PREFIX};
 
 pub(crate) const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 pub(crate) const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
@@ -39,6 +39,22 @@ pub(crate) fn connection_nominated(headers: &HeaderMap) -> Vec<String> {
         .map(|t| t.trim().to_ascii_lowercase())
         .filter(|t| !t.is_empty())
         .collect()
+}
+
+/// The token of an `Authorization: Bearer <token>` header, trimmed.
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let auth = headers.get(AUTHORIZATION)?.to_str().ok()?.trim();
+    let scheme = auth.get(..7)?;
+    if !scheme.eq_ignore_ascii_case("bearer ") {
+        return None;
+    }
+    Some(auth[7..].trim())
+}
+
+/// Whether `Authorization` carries a Warren API key (`Bearer sk_live_...`).
+/// Such a header is the edge's credential and is never forwarded.
+pub(crate) fn is_warren_bearer(headers: &HeaderMap) -> bool {
+    bearer_token(headers).is_some_and(|t| t.starts_with(KEY_PREFIX))
 }
 
 /// `(name, "name=value")` for every cookie in every `Cookie` header.

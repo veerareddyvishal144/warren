@@ -5,17 +5,37 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use warren_core::agentapi::Health;
 
-use crate::{VERSION, server::SharedState, wrap::WrappedStatus};
+use crate::{VERSION, owner::HomeOwner, server::SharedState, wrap::WrappedStatus};
 
-/// The health document: the contract's [`Health`] fields plus, in wrap
-/// mode, the state of the wrapped program.
+/// The health document: the contract's [`Health`] fields, who owns the
+/// persistent home (and therefore runs agent commands) and, in wrap mode,
+/// the state of the wrapped program.
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthReport {
     #[serde(flatten)]
     pub health: Health,
+    /// The user agent commands run as and created files belong to.
+    pub home_owner: HomeOwnerInfo,
     /// Present only when the gateway wraps the image's own entrypoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrapped: Option<WrappedStatus>,
+}
+
+/// `home_owner` in the health document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HomeOwnerInfo {
+    pub uid: u32,
+    /// Name from `/etc/passwd`, or the numeric uid as a string when unlisted.
+    pub name: String,
+}
+
+impl From<&HomeOwner> for HomeOwnerInfo {
+    fn from(o: &HomeOwner) -> Self {
+        HomeOwnerInfo {
+            uid: o.uid,
+            name: o.name.clone(),
+        }
+    }
 }
 
 /// The current health document for `state`.
@@ -27,6 +47,7 @@ pub fn report(state: &SharedState) -> HealthReport {
             driver: state.config.driver_name().to_string(),
             version: VERSION.to_string(),
         },
+        home_owner: HomeOwnerInfo::from(&state.owner),
         wrapped: state.wrapped.as_ref().map(|w| w.status()),
     }
 }

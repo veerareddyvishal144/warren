@@ -71,6 +71,8 @@ fn unsupported() -> Error {
 struct FakeLifecycle {
     instances: Mutex<HashMap<String, Instance>>,
     ip: String,
+    /// The per-instance gateway token `gateway_credentials` hands out.
+    token: Mutex<String>,
     activity: AtomicUsize,
     awakened: AtomicUsize,
 }
@@ -80,9 +82,14 @@ impl FakeLifecycle {
         Arc::new(FakeLifecycle {
             instances: Mutex::new(HashMap::new()),
             ip: ip.to_string(),
+            token: Mutex::new(String::new()),
             activity: AtomicUsize::new(0),
             awakened: AtomicUsize::new(0),
         })
+    }
+
+    fn set_token(&self, token: &str) {
+        *self.token.lock().unwrap() = token.to_string();
     }
 
     fn insert(&self, inst: Instance) {
@@ -176,6 +183,20 @@ impl Lifecycle for FakeLifecycle {
         Self: 'at,
     {
         let found = self.lookup(id).map(|_| self.ip.clone());
+        Box::pin(async move { found.ok_or_else(|| Error::not_found("instance")) })
+    }
+
+    fn gateway_credentials<'a, 'b, 'at>(
+        &'a self,
+        id: &'b str,
+    ) -> BoxFut<'at, Result<(String, String)>>
+    where
+        'a: 'at,
+        'b: 'at,
+        Self: 'at,
+    {
+        let token = self.token.lock().unwrap().clone();
+        let found = self.lookup(id).map(|_| (self.ip.clone(), token));
         Box::pin(async move { found.ok_or_else(|| Error::not_found("instance")) })
     }
 }
@@ -292,6 +313,14 @@ struct Harness {
     cfg: Config,
     router: Router,
     upstream_port: u16,
+    /// The most API requests `/v1/count` saw in flight at once.
+    api_max_in_flight: Arc<AtomicUsize>,
+}
+
+/// An API route that sleeps `ms` milliseconds, then answers `late`.
+async fn api_sleep(ms: u64) -> &'static str {
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+    "late"
 }
 
 fn instance(id: &str, ws: &str, port: u16) -> Instance {
@@ -331,11 +360,29 @@ async fn harness_with(opts: EdgeOptions) -> Harness {
     ]);
     let signer = Arc::new(HmacSigner::new("test-secret", Arc::new(RealClock)));
     let cfg = Config::default();
+    let api_max_in_flight = Arc::new(AtomicUsize::new(0));
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let counter = {
+        let (in_flight, max) = (in_flight.clone(), api_max_in_flight.clone());
+        move || {
+            let (in_flight, max) = (in_flight.clone(), max.clone());
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                "counted"
+            }
+        }
+    };
     let api = Router::new()
         .route(
             "/v1/health",
             any(|| async { Json(json!({ "healthy": true })) }),
         )
+        .route("/v1/slow", any(|| api_sleep(400)))
+        .route("/v1/instances/{id}/exec", any(|| api_sleep(400)))
+        .route("/v1/count", any(counter))
         .fallback(|| async { (StatusCode::NOT_FOUND, "api 404") });
     let dashboard = Router::new().fallback(|| async { "dashboard" });
     let router = router_with(
@@ -355,12 +402,29 @@ async fn harness_with(opts: EdgeOptions) -> Harness {
         cfg,
         router,
         upstream_port,
+        api_max_in_flight,
     }
 }
 
 impl Harness {
     fn host(&self) -> String {
         format!("{ID}.warren.localhost:7337")
+    }
+
+    /// The instance's own origin on the default-port host.
+    fn origin(&self) -> String {
+        format!("http://{ID}.warren.localhost:7337")
+    }
+
+    /// A cookie-authenticated GET with extra headers.
+    fn cookie_get(&self, extra: &[(&str, &str)]) -> Request {
+        let mut b = self
+            .get(&self.host(), "/")
+            .header(COOKIE, format!("warren_session={}", self.token(ID, 0)));
+        for (name, value) in extra {
+            b = b.header(*name, *value);
+        }
+        b.body(Body::empty()).unwrap()
     }
 
     fn port_host(&self, port: u16) -> String {
@@ -667,7 +731,7 @@ async fn relays_upstream_headers_and_drops_hop_by_hop() {
 }
 
 #[tokio::test]
-async fn authorization_bearer_key_authenticates_and_is_preserved() {
+async fn authorization_bearer_key_authenticates_and_is_stripped() {
     let h = harness().await;
     let req = h
         .get(&h.host(), "/")
@@ -679,7 +743,131 @@ async fn authorization_bearer_key_authenticates_and_is_preserved() {
     let seen = json_body(resp).await;
     assert_eq!(
         seen_header(&seen, "authorization"),
-        Some(format!("Bearer {KEY}").as_str())
+        None,
+        "a Warren key never reaches the instance"
+    );
+
+    // Also when X-Warren-Key did the authenticating: the bearer is still a key.
+    let req = h
+        .get(&h.host(), "/")
+        .header("x-warren-key", KEY)
+        .header(AUTHORIZATION, "Bearer sk_live_somethingelse")
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let seen = json_body(resp).await;
+    assert_eq!(seen_header(&seen, "authorization"), None);
+    assert_eq!(seen_header(&seen, "x-warren-key"), None);
+
+    // A non-Warren bearer under key auth is the app's own and is forwarded.
+    let req = h
+        .get(&h.host(), "/")
+        .header("x-warren-key", KEY)
+        .header(AUTHORIZATION, "Bearer app-token")
+        .body(Body::empty())
+        .unwrap();
+    let seen = json_body(h.send(req).await).await;
+    assert_eq!(
+        seen_header(&seen, "authorization"),
+        Some("Bearer app-token")
+    );
+}
+
+#[tokio::test]
+async fn instance_token_is_injected_and_never_client_supplied() {
+    let h = harness().await;
+    // No token known: a client-sent header is dropped.
+    let req = h
+        .get(&h.host(), "/")
+        .header("x-warren-key", KEY)
+        .header("x-warren-instance-token", "forged")
+        .body(Body::empty())
+        .unwrap();
+    let seen = json_body(h.send(req).await).await;
+    assert_eq!(seen_header(&seen, "x-warren-instance-token"), None);
+
+    // A known token is set, overwriting whatever the client sent.
+    h.lifecycle.set_token("it_secret");
+    let req = h
+        .get(&h.host(), "/")
+        .header("x-warren-key", KEY)
+        .header("x-warren-instance-token", "forged")
+        .body(Body::empty())
+        .unwrap();
+    let seen = json_body(h.send(req).await).await;
+    assert_eq!(
+        seen["headers"]["x-warren-instance-token"],
+        json!(["it_secret"])
+    );
+}
+
+#[tokio::test]
+async fn session_cookie_requires_same_origin() {
+    let h = harness().await;
+    let own = h.origin();
+    let ok = [
+        vec![],
+        vec![("origin", own.as_str())],
+        vec![("referer", "http://ab12cd34ef.warren.localhost:7337/app?x=1")],
+        vec![("sec-fetch-site", "same-origin")],
+        vec![("sec-fetch-site", "none")],
+        // A top-level navigation (what SameSite=Lax permits) from the dashboard.
+        vec![
+            ("sec-fetch-site", "same-site"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-dest", "document"),
+            ("referer", "http://warren.localhost:7337/"),
+        ],
+    ];
+    for extra in &ok {
+        let resp = h.send(h.cookie_get(extra)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{extra:?}");
+    }
+    let refused = [
+        vec![("origin", "http://warren.localhost:7337")],
+        vec![("origin", "http://zz99yy88xx.warren.localhost:7337")],
+        vec![("origin", "http://evil.example")],
+        vec![("referer", "http://zz99yy88xx.warren.localhost:7337/")],
+        vec![("sec-fetch-site", "same-site")],
+        vec![("sec-fetch-site", "cross-site")],
+        // Embedding (an iframe) is not a top-level navigation.
+        vec![
+            ("sec-fetch-site", "same-site"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-dest", "iframe"),
+        ],
+    ];
+    for extra in &refused {
+        let resp = h.send(h.cookie_get(extra)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{extra:?}");
+        let body = json_body(resp).await;
+        assert_eq!(body["error"]["code"], "invalid_api_key", "{extra:?}");
+    }
+    // A POST is never a navigation, even with navigation headers.
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/exec")
+        .header(HOST, h.host())
+        .header(COOKIE, format!("warren_session={}", h.token(ID, 0)))
+        .header("sec-fetch-site", "same-site")
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "document")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(h.send(req).await.status(), StatusCode::UNAUTHORIZED);
+    // Keys are not subject to the check: scripts on other origins hold one.
+    let req = h
+        .get(&h.host(), "/")
+        .header("x-warren-key", KEY)
+        .header("origin", "http://evil.example")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(h.send(req).await.status(), StatusCode::OK);
+    assert_eq!(
+        h.lifecycle.awakened.load(Ordering::SeqCst),
+        ok.len() + 1,
+        "refused requests never touch the instance"
     );
 }
 
@@ -773,7 +961,10 @@ async fn signed_url_redirects_with_cookie_then_cookie_proxies() {
         )
         .await;
     assert_eq!(resp.status(), StatusCode::FOUND);
-    assert_eq!(header_str(&resp, &LOCATION), "/term?a=1&b=2");
+    assert_eq!(
+        header_str(&resp, &LOCATION),
+        "http://ab12cd34ef.warren.localhost:7337/term?a=1&b=2"
+    );
     assert_eq!(
         header_str(&resp, &SET_COOKIE),
         format!("warren_session={token}; HttpOnly; SameSite=Lax; Path=/")
@@ -791,7 +982,22 @@ async fn signed_url_redirects_with_cookie_then_cookie_proxies() {
                 .unwrap(),
         )
         .await;
-    assert_eq!(header_str(&resp, &LOCATION), "/term");
+    assert_eq!(
+        header_str(&resp, &LOCATION),
+        "http://ab12cd34ef.warren.localhost:7337/term"
+    );
+
+    // A path that could become a protocol-relative URL is refused.
+    let resp = h
+        .send(
+            h.get(&h.host(), &format!("//evil.example/?warren_token={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(resp.headers().get(LOCATION).is_none());
+    assert_eq!(json_body(resp).await["error"]["code"], "invalid_request");
 
     let req = h
         .get(&h.host(), "/term?a=1&b=2")
@@ -979,11 +1185,12 @@ async fn slow_upstream_is_504_timeout() {
 #[tokio::test]
 async fn cors_preflight_and_response_headers() {
     let h = harness().await;
+    let dashboard = "http://warren.localhost:7337";
     let req = Request::builder()
         .method(Method::OPTIONS)
         .uri("/v1/responses")
         .header(HOST, h.host())
-        .header(ORIGIN, "http://app.example")
+        .header(ORIGIN, dashboard)
         .header("access-control-request-method", "POST")
         .header(
             "access-control-request-headers",
@@ -993,10 +1200,7 @@ async fn cors_preflight_and_response_headers() {
         .unwrap();
     let resp = h.send(req).await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        header_str(&resp, &ACCESS_CONTROL_ALLOW_ORIGIN),
-        "http://app.example"
-    );
+    assert_eq!(header_str(&resp, &ACCESS_CONTROL_ALLOW_ORIGIN), dashboard);
     assert_eq!(
         header_str(&resp, &ACCESS_CONTROL_ALLOW_HEADERS),
         "X-Warren-Key, Content-Type, Authorization, x-app-trace"
@@ -1012,24 +1216,80 @@ async fn cors_preflight_and_response_headers() {
         "preflights never touch the instance"
     );
 
-    let req = h
-        .get(&h.host(), "/")
-        .header("x-warren-key", KEY)
+    // A preflight from an untrusted origin is answered without any grant.
+    let req = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/v1/responses")
+        .header(HOST, h.host())
         .header(ORIGIN, "http://app.example")
+        .header("access-control-request-method", "POST")
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(resp.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+    assert!(resp.headers().get(ACCESS_CONTROL_ALLOW_HEADERS).is_none());
+    assert!(
+        resp.headers()
+            .get(ACCESS_CONTROL_ALLOW_CREDENTIALS)
+            .is_none()
+    );
+
+    // Trusted origins on proxied responses: the dashboard and the instance itself.
+    for origin in [dashboard, &h.origin()] {
+        let req = h
+            .get(&h.host(), "/")
+            .header("x-warren-key", KEY)
+            .header(ORIGIN, origin)
+            .body(Body::empty())
+            .unwrap();
+        let resp = h.send(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header_str(&resp, &ACCESS_CONTROL_ALLOW_ORIGIN), origin);
+        assert_eq!(header_str(&resp, &ACCESS_CONTROL_ALLOW_CREDENTIALS), "true");
+    }
+    // On a port host the preview origin is trusted as well.
+    let port_origin = format!("http://{ID}-{}.warren.localhost:7337", h.upstream_port);
+    let req = h
+        .get(&h.port_host(h.upstream_port), "/")
+        .header("x-warren-key", KEY)
+        .header(ORIGIN, &port_origin)
         .body(Body::empty())
         .unwrap();
     let resp = h.send(req).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        header_str(&resp, &ACCESS_CONTROL_ALLOW_ORIGIN),
-        "http://app.example"
-    );
-    assert_eq!(header_str(&resp, &ACCESS_CONTROL_ALLOW_CREDENTIALS), "true");
+    assert_eq!(header_str(&resp, &ACCESS_CONTROL_ALLOW_ORIGIN), port_origin);
+
+    // Other origins, another instance included, get no CORS at all.
+    for origin in [
+        "http://app.example",
+        "http://zz99yy88xx.warren.localhost:7337",
+        "http://api.warren.localhost:7337",
+        "https://warren.localhost:7337",
+    ] {
+        let req = h
+            .get(&h.host(), "/")
+            .header("x-warren-key", KEY)
+            .header(ORIGIN, origin)
+            .body(Body::empty())
+            .unwrap();
+        let resp = h.send(req).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{origin}");
+        assert!(
+            resp.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+            "{origin} must not be granted"
+        );
+        assert!(
+            resp.headers()
+                .get(ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none()
+        );
+    }
 
     let resp = h
         .send(
             h.get(&h.host(), "/")
-                .header(ORIGIN, "http://app.example")
+                .header(ORIGIN, dashboard)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1037,8 +1297,8 @@ async fn cors_preflight_and_response_headers() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         header_str(&resp, &ACCESS_CONTROL_ALLOW_ORIGIN),
-        "http://app.example",
-        "browsers can read edge errors too"
+        dashboard,
+        "the dashboard can read edge errors too"
     );
 
     let resp = h
@@ -1053,6 +1313,118 @@ async fn cors_preflight_and_response_headers() {
         resp.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
         "no Origin, no CORS headers"
     );
+}
+
+#[test]
+fn root_origin_follows_the_public_port_rule() {
+    let cfg = Config::default();
+    assert_eq!(
+        crate::cors::root_origin(&cfg),
+        "http://warren.localhost:7337"
+    );
+    let cfg = Config {
+        public_scheme: "https".into(),
+        public_port: 443,
+        base_domain: "warren.example".into(),
+        ..Config::default()
+    };
+    assert_eq!(crate::cors::root_origin(&cfg), "https://warren.example");
+    let allowed = crate::cors::allowed_origins(&cfg, ID, 8080);
+    assert_eq!(
+        allowed,
+        vec![
+            "https://warren.example".to_string(),
+            format!("https://{ID}.warren.example"),
+            format!("https://{ID}-8080.warren.example"),
+        ]
+    );
+    assert_eq!(crate::cors::allowed_origins(&cfg, ID, 0).len(), 2);
+}
+
+#[test]
+fn exec_paths_are_recognised() {
+    use crate::dispatch::is_exec_path;
+    assert!(is_exec_path("/v1/instances/ab12cd34ef/exec"));
+    assert!(is_exec_path("/v1/instances/ab12cd34ef/exec/"));
+    assert!(!is_exec_path("/v1/instances/ab12cd34ef/logs"));
+    assert!(!is_exec_path("/v1/instances//exec"));
+    assert!(!is_exec_path("/v1/instances/ab12cd34ef/exec/more"));
+    assert!(!is_exec_path("/v1/exec"));
+}
+
+#[tokio::test]
+async fn api_requests_have_a_deadline_except_exec() {
+    let h = harness_with(EdgeOptions {
+        api_timeout: Duration::from_millis(100),
+        ..EdgeOptions::default()
+    })
+    .await;
+    let resp = h
+        .send(
+            h.get("api.warren.localhost:7337", "/v1/slow")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    let body = json_body(resp).await;
+    assert_eq!(body["error"]["code"], "timeout");
+
+    // The same deadline applies under <base>/v1.
+    let resp = h
+        .send(
+            h.get("warren.localhost:7337", "/v1/slow")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+
+    // exec runs to its own timeout.
+    let resp = h
+        .send(
+            h.get("api.warren.localhost:7337", "/v1/instances/ab12cd34ef/exec")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(text_body(resp).await, "late");
+
+    // Proxied instance requests are not subject to it either.
+    let req = h
+        .get(&h.host(), "/slow")
+        .header("x-warren-key", KEY)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(h.send(req).await.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn in_flight_requests_are_capped() {
+    let h = harness_with(EdgeOptions {
+        max_in_flight: 2,
+        ..EdgeOptions::default()
+    })
+    .await;
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let router = h.router.clone();
+        tasks.spawn(async move {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("/v1/count")
+                .header(HOST, "api.warren.localhost:7337")
+                .body(Body::empty())
+                .unwrap();
+            router.oneshot(req).await.unwrap().status()
+        });
+    }
+    while let Some(status) = tasks.join_next().await {
+        assert_eq!(status.unwrap(), StatusCode::OK);
+    }
+    let max = h.api_max_in_flight.load(Ordering::SeqCst);
+    assert!((1..=2).contains(&max), "saw {max} in flight");
 }
 
 // ------------------------------------------------------- live connections

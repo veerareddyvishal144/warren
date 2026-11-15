@@ -625,3 +625,7 @@ pub const INSTANCE_ID_LENGTH: usize = 10;
 pub const MAX_ENV_ENTRIES: usize = 64;
 pub const MAX_ENV_VALUE_BYTES: usize = 4096;
 pub const MAX_METADATA_ENTRIES: usize = 32;
+/// Backups kept per instance; the oldest is deleted when a new one exceeds it.
+pub const MAX_BACKUPS_PER_INSTANCE: usize = 20;
+/// Total backup bytes a workspace may hold.
+pub const MAX_BACKUP_BYTES_PER_WORKSPACE: u64 = 20 << 30;

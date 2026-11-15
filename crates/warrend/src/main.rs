@@ -38,6 +38,14 @@ struct Args {
     /// Development mode: dev top-ups, 5 s minimum idle timeout, host.docker.internal.
     #[arg(long, env = "WARREN_DEV", default_value_t = false)]
     dev: bool,
+    /// Whether `POST /v1/signup` is open; when off it answers 404 and workspaces
+    /// are created some other way.
+    #[arg(long, env = "WARREN_SIGNUP_ENABLED", default_value_t = true, action = clap::ArgAction::Set)]
+    signup_enabled: bool,
+    /// Let instances reach private networks (RFC 1918, link-local, the host);
+    /// off for a hosted service.
+    #[arg(long, env = "WARREN_ALLOW_PRIVATE_EGRESS", default_value_t = false)]
+    allow_private_egress: bool,
     /// Free credit granted to each new workspace, in micros.
     #[arg(long, env = "WARREN_FREE_CREDIT_MICROS", default_value_t = 5 * MICROS_PER_DOLLAR)]
     free_credit_micros: Money,
@@ -85,6 +93,8 @@ impl Args {
             runtime: self.runtime,
             region: self.region,
             dev_mode: dev,
+            signup_enabled: self.signup_enabled,
+            allow_private_egress: self.allow_private_egress,
             free_credit_micros: self.free_credit_micros,
             min_idle_timeout_sec: self.min_idle_seconds.unwrap_or(if dev {
                 5

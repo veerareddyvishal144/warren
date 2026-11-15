@@ -49,7 +49,7 @@ Worked example, 2/4/4: `2 x 0.80 + 4 x 0.70 + 4 x 0.09 = 1.60 + 2.80 + 0.36 = $4
 | `sleeping`, `stopped`, `waking` | the disk rate only |
 | `failed`, `deleting`, `deleted` | nothing |
 
-The meter ticks every minute (`--meter-interval`, 60 s by default). For every instance it charges the whole minutes elapsed since the instance's `metered_through`, carries fractional micros forward so nothing is lost to rounding, and writes a ledger entry with `kind: compute` or `disk`, negative `micros` and the `minutes` charged. Deleting an instance settles its final minutes.
+The meter ticks every minute (`--meter-interval`, 60 s by default). For every instance it charges the whole minutes elapsed since the instance's `metered_through`, carries fractional micros forward so nothing is lost to rounding, and writes a ledger entry with `kind: compute` or `disk`, negative `micros` and the `minutes` charged. Deleting an instance ends billing; the partial minute since the last tick is not charged.
 
 An agent instance with `auto_sleep: true` that is awake two hours a day on the 2/4/4 shape costs about `60 h x $0.00652 + $0.36 = $0.75` a month. The $5 welcome credit covers about 31 days of a 2/4/4 instance running non-stop, or about 14 months of a sleeping one.
 

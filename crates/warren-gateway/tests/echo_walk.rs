@@ -14,6 +14,8 @@ use warren_gateway::{
 struct TestServer {
     base: String,
     home: PathBuf,
+    /// Sent as `x-warren-instance-token` by the request helpers when non-empty.
+    token: String,
     client: reqwest::Client,
 }
 
@@ -45,6 +47,7 @@ async fn start(driver: &str, token: &str) -> TestServer {
     TestServer {
         base: format!("http://{addr}"),
         home,
+        token: token.to_string(),
         client: reqwest::Client::new(),
     }
 }
@@ -53,22 +56,48 @@ impl TestServer {
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
     }
+    /// A request carrying the instance token (when the server has one), the
+    /// way the edge and the daemon send them.
+    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        let r = self.client.request(method, self.url(path));
+        if self.token.is_empty() {
+            r
+        } else {
+            r.header(HEADER_INSTANCE_TOKEN, &self.token)
+        }
+    }
+    fn get(&self, path: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::GET, path)
+    }
+    fn post(&self, path: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::POST, path)
+    }
+    fn put(&self, path: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::PUT, path)
+    }
+    fn patch(&self, path: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::PATCH, path)
+    }
+    fn delete(&self, path: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::DELETE, path)
+    }
     async fn get_json(&self, path: &str) -> (u16, Value) {
-        let r = self
-            .client
-            .get(self.url(path))
-            .send()
-            .await
-            .expect("request");
+        let r = self.get(path).send().await.expect("request");
         let status = r.status().as_u16();
         let v: Value = r.json().await.unwrap_or(Value::Null);
         (status, v)
     }
     async fn post_json(&self, path: &str, body: &Value) -> (u16, Value) {
+        let r = self.post(path).json(body).send().await.expect("request");
+        let status = r.status().as_u16();
+        let v: Value = r.json().await.unwrap_or(Value::Null);
+        (status, v)
+    }
+    /// A bare request without the token, as an unauthenticated caller sends it.
+    async fn anonymous(&self, method: reqwest::Method, path: &str) -> (u16, Value) {
         let r = self
             .client
-            .post(self.url(path))
-            .json(body)
+            .request(method, self.url(path))
             .send()
             .await
             .expect("request");
@@ -106,17 +135,23 @@ fn error_code(v: &Value) -> &str {
 async fn walk_the_agent_api_with_the_echo_driver() {
     let s = start("echo", "secret-token").await;
 
-    // Health and version.
-    let (status, health) = s.get_json("/v1/health").await;
+    // Health and version answer without the token.
+    let (status, health) = s.anonymous(reqwest::Method::GET, "/v1/health").await;
     assert_eq!(status, 200);
     assert_eq!(health["healthy"], true);
     assert_eq!(health["agent_ready"], true);
     assert_eq!(health["driver"], "echo");
     assert!(!health["version"].as_str().unwrap().is_empty());
-    let (status, version) = s.get_json("/v1/version").await;
+    assert_eq!(
+        health["home_owner"]["uid"],
+        warren_gateway::exec::effective_uid()
+    );
+    assert!(!health["home_owner"]["name"].as_str().unwrap().is_empty());
+    let (status, version) = s.anonymous(reqwest::Method::GET, "/v1/version").await;
     assert_eq!(status, 200);
     assert_eq!(version["version"], health["version"]);
-    let (_, models) = s.get_json("/v1/models").await;
+    let (status, models) = s.get_json("/v1/models").await;
+    assert_eq!(status, 200);
     assert_eq!(models["data"][0]["id"], "default");
 
     // Non-streaming response.
@@ -135,8 +170,7 @@ async fn walk_the_agent_api_with_the_echo_driver() {
 
     // Streaming response in the same session.
     let resp = s
-        .client
-        .post(s.url("/v1/responses"))
+        .post("/v1/responses")
         .json(&json!({ "input": "again", "session_id": session_id, "stream": true }))
         .send()
         .await
@@ -172,8 +206,7 @@ async fn walk_the_agent_api_with_the_echo_driver() {
     assert_eq!(got["status"], "completed");
     assert_eq!(got["output_text"], "echo: again");
     let replay = s
-        .client
-        .get(s.url(&format!("/v1/responses/{first_id}/stream")))
+        .get(&format!("/v1/responses/{first_id}/stream"))
         .send()
         .await
         .unwrap();
@@ -206,8 +239,7 @@ async fn walk_the_agent_api_with_the_echo_driver() {
     assert_eq!(messages[1]["content"], "echo: hello");
     assert!(messages[0]["at"].as_i64().unwrap() > 0);
     let r = s
-        .client
-        .patch(s.url(&format!("/v1/sessions/{session_id}")))
+        .patch(&format!("/v1/sessions/{session_id}"))
         .json(&json!({ "name": "renamed" }))
         .send()
         .await
@@ -215,8 +247,7 @@ async fn walk_the_agent_api_with_the_echo_driver() {
     assert_eq!(r.status().as_u16(), 200);
     assert_eq!(r.json::<Value>().await.unwrap()["name"], "renamed");
     let r = s
-        .client
-        .patch(s.url(&format!("/v1/sessions/{session_id}")))
+        .patch(&format!("/v1/sessions/{session_id}"))
         .json(&json!({ "nom": "x" }))
         .send()
         .await
@@ -234,8 +265,7 @@ async fn walk_the_agent_api_with_the_echo_driver() {
     assert_eq!(list["data"][0]["id"], r2["session_id"]);
     assert_eq!(list["data"][1]["id"], session_id);
     let r = s
-        .client
-        .delete(s.url(&format!("/v1/sessions/{session_id}")))
+        .delete(&format!("/v1/sessions/{session_id}"))
         .send()
         .await
         .unwrap();
@@ -244,8 +274,7 @@ async fn walk_the_agent_api_with_the_echo_driver() {
     let (status, _) = s.get_json(&format!("/v1/sessions/{session_id}")).await;
     assert_eq!(status, 404);
     let r = s
-        .client
-        .delete(s.url(&format!("/v1/sessions/{session_id}")))
+        .delete(&format!("/v1/sessions/{session_id}"))
         .send()
         .await
         .unwrap();
@@ -253,8 +282,7 @@ async fn walk_the_agent_api_with_the_echo_driver() {
 
     // Files: put, get, list, move, download, delete.
     let r = s
-        .client
-        .put(s.url("/v1/files/content?path=dir/a.txt"))
+        .put("/v1/files/content?path=dir/a.txt")
         .body("hello")
         .send()
         .await
@@ -264,8 +292,7 @@ async fn walk_the_agent_api_with_the_echo_driver() {
     assert_eq!(put["path"], "dir/a.txt");
     assert_eq!(put["size"], 5);
     let r = s
-        .client
-        .get(s.url("/v1/files/content?path=dir/a.txt"))
+        .get("/v1/files/content?path=dir/a.txt")
         .send()
         .await
         .unwrap();
@@ -303,18 +330,12 @@ async fn walk_the_agent_api_with_the_echo_driver() {
     assert_eq!(moved["moved"], true);
     assert_eq!(moved["to"], "dir/sub/b.txt");
     let r = s
-        .client
-        .get(s.url("/v1/files/content?path=dir/sub/b.txt"))
+        .get("/v1/files/content?path=dir/sub/b.txt")
         .send()
         .await
         .unwrap();
     assert_eq!(r.text().await.unwrap(), "hello");
-    let r = s
-        .client
-        .get(s.url("/v1/files/download?path=dir"))
-        .send()
-        .await
-        .unwrap();
+    let r = s.get("/v1/files/download?path=dir").send().await.unwrap();
     assert_eq!(r.status().as_u16(), 200);
     assert_eq!(r.headers()["content-type"], "application/gzip");
     assert!(
@@ -331,12 +352,7 @@ async fn walk_the_agent_api_with_the_echo_driver() {
         .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
         .collect();
     assert!(names.contains(&"dir/sub/b.txt".to_string()), "{names:?}");
-    let r = s
-        .client
-        .delete(s.url("/v1/files?path=dir"))
-        .send()
-        .await
-        .unwrap();
+    let r = s.delete("/v1/files?path=dir").send().await.unwrap();
     assert_eq!(r.status().as_u16(), 200);
     assert_eq!(r.json::<Value>().await.unwrap()["deleted"], true);
     let (status, _) = s.get_json("/v1/files?path=dir").await;
@@ -352,11 +368,10 @@ async fn walk_the_agent_api_with_the_echo_driver() {
         "a/../../x",
     ] {
         let r = s
-            .client
-            .get(s.url(&format!(
+            .get(&format!(
                 "/v1/files/content?path={}",
                 urlencoding::encode(path)
-            )))
+            ))
             .send()
             .await
             .unwrap();
@@ -364,8 +379,7 @@ async fn walk_the_agent_api_with_the_echo_driver() {
         assert_eq!(error_code(&r.json::<Value>().await.unwrap()), "forbidden");
     }
     let r = s
-        .client
-        .put(s.url("/v1/files/content?path=../escape.txt"))
+        .put("/v1/files/content?path=../escape.txt")
         .body("x")
         .send()
         .await
@@ -374,30 +388,27 @@ async fn walk_the_agent_api_with_the_echo_driver() {
     assert!(!s.home.parent().unwrap().join("escape.txt").exists());
     let (status, _) = s.get_json("/v1/files?path=/etc").await;
     assert_eq!(status, 403);
-    let r = s
-        .client
-        .delete(s.url("/v1/files?path=.."))
-        .send()
-        .await
-        .unwrap();
+    let r = s.delete("/v1/files?path=..").send().await.unwrap();
     assert_eq!(r.status().as_u16(), 403);
     let (status, _) = s
         .post_json("/v1/files/move", &json!({ "from": ".", "to": "x" }))
         .await;
     assert_eq!(status, 403);
-    let r = s
-        .client
-        .get(s.url("/v1/files/content"))
-        .send()
-        .await
-        .unwrap();
+    let r = s.get("/v1/files/content").send().await.unwrap();
     assert_eq!(r.status().as_u16(), 400);
 
-    // Exec requires the instance token.
+    // Exec requires the instance token: missing or wrong -> 401 invalid_api_key.
     let body = json!({ "command": "echo out; echo err 1>&2; exit 3" });
-    let (status, e) = s.post_json("/v1/exec", &body).await;
-    assert_eq!(status, 403);
-    assert_eq!(error_code(&e), "forbidden");
+    let (status, e) = s.anonymous(reqwest::Method::POST, "/v1/exec").await;
+    assert_eq!(status, 401);
+    assert_eq!(error_code(&e), "invalid_api_key");
+    assert!(
+        e["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(HEADER_INSTANCE_TOKEN),
+        "{e}"
+    );
     let r = s
         .client
         .post(s.url("/v1/exec"))
@@ -406,15 +417,12 @@ async fn walk_the_agent_api_with_the_echo_driver() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status().as_u16(), 403);
-    let r = s
-        .client
-        .post(s.url("/v1/exec"))
-        .header(HEADER_INSTANCE_TOKEN, "secret-token")
-        .json(&body)
-        .send()
-        .await
-        .unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    assert_eq!(
+        error_code(&r.json::<Value>().await.unwrap()),
+        "invalid_api_key"
+    );
+    let r = s.post("/v1/exec").json(&body).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 200);
     let result: Value = r.json().await.unwrap();
     assert_eq!(result["exit_code"], 3);
@@ -422,18 +430,14 @@ async fn walk_the_agent_api_with_the_echo_driver() {
     assert_eq!(result["stderr"], "err\n");
     assert!(result["duration_ms"].as_i64().unwrap() >= 0);
     let r = s
-        .client
-        .post(s.url("/v1/exec"))
-        .header(HEADER_INSTANCE_TOKEN, "secret-token")
+        .post("/v1/exec")
         .json(&json!({ "command": "pwd", "bogus": 1 }))
         .send()
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 400);
     let r = s
-        .client
-        .post(s.url("/v1/exec"))
-        .header(HEADER_INSTANCE_TOKEN, "secret-token")
+        .post("/v1/exec")
         .json(&json!({ "command": "pwd" }))
         .send()
         .await
@@ -445,15 +449,10 @@ async fn walk_the_agent_api_with_the_echo_driver() {
     );
 
     // Shutdown is token-protected and unavailable outside init mode.
-    let (status, _) = s.post_json("/v1/shutdown", &json!({})).await;
-    assert_eq!(status, 403);
-    let r = s
-        .client
-        .post(s.url("/v1/shutdown"))
-        .header(HEADER_INSTANCE_TOKEN, "secret-token")
-        .send()
-        .await
-        .unwrap();
+    let (status, e) = s.anonymous(reqwest::Method::POST, "/v1/shutdown").await;
+    assert_eq!(status, 401);
+    assert_eq!(error_code(&e), "invalid_api_key");
+    let r = s.post("/v1/shutdown").send().await.unwrap();
     assert_eq!(r.status().as_u16(), 400);
     assert_eq!(
         error_code(&r.json::<Value>().await.unwrap()),
@@ -471,8 +470,7 @@ async fn walk_the_agent_api_with_the_echo_driver() {
         .await;
     assert_eq!(status, 400);
     let r = s
-        .client
-        .post(s.url("/v1/responses"))
+        .post("/v1/responses")
         .body("not json")
         .send()
         .await
@@ -485,8 +483,7 @@ async fn walk_the_agent_api_with_the_echo_driver() {
     // Cancel a long-running turn while following its stream.
     let started = std::time::Instant::now();
     let resp = s
-        .client
-        .post(s.url("/v1/responses"))
+        .post("/v1/responses")
         .json(&json!({ "input": "!sleep 30", "stream": true }))
         .send()
         .await
@@ -548,6 +545,13 @@ async fn non_agent_template_serves_files_exec_and_health_only() {
     assert_eq!(health["healthy"], true);
     assert_eq!(health["agent_ready"], false);
     assert_eq!(health["driver"], "none");
+    assert_eq!(
+        health["home_owner"]["uid"],
+        warren_gateway::exec::effective_uid()
+    );
+    // Without a configured token every route is open (local runs).
+    let (status, _) = s.anonymous(reqwest::Method::GET, "/v1/files").await;
+    assert_eq!(status, 200);
 
     let (status, e) = s
         .post_json("/v1/responses", &json!({ "input": "hello" }))
@@ -559,19 +563,13 @@ async fn non_agent_template_serves_files_exec_and_health_only() {
     assert_eq!(sessions["data"].as_array().unwrap().len(), 0);
 
     let r = s
-        .client
-        .put(s.url("/v1/files/content?path=f.txt"))
+        .put("/v1/files/content?path=f.txt")
         .body("data")
         .send()
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 200);
-    let r = s
-        .client
-        .get(s.url("/v1/files/content?path=f.txt"))
-        .send()
-        .await
-        .unwrap();
+    let r = s.get("/v1/files/content?path=f.txt").send().await.unwrap();
     assert_eq!(r.text().await.unwrap(), "data");
 
     // Without a configured token, exec needs no header.
@@ -581,4 +579,100 @@ async fn non_agent_template_serves_files_exec_and_health_only() {
     assert_eq!(status, 200);
     assert_eq!(result["stdout"], "ok\n");
     assert_eq!(result["exit_code"], 0);
+}
+
+#[tokio::test]
+async fn token_guards_every_route_except_health_and_version() {
+    use reqwest::Method;
+    let s = start("echo", "guard-token").await;
+
+    // The two open routes, exactly spelled.
+    for path in ["/v1/health", "/v1/version"] {
+        let (status, _) = s.anonymous(Method::GET, path).await;
+        assert_eq!(status, 200, "{path}");
+    }
+
+    // Everything else answers 401 invalid_api_key without the token: the
+    // Agent API, files, exec, shutdown, the root document, unknown routes and
+    // alternative spellings of open and protected paths.
+    let protected: &[(Method, &str)] = &[
+        (Method::GET, "/"),
+        (Method::POST, "/v1/responses"),
+        (
+            Method::GET,
+            "/v1/responses/00000000000000000000000000000000",
+        ),
+        (
+            Method::GET,
+            "/v1/responses/00000000000000000000000000000000/stream",
+        ),
+        (
+            Method::POST,
+            "/v1/responses/00000000000000000000000000000000/cancel",
+        ),
+        (Method::GET, "/v1/sessions"),
+        (Method::GET, "/v1/sessions/x"),
+        (Method::PATCH, "/v1/sessions/x"),
+        (Method::DELETE, "/v1/sessions/x"),
+        (Method::GET, "/v1/models"),
+        (Method::GET, "/v1/files"),
+        (Method::GET, "/v1/files?path=."),
+        (Method::DELETE, "/v1/files?path=x"),
+        (Method::GET, "/v1/files/content?path=x"),
+        (Method::PUT, "/v1/files/content?path=x"),
+        (Method::POST, "/v1/files/move"),
+        (Method::GET, "/v1/files/download?path=."),
+        (Method::POST, "/v1/exec"),
+        (Method::POST, "/v1/shutdown"),
+        (Method::GET, "/v1/nope"),
+        (Method::POST, "/v1/health"),
+        (Method::GET, "/v1/health/"),
+        (Method::GET, "//v1/files"),
+        (Method::GET, "/v1/./files"),
+        (Method::GET, "/v1/health/../files"),
+        (Method::GET, "//v1/health"),
+        (Method::GET, "/v1//health"),
+        (Method::GET, "/V1/files"),
+    ];
+    for (method, path) in protected {
+        let (status, e) = s.anonymous(method.clone(), path).await;
+        assert_eq!(status, 401, "{method} {path}: {e}");
+        assert_eq!(error_code(&e), "invalid_api_key", "{method} {path}");
+        assert!(
+            e["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(HEADER_INSTANCE_TOKEN),
+            "{method} {path}: {e}"
+        );
+    }
+    // A wrong token is as good as none, whatever its length.
+    for wrong in ["", "guard-toke", "guard-tokens", "GUARD-TOKEN", "x"] {
+        let r = s
+            .client
+            .get(s.url("/v1/files"))
+            .header(HEADER_INSTANCE_TOKEN, wrong)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401, "{wrong:?}");
+    }
+
+    // With the token the same routes work.
+    let (status, listing) = s.get_json("/v1/files").await;
+    assert_eq!(status, 200, "{listing}");
+    assert_eq!(listing["path"], ".");
+    let (status, _) = s.get_json("/v1/sessions").await;
+    assert_eq!(status, 200);
+    let (status, root) = s.get_json("/").await;
+    assert_eq!(status, 200);
+    assert_eq!(root["name"], "warren-gateway");
+    let (status, e) = s.get_json("/v1/nope").await;
+    assert_eq!(status, 404);
+    assert_eq!(error_code(&e), "not_found");
+    let (status, r) = s
+        .post_json("/v1/responses", &json!({ "input": "hi" }))
+        .await;
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["output_text"], "echo: hi");
 }

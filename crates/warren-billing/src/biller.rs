@@ -185,10 +185,15 @@ impl Biller {
         Ok(())
     }
 
-    /// Charge one instance for the whole minutes since its meter position and
-    /// move the meter. The ledger is written first; if the meter cannot then be
-    /// saved, the charge is reversed with an `Adjustment` so the retry on the
-    /// next tick does not double-charge.
+    /// Charge one instance for the whole minutes since the meter position the
+    /// listing saw and move the meter. The meter is written first, as a
+    /// compare-and-swap on that position: when the lifecycle moved it since the
+    /// listing (start and wake reset it) this tick skips the instance instead of
+    /// rewinding the meter or charging the same minutes twice, and the next tick
+    /// meters from the new position. The ledger entry follows the meter write, so
+    /// a charge is never written for minutes the meter did not consume; if the
+    /// ledger write fails the meter is moved back so the retry charges the span
+    /// exactly once.
     async fn meter_instance(&self, inst: &Instance, now: i64) -> Result<()> {
         let Some(from) = meter::metered_from(inst) else {
             return Ok(());
@@ -200,89 +205,106 @@ impl Biller {
             return Ok(());
         };
 
-        if step.charge_micros > 0 {
-            let mut entry = LedgerEntry {
-                id: String::new(),
-                workspace_id: inst.workspace_id.clone(),
-                instance_id: inst.id.clone(),
-                kind,
-                micros: -step.charge_micros,
-                minutes: step.minutes as f64,
-                at: now,
-                note: String::new(),
-            };
-            self.store.apply_ledger(&mut entry).await?;
+        let moved = match self
+            .store
+            .set_meter(
+                &inst.id,
+                step.metered_through,
+                step.carry_micros,
+                Some(inst.metered_through),
+            )
+            .await
+        {
+            Ok(moved) => moved,
+            Err(e) if e.is_not_found() => {
+                debug!(instance = %inst.id, "instance disappeared while metering; nothing charged");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        if !moved {
             debug!(
                 instance = %inst.id,
                 workspace = %inst.workspace_id,
-                kind = kind.as_str(),
-                status = %inst.status,
-                minutes = step.minutes,
-                micros = step.charge_micros,
-                carry = step.carry_micros,
-                "metered"
+                listed_through = inst.metered_through,
+                "meter moved by the lifecycle since the listing; skipping this tick"
             );
+            return Ok(());
         }
-
-        // Re-read before saving so a status change the lifecycle made since the
-        // listing is not overwritten with the stale copy.
-        let mut fresh = match self.store.get_instance(&inst.id).await {
-            Ok(i) => i,
-            Err(e) if e.is_not_found() => {
-                debug!(instance = %inst.id, "instance disappeared while metering; its final minutes stand");
-                return Ok(());
-            }
-            Err(e) => {
-                self.reverse_charge(inst, &step, kind, now, &e).await;
-                return Err(e);
-            }
-        };
-        fresh.metered_through = step.metered_through;
-        fresh.meter_carry_micros = step.carry_micros;
-        if let Err(e) = self.store.update_instance(&fresh).await {
-            self.reverse_charge(inst, &step, kind, now, &e).await;
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    /// Best-effort compensation when the meter position could not be saved
-    /// after a charge was written.
-    async fn reverse_charge(
-        &self,
-        inst: &Instance,
-        step: &MeterStep,
-        kind: LedgerKind,
-        now: i64,
-        cause: &Error,
-    ) {
         if step.charge_micros <= 0 {
-            return;
+            return Ok(());
         }
+
         let mut entry = LedgerEntry {
             id: String::new(),
             workspace_id: inst.workspace_id.clone(),
             instance_id: inst.id.clone(),
-            kind: LedgerKind::Adjustment,
-            micros: step.charge_micros,
-            minutes: 0.0,
+            kind,
+            micros: -step.charge_micros,
+            minutes: step.minutes as f64,
             at: now,
-            note: format!(
-                "metering rollback of {} {} micros: {cause}",
-                step.charge_micros,
-                kind.as_str()
-            ),
+            note: String::new(),
         };
-        match self.store.apply_ledger(&mut entry).await {
-            Ok(()) => {
-                warn!(instance = %inst.id, micros = step.charge_micros, error = %cause, "meter not saved; charge reversed")
-            }
+        if let Err(e) = self.store.apply_ledger(&mut entry).await {
+            self.rewind_meter(inst, &step, kind, &e).await;
+            return Err(e);
+        }
+        debug!(
+            instance = %inst.id,
+            workspace = %inst.workspace_id,
+            kind = kind.as_str(),
+            status = %inst.status,
+            minutes = step.minutes,
+            micros = step.charge_micros,
+            carry = step.carry_micros,
+            "metered"
+        );
+        Ok(())
+    }
+
+    /// Best-effort compensation when the ledger entry could not be written after
+    /// the meter had moved: put the meter back where the listing saw it, again
+    /// as a compare-and-swap so a lifecycle write in between stands, and let the
+    /// next tick charge the whole span once. When that fails too the span stays
+    /// unbilled, which is logged; the wallet is never over-charged.
+    async fn rewind_meter(
+        &self,
+        inst: &Instance,
+        step: &MeterStep,
+        kind: LedgerKind,
+        cause: &Error,
+    ) {
+        match self
+            .store
+            .set_meter(
+                &inst.id,
+                inst.metered_through,
+                inst.meter_carry_micros,
+                Some(step.metered_through),
+            )
+            .await
+        {
+            Ok(true) => warn!(
+                instance = %inst.id,
+                kind = kind.as_str(),
+                micros = step.charge_micros,
+                error = %cause,
+                "charge not written; meter moved back for the next tick"
+            ),
+            Ok(false) => warn!(
+                instance = %inst.id,
+                kind = kind.as_str(),
+                micros = step.charge_micros,
+                error = %cause,
+                "charge not written and the lifecycle moved the meter meanwhile; the span stays unbilled"
+            ),
             Err(e) => error!(
                 instance = %inst.id,
+                kind = kind.as_str(),
                 micros = step.charge_micros,
                 error = %cause,
                 rollback_error = %e,
-                "meter not saved and charge could not be reversed; wallet may be over-charged"
+                "charge not written and the meter could not be moved back; the span stays unbilled"
             ),
         }
     }
@@ -352,6 +374,9 @@ impl BillerApi for Biller {
     }
 
     async fn assert_can_wake(&self, ws: &Workspace) -> Result<()> {
+        if ws.wallet_micros <= 0 {
+            return Err(Error::insufficient_balance(1, ws.wallet_micros));
+        }
         self.assert_awake_room(ws).await
     }
 

@@ -73,6 +73,34 @@ pub trait Store: Send + Sync {
     async fn count_awake_instances(&self, workspace_id: &str) -> Result<u32>;
     async fn count_instances_using_template(&self, workspace_id: &str, name: &str) -> Result<u32>;
 
+    /// Write the meter position of an instance (`metered_through`,
+    /// `meter_carry_micros`) without touching any other column. With
+    /// `expected_from` set, the write happens only when the stored
+    /// `metered_through` still equals it (compare-and-swap) and the result reports
+    /// whether it did. `update_instance` never writes these two columns, so the
+    /// biller and the lifecycle cannot overwrite each other's rows.
+    ///
+    /// The default implementation is a non-atomic read-modify-write for in-memory
+    /// fakes; real stores override it with a single conditional UPDATE.
+    async fn set_meter(
+        &self,
+        id: &str,
+        metered_through: i64,
+        carry_micros: f64,
+        expected_from: Option<i64>,
+    ) -> Result<bool> {
+        let mut inst = self.get_instance(id).await?;
+        if let Some(expected) = expected_from
+            && inst.metered_through != expected
+        {
+            return Ok(false);
+        }
+        inst.metered_through = metered_through;
+        inst.meter_carry_micros = carry_micros;
+        self.update_instance(&inst).await?;
+        Ok(true)
+    }
+
     /// Insert the entry and move the wallet by `entry.micros` in one transaction;
     /// for `Topup` also add to `top_up_total_micros`. Assigns `entry.id` when empty.
     async fn apply_ledger(&self, entry: &mut LedgerEntry) -> Result<()>;
@@ -116,6 +144,12 @@ pub trait Runtime: Send + Sync {
     async fn exec(&self, inst: &Instance, req: &ExecRequest) -> Result<ExecResult>;
     async fn logs(&self, inst: &Instance, opts: LogsOptions) -> Result<String>;
     async fn stats(&self, inst: &Instance) -> Result<Stats>;
+    /// Whether the runtime object exists and is running right now. `Ok(false)`
+    /// when it exited or does not exist; `Err` means the answer is unknown
+    /// (daemon unreachable) and callers must not change instance state on it.
+    async fn is_running(&self, inst: &Instance) -> Result<bool> {
+        self.stats(inst).await.map(|_| true)
+    }
     /// Apply a new shape. Returns `errors::requires_restart()` when it cannot be
     /// done live; the caller stops, resizes again and starts.
     async fn resize(&self, inst: &mut Instance, shape: Shape) -> Result<()>;
@@ -255,6 +289,12 @@ pub trait Lifecycle: Send + Sync {
     fn record_activity(&self, id: &str);
     /// IP the edge proxies to for a running instance.
     async fn endpoint(&self, id: &str) -> Result<String>;
+    /// IP and per-instance gateway token for a running instance, so the edge and
+    /// the cron scheduler can authenticate to the gateway. The default returns an
+    /// empty token for fakes; the real lifecycle returns `Instance::instance_token`.
+    async fn gateway_credentials(&self, id: &str) -> Result<(String, String)> {
+        Ok((self.endpoint(id).await?, String::new()))
+    }
 }
 
 /// Lets the biller stop an instance whose wallet is exhausted without depending

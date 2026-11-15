@@ -92,11 +92,7 @@ pub fn is_hidden_var(key: &str) -> bool {
 pub fn child_command(spec: &WrapSpec) -> Command {
     let mut cmd = Command::new(&spec.argv[0]);
     cmd.args(&spec.argv[1..]);
-    for (key, _) in std::env::vars_os() {
-        if key.to_str().is_some_and(is_hidden_var) {
-            cmd.env_remove(key);
-        }
-    }
+    crate::exec::hide_platform_env(&mut cmd);
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd);
     }

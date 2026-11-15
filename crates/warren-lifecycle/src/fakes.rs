@@ -59,6 +59,8 @@ pub struct FakeStore {
     state: Mutex<State>,
     /// Number of `update_instance` calls.
     pub updates: AtomicUsize,
+    /// Number of `set_meter` calls.
+    pub meter_sets: AtomicUsize,
     /// Make `update_instance` fail.
     pub fail_update: AtomicBool,
 }
@@ -289,11 +291,37 @@ impl Store for FakeStore {
         }
         self.updates.fetch_add(1, Ordering::SeqCst);
         let mut st = self.state.lock();
-        if !st.instances.contains_key(&inst.id) {
+        let Some(current) = st.instances.get(&inst.id) else {
             return Err(Error::not_found("instance"));
-        }
-        st.instances.insert(inst.id.clone(), inst.clone());
+        };
+        // Like the real store, the meter columns belong to `set_meter`.
+        let mut row = inst.clone();
+        row.metered_through = current.metered_through;
+        row.meter_carry_micros = current.meter_carry_micros;
+        st.instances.insert(inst.id.clone(), row);
         Ok(())
+    }
+    async fn set_meter(
+        &self,
+        id: &str,
+        metered_through: i64,
+        carry_micros: f64,
+        expected_from: Option<i64>,
+    ) -> Result<bool> {
+        self.meter_sets.fetch_add(1, Ordering::SeqCst);
+        let mut st = self.state.lock();
+        let row = st
+            .instances
+            .get_mut(id)
+            .ok_or_else(|| Error::not_found("instance"))?;
+        if let Some(expected) = expected_from
+            && row.metered_through != expected
+        {
+            return Ok(false);
+        }
+        row.metered_through = metered_through;
+        row.meter_carry_micros = carry_micros;
+        Ok(true)
     }
     async fn delete_instance(&self, id: &str) -> Result<()> {
         self.state
@@ -462,6 +490,10 @@ pub struct FakeRuntime {
     pub resize_calls: AtomicUsize,
     /// Delay inside `start`, in milliseconds.
     pub start_delay_ms: AtomicU64,
+    /// Delay inside `stop`, in milliseconds.
+    pub stop_delay_ms: AtomicU64,
+    /// `is_running` answers `Err` (the daemon cannot be reached).
+    pub liveness_unknown: AtomicBool,
     pub disk_usage: AtomicI64,
     pub starts: AtomicUsize,
     pub recreates: AtomicUsize,
@@ -541,9 +573,20 @@ impl Runtime for FakeRuntime {
     }
     async fn stop(&self, inst: &Instance, _grace: Duration) -> Result<()> {
         self.record("stop", &inst.id);
+        let delay = self.stop_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         Self::failing(&self.fail_stop, "stop")?;
         self.set_running(&inst.id, false);
         Ok(())
+    }
+    async fn is_running(&self, inst: &Instance) -> Result<bool> {
+        self.record("is_running", &inst.id);
+        if self.liveness_unknown.load(Ordering::SeqCst) {
+            return Err(Error::internal("daemon unreachable"));
+        }
+        Ok(FakeRuntime::is_running(self, &inst.id))
     }
     async fn destroy(&self, inst: &Instance, remove_storage: bool) -> Result<()> {
         self.record(
@@ -631,13 +674,39 @@ impl Runtime for FakeRuntime {
 pub struct FakeBiller {
     pub refuse_create: AtomicBool,
     pub refuse_wake: AtomicBool,
+    /// `assert_can_wake` refuses with `insufficient_balance` (the wallet check).
+    pub refuse_wake_balance: AtomicBool,
     pub create_checks: Mutex<Vec<(Shape, InstanceType)>>,
     pub wake_checks: AtomicUsize,
+    /// Admit at most this many awake instances (counted through the store
+    /// passed to `with_store`), like the real ladder; `0` disables the count.
+    pub awake_cap: AtomicUsize,
+    store: Mutex<Option<Arc<FakeStore>>>,
+    /// Delay inside `assert_can_create`, in milliseconds, to widen races.
+    pub create_delay_ms: AtomicU64,
+    /// Delay inside `assert_can_wake`, in milliseconds, to widen races.
+    pub wake_delay_ms: AtomicU64,
 }
 
 impl FakeBiller {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+    /// Count awake instances in `store` and refuse beyond `cap`.
+    pub fn cap_awake(&self, store: Arc<FakeStore>, cap: usize) {
+        *self.store.lock() = Some(store);
+        self.awake_cap.store(cap, Ordering::SeqCst);
+    }
+    async fn check_ladder(&self, ws: &Workspace) -> Result<()> {
+        let cap = self.awake_cap.load(Ordering::SeqCst);
+        let store = self.store.lock().clone();
+        if let (Some(store), true) = (store, cap > 0) {
+            let awake = store.count_awake_instances(&ws.id).await?;
+            if awake as usize >= cap {
+                return Err(Error::instance_limit(cap as u32, awake));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -652,22 +721,30 @@ impl Biller for FakeBiller {
     fn monthly_disk_micros(&self, shape: Shape) -> Money {
         Rates::default().monthly_disk(shape)
     }
-    async fn assert_can_create(
-        &self,
-        _ws: &Workspace,
-        shape: Shape,
-        t: InstanceType,
-    ) -> Result<()> {
+    async fn assert_can_create(&self, ws: &Workspace, shape: Shape, t: InstanceType) -> Result<()> {
         self.create_checks.lock().push((shape, t));
         if self.refuse_create.load(Ordering::SeqCst) {
             return Err(Error::insufficient_balance(1_000_000, 0));
         }
+        self.check_ladder(ws).await?;
+        let delay = self.create_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         Ok(())
     }
-    async fn assert_can_wake(&self, _ws: &Workspace) -> Result<()> {
+    async fn assert_can_wake(&self, ws: &Workspace) -> Result<()> {
         self.wake_checks.fetch_add(1, Ordering::SeqCst);
         if self.refuse_wake.load(Ordering::SeqCst) {
             return Err(Error::instance_limit(3, 3));
+        }
+        if self.refuse_wake_balance.load(Ordering::SeqCst) {
+            return Err(Error::insufficient_balance(1_000_000, 0));
+        }
+        self.check_ladder(ws).await?;
+        let delay = self.wake_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
         }
         Ok(())
     }

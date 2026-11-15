@@ -313,3 +313,89 @@ async fn ledger_is_a_list_envelope_newest_first_with_limit() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+/// A signup request as seen from a peer address.
+fn signup_from(ip: &str) -> http::Request<axum::body::Body> {
+    use axum::extract::ConnectInfo;
+    let addr: std::net::SocketAddr = format!("{ip}:40000").parse().unwrap();
+    let mut req = http::Request::builder()
+        .method("POST")
+        .uri("/v1/signup")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    req.extensions_mut().insert(ConnectInfo(addr));
+    req
+}
+
+#[tokio::test]
+async fn signup_can_be_disabled() {
+    let h = Harness::with_config(Config {
+        signup_enabled: false,
+        ..test_config()
+    });
+    let (status, v) = h.call("POST", "/v1/signup", None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(code(&v), "not_found");
+    assert!(h.store.lock().workspaces.is_empty());
+}
+
+#[tokio::test]
+async fn signup_is_rate_limited_per_client_ip() {
+    let h = Harness::new();
+    for i in 0..10 {
+        let (status, _, v) = h.send(signup_from("203.0.113.7")).await;
+        assert_eq!(status, StatusCode::CREATED, "signup {i}: {v}");
+    }
+    let (status, _, v) = h.send(signup_from("203.0.113.7")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    assert_eq!(code(&v), "try_again");
+    assert!(message(&v).contains("10 per hour"), "{v}");
+
+    // Another address has its own budget; IPv4-mapped IPv6 is the same address.
+    let (status, _, _) = h.send(signup_from("203.0.113.8")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _, _) = h.send(signup_from("[::ffff:203.0.113.7]")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+    // The budget refills over the hour.
+    h.clock.advance(6 * 60);
+    let (status, _, _) = h.send(signup_from("203.0.113.7")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _, _) = h.send(signup_from("203.0.113.7")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+    // Loopback is not exempt outside dev mode.
+    for _ in 0..10 {
+        h.send(signup_from("127.0.0.1")).await;
+    }
+    let (status, _, _) = h.send(signup_from("127.0.0.1")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn signup_without_a_peer_shares_one_bucket_and_dev_loopback_is_exempt() {
+    let h = Harness::new();
+    for _ in 0..10 {
+        let (status, _) = h.call("POST", "/v1/signup", None, None).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    let (status, v) = h.call("POST", "/v1/signup", None, None).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{v}");
+
+    let h = Harness::with_config(Config {
+        dev_mode: true,
+        ..test_config()
+    });
+    for ip in ["127.0.0.1", "[::1]", "[::ffff:127.0.0.1]"] {
+        for i in 0..12 {
+            let (status, _, v) = h.send(signup_from(ip)).await;
+            assert_eq!(status, StatusCode::CREATED, "{ip} signup {i}: {v}");
+        }
+    }
+    // Dev mode exempts loopback only.
+    for _ in 0..10 {
+        h.send(signup_from("203.0.113.9")).await;
+    }
+    let (status, _, _) = h.send(signup_from("203.0.113.9")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}

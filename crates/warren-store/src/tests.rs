@@ -624,13 +624,22 @@ async fn instance_round_trip_with_internal_fields() {
     a2.env.insert("EXTRA".into(), "1".into());
     a2.ip.clear();
     a2.runtime_ref = "container-xyz".into();
-    a2.metered_through = 12_345;
-    a2.meter_carry_micros = 0.999_999;
     a2.disk_used_bytes = 1 << 40;
     a2.auto_sleep = false;
     a2.budget = Budget::default();
     store.update_instance(&a2).await.unwrap();
     assert_eq!(store.get_instance("aaaaaaaaaa").await.unwrap(), a2);
+
+    // The meter position belongs to the biller: a full-row write leaves it alone.
+    let mut stale = a2.clone();
+    stale.metered_through = 12_345;
+    stale.meter_carry_micros = 0.999_999;
+    store.update_instance(&stale).await.unwrap();
+    assert_eq!(
+        store.get_instance("aaaaaaaaaa").await.unwrap(),
+        a2,
+        "update_instance does not write metered_through or meter_carry_micros"
+    );
 
     let ghost = inst("gggggggggg", "ws_a", InstanceStatus::Running, 1);
     assert_eq!(
@@ -646,6 +655,83 @@ async fn instance_round_trip_with_internal_fields() {
     };
     store.create_instance(&bare).await.unwrap();
     assert_eq!(store.get_instance("dddddddddd").await.unwrap(), bare);
+}
+
+#[tokio::test]
+async fn set_meter_writes_only_the_meter_and_honours_the_cas() {
+    let (_dir, store) = open();
+    let a = inst("aaaaaaaaaa", "ws_a", InstanceStatus::Running, 100);
+    store.create_instance(&a).await.unwrap();
+    assert_eq!(a.metered_through, 107, "create_instance persists the meter");
+    assert_eq!(store.get_instance("aaaaaaaaaa").await.unwrap(), a);
+
+    // Unconditional write: only the two meter columns change.
+    assert!(
+        store
+            .set_meter("aaaaaaaaaa", 1_000, 0.25, None)
+            .await
+            .unwrap()
+    );
+    let mut expected = a.clone();
+    expected.metered_through = 1_000;
+    expected.meter_carry_micros = 0.25;
+    assert_eq!(store.get_instance("aaaaaaaaaa").await.unwrap(), expected);
+
+    // CAS miss: nothing changes and the miss is reported, not an error.
+    assert!(
+        !store
+            .set_meter("aaaaaaaaaa", 2_000, 0.5, Some(999))
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.get_instance("aaaaaaaaaa").await.unwrap(), expected);
+
+    // CAS hit, including a write that leaves the values as they are.
+    assert!(
+        store
+            .set_meter("aaaaaaaaaa", 2_000, 0.5, Some(1_000))
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .set_meter("aaaaaaaaaa", 2_000, 0.5, Some(2_000))
+            .await
+            .unwrap(),
+        "a no-op CAS hit still counts as a hit"
+    );
+    expected.metered_through = 2_000;
+    expected.meter_carry_micros = 0.5;
+    assert_eq!(store.get_instance("aaaaaaaaaa").await.unwrap(), expected);
+
+    // The lifecycle writing the whole row with a stale snapshot cannot rewind it.
+    let mut lifecycle_copy = a.clone();
+    lifecycle_copy.status = InstanceStatus::Stopping;
+    lifecycle_copy.ip = "10.9.9.9".into();
+    store.update_instance(&lifecycle_copy).await.unwrap();
+    let after = store.get_instance("aaaaaaaaaa").await.unwrap();
+    assert_eq!(after.status, InstanceStatus::Stopping);
+    assert_eq!(after.ip, "10.9.9.9");
+    assert_eq!(after.metered_through, 2_000);
+    assert_eq!(after.meter_carry_micros, 0.5);
+
+    // Unknown id: not_found whether or not a CAS value is given.
+    assert_eq!(
+        store
+            .set_meter("zzzzzzzzzz", 1, 0.0, None)
+            .await
+            .unwrap_err()
+            .code,
+        CODE_NOT_FOUND
+    );
+    assert_eq!(
+        store
+            .set_meter("zzzzzzzzzz", 1, 0.0, Some(1))
+            .await
+            .unwrap_err()
+            .code,
+        CODE_NOT_FOUND
+    );
 }
 
 #[tokio::test]

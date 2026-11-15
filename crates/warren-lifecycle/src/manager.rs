@@ -3,6 +3,7 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{
         Arc, Weak,
         atomic::{AtomicU64, Ordering},
@@ -33,6 +34,10 @@ pub struct Manager {
     pub(crate) deps: Deps,
     /// One async mutex per instance id; operations on one instance serialize.
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// One async mutex per workspace id, held from the biller's awake-limit
+    /// check through the insert or transition that consumes the slot, so
+    /// concurrent create/start/wake/fork requests cannot exceed the ladder.
+    ws_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Instance id -> last activity (unix seconds), flushed to the store periodically.
     activity: Mutex<HashMap<String, i64>>,
     /// How long `ensure_awake` waits for a transitional instance, in milliseconds.
@@ -59,6 +64,7 @@ impl Manager {
         Ok(Arc::new_cyclic(|me| Manager {
             deps: d,
             locks: Mutex::new(HashMap::new()),
+            ws_locks: Mutex::new(HashMap::new()),
             activity: Mutex::new(HashMap::new()),
             wake_deadline_ms: AtomicU64::new(crate::ops::WAKE_DEADLINE.as_millis() as u64),
             me: me.clone(),
@@ -108,6 +114,38 @@ impl Manager {
     /// Exclusive access to one instance if nobody holds it right now.
     pub(crate) fn try_lock(&self, id: &str) -> Option<OwnedMutexGuard<()>> {
         self.lock_handle(id).try_lock_owned().ok()
+    }
+
+    /// Serialize the awake-limit check and the slot-consuming write for one
+    /// workspace. Always taken after the instance lock (or before a brand-new
+    /// instance's lock, which nobody else can hold), so the two never cycle.
+    pub(crate) async fn ws_lock(&self, workspace_id: &str) -> OwnedMutexGuard<()> {
+        let handle = self
+            .ws_locks
+            .lock()
+            .entry(workspace_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        handle.lock_owned().await
+    }
+
+    /// Run `op` on a detached task that owns the instance lock, and wait for it.
+    /// When the caller is dropped (the client disconnected mid-request) the
+    /// task still runs to its end, so a transitional status written before a
+    /// runtime call is always followed by the matching final state. Waiting
+    /// for the lock stays cancellable because nothing has been written yet.
+    pub(crate) async fn detached<T, F, Fut>(&self, id: &str, op: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Manager>, OwnedMutexGuard<()>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+    {
+        let me = self.arc()?;
+        let guard = self.lock(id).await;
+        match tokio::spawn(op(me, guard)).await {
+            Ok(result) => result,
+            Err(e) => Err(Error::internal(format!("lifecycle task aborted: {e}"))),
+        }
     }
 
     pub(crate) fn forget(&self, id: &str) {
@@ -183,6 +221,12 @@ impl Manager {
     /// honest: entering a compute-billing state from a state that did not bill
     /// compute restarts the meter position, and the first `Running` stamps
     /// `meter_started_at`.
+    ///
+    /// The meter columns belong to the biller and `update_instance` does not
+    /// write them, so the restart goes through `Store::set_meter`, and it goes
+    /// first: a biller tick landing between the two writes then sees the old
+    /// (disk-only) status with a fresh position rather than the new compute
+    /// status with a stale one.
     pub(crate) async fn transition(
         &self,
         inst: &mut Instance,
@@ -193,6 +237,10 @@ impl Manager {
         let from = inst.status;
         if status.bills_compute() && !from.bills_compute() {
             inst.metered_through = now;
+            self.deps
+                .store
+                .set_meter(&inst.id, now, inst.meter_carry_micros, None)
+                .await?;
         }
         if status == InstanceStatus::Running && inst.meter_started_at == 0 {
             inst.meter_started_at = now;
@@ -210,6 +258,32 @@ impl Manager {
     /// already returning the original error.
     pub(crate) async fn fail(&self, inst: &mut Instance, err: &Error, what: &str) {
         let reason = describe(err);
+        tracing::error!(instance = %inst.id, op = what, error = %reason, "operation failed");
+        if let Err(e) = self.transition(inst, InstanceStatus::Failed, &reason).await {
+            tracing::error!(instance = %inst.id, error = %e, "could not record failure");
+        }
+    }
+
+    /// A stop or destroy failed. A `Failed` row bills nothing, so the runtime
+    /// object must not keep running behind it: force it down with
+    /// `destroy(remove_storage = false)` (the disk stays), then record both the
+    /// original error and the outcome of the forced destroy as the reason.
+    pub(crate) async fn fail_force(&self, inst: &mut Instance, err: &Error, what: &str) {
+        let outcome = match self.runtime_for(inst) {
+            Ok(rt) => match rt.destroy(inst, false).await {
+                Ok(()) => {
+                    inst.ip.clear();
+                    "runtime destroyed".to_string()
+                }
+                Err(e) if e.is_not_found() => {
+                    inst.ip.clear();
+                    "runtime already gone".to_string()
+                }
+                Err(e) => format!("forced destroy failed: {}", describe(&e)),
+            },
+            Err(e) => format!("no runtime to destroy: {}", describe(&e)),
+        };
+        let reason = format!("{}; {outcome}", describe(err));
         tracing::error!(instance = %inst.id, op = what, error = %reason, "operation failed");
         if let Err(e) = self.transition(inst, InstanceStatus::Failed, &reason).await {
             tracing::error!(instance = %inst.id, error = %e, "could not record failure");

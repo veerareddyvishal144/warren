@@ -5,7 +5,9 @@
 //! - `ready` pings the daemon, picks the OCI runtime (`runsc` when the daemon offers
 //!   it, else `runc`, as configured by `Config::runtime`) and makes sure the two
 //!   bridge networks exist: [`NETWORK_PUBLIC`] with egress and [`NETWORK_INTERNAL`]
-//!   (`internal: true`) for deny-all instances.
+//!   (`internal: true`) for deny-all instances. Both have inter-container
+//!   communication off, and as root `ready` installs the iptables egress rules
+//!   (metadata service, private ranges, the host); see the `netpolicy` module.
 //! - Every instance is one container named `warren-<id>`. Its persistent disk is the
 //!   host directory `<data_dir>/instances/<id>/home`, bind-mounted at the template's
 //!   `mount_path`. The container carries the labels `warren.instance` and
@@ -47,6 +49,7 @@ mod exec;
 mod helper;
 mod image;
 mod inject;
+mod netpolicy;
 mod observe;
 mod runtime;
 mod storage;
@@ -54,6 +57,7 @@ mod storage;
 #[cfg(test)]
 mod tests;
 
+pub use netpolicy::{LINK_LOCAL, OPT_ENABLE_ICC, PIDS_LIMIT, PRIVATE_RANGES};
 pub use runtime::DockerRuntime;
 
 /// Bridge network with egress, used for [`warren_core::NetworkMode::AllowAll`].

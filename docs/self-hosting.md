@@ -9,13 +9,13 @@ Size the machine for the instances you want awake at once: their vCPUs and RAM a
 ## 2. Docker
 
 ```bash
-sudo apt-get update && sudo apt-get install -y ca-certificates curl git build-essential pkg-config
+sudo apt-get update && sudo apt-get install -y ca-certificates curl git build-essential pkg-config musl-tools
 curl -fsSL https://get.docker.com | sudo sh
 sudo systemctl enable --now docker
 docker info >/dev/null && echo docker ok
 ```
 
-If the daemon will run as a non-root user, add that user to the `docker` group. Running the daemon as root is simpler and is required for the RFC1918 egress rules and for `vm` instances; the rest of this page assumes root.
+If the daemon will run as a non-root user, add that user to the `docker` group. Running the daemon as root is simpler and is required for two things: the egress firewall rules in section 8 (a non-root daemon logs a warning and installs none) and `vm` instances. The rest of this page assumes root.
 
 ## 3. gVisor
 
@@ -30,11 +30,14 @@ The script downloads the release tarball, verifies its SHA-512, installs `runsc`
 
 ```bash
 curl https://sh.rustup.rs -sSf | sh -s -- -y && source ~/.cargo/env
+rustup target add x86_64-unknown-linux-musl
 git clone https://github.com/veerareddyvishal144/warren.git && cd warren
-cargo build --release --locked -p warrend -p warren-cli -p warren-gateway
+cargo build --release --locked -p warrend -p warren-cli
+make gateway                                           # static musl warren-gateway for the images and for injection
 sudo install -m 0755 target/release/warrend /usr/local/bin/warrend
-sudo install -m 0755 target/release/cli /usr/local/bin/warren
-WARREN_IMAGE_TAG=prod scripts/build-images.sh          # warren/base:prod, warren/agent:prod, warren/opencode:prod
+sudo install -m 0755 target/release/warren /usr/local/bin/warren
+sudo install -m 0755 target/x86_64-unknown-linux-musl/release/warren-gateway /usr/local/bin/warren-gateway
+WARREN_IMAGE_TAG=prod WARREN_SKIP_GATEWAY_BUILD=1 scripts/build-images.sh   # warren/base:prod, warren/agent:prod, warren/opencode:prod
 ```
 
 Images live in the local Docker daemon; start `warrend` with the same `--image-tag`.
@@ -94,9 +97,12 @@ WARREN_LOG=info                         # tracing filter, e.g. info,warren_edge=
 | `WARREN_METER_INTERVAL` | `--meter-interval` | `60s` | |
 | `WARREN_IMAGE_TAG` | `--image-tag` | `dev` | Tag of the built-in images |
 | `WARREN_ENABLE_FIRECRACKER`, `WARREN_FIRECRACKER_BIN`, `WARREN_KERNEL_IMAGE` | `--firecracker`, `--firecracker-bin`, `--kernel` | off | [vm-instances.md](vm-instances.md) |
+| `WARREN_GATEWAY_BIN` | `--gateway-bin` | next to `warrend`, else `/usr/local/bin/warren-gateway` | Static gateway injected into registered images |
+| `WARREN_SIGNUP_ENABLED` | `--signup-enabled` | `true` | `false` makes `POST /v1/signup` answer 404 |
+| `WARREN_ALLOW_PRIVATE_EGRESS` | `--allow-private-egress` | `false` | Lets instances reach RFC 1918 ranges and the host; 169.254.0.0/16 stays blocked |
 | `WARREN_LOG` | `--log` | `info` | tracing `EnvFilter` syntax |
 
-Signup is open in this build (`POST /v1/signup` needs no auth and grants the free credit). On a public host either set `WARREN_FREE_CREDIT_MICROS=0`, or keep the API host reachable only from your own backend and create workspaces from there. There is no production top-up provider yet: the `dev` provider works only with `WARREN_DEV=true`, so a production wallet can only be funded by granting a larger free credit at signup.
+Signup is on by default (`POST /v1/signup` needs no auth and grants the free credit) and limited to 10 signups per client IP per hour. On a public host either turn it off with `--signup-enabled false` and create workspaces through your own flow, or set `WARREN_FREE_CREDIT_MICROS=0` so anonymous signups cost you nothing.
 
 ## 6. systemd
 
@@ -192,7 +198,11 @@ The instance `url` fields now read `https://<id>.warren.example.com`, the dashbo
 
 ## 8. Firewall
 
-Expose 443 (and 80 if you use HTTP-01 for the apex). Keep 7337 on loopback. Instances have no published ports: all traffic enters through the edge, and the instance networks are ordinary Docker bridges (`warren-net` with egress, `warren-internal` without). When the daemon runs as root it installs an nftables rule set blocking RFC1918 egress from instances at startup, so instances cannot reach other machines on your private network; check it with `nft list ruleset` after the first start, and add your own rules if you have more to protect.
+Expose 443 (and 80 if you use HTTP-01 for the apex). Keep 7337 on loopback. Instances have no published ports: all traffic enters through the edge.
+
+The daemon creates two Docker bridge networks, `warren-net` (with egress) and `warren-internal` (no route out), both with inter-container communication disabled, so instances cannot reach each other over the bridge; Firecracker taps get bridge port isolation. When it runs as root it also installs iptables rules at startup in the `DOCKER-USER` chain (and `FORWARD` rules for the Firecracker bridge) that drop traffic from instances to `169.254.0.0/16` (cloud metadata) always, and to the RFC 1918 ranges and the host's own addresses unless `--allow-private-egress` (`WARREN_ALLOW_PRIVATE_EGRESS=true`) is set. Check them after the first start with `sudo iptables -S DOCKER-USER`. When the daemon is not root it logs a warning and installs nothing; block the private ranges with your own host firewall in that case. Set `--allow-private-egress` only when instances must reach services on your private network (a database, an internal registry); it does not open the metadata range. There is no per-instance allowlist yet: an instance with `allow-all` can reach the whole internet (see [security.md](security.md)).
+
+**Upgrading from a build that created the networks without isolation**: Docker keeps the options of an existing network, so remove the old ones once. Stop the instances, run `docker network rm warren-net warren-internal`, and restart `warrend`; it recreates both networks and instances attach to them on their next start.
 
 ## 9. Backups of the data directory
 
@@ -218,10 +228,13 @@ Restore: stop the daemon, put the files back with the same paths and ownership, 
 
 ```bash
 cd warren && git pull
-cargo build --release --locked -p warrend -p warren-cli -p warren-gateway
+cargo build --release --locked -p warrend -p warren-cli
+make gateway
 sudo install -m 0755 target/release/warrend /usr/local/bin/warrend
+sudo install -m 0755 target/release/warren /usr/local/bin/warren
+sudo install -m 0755 target/x86_64-unknown-linux-musl/release/warren-gateway /usr/local/bin/warren-gateway
 sudo systemctl restart warrend                       # instances keep running; the reconciler re-adopts them
-WARREN_IMAGE_TAG=prod scripts/build-images.sh        # new gateway inside the images
+WARREN_IMAGE_TAG=prod WARREN_SKIP_GATEWAY_BUILD=1 scripts/build-images.sh   # new gateway inside the images
 ```
 
 Instances pick up a rebuilt image when they are recreated: `POST /v1/instances/{id}/update` (same template, latest revision) does it on demand, otherwise the next stop and start or sleep and wake does. Database migrations are embedded and run at startup; keep the pre-upgrade `.backup` until you are happy.

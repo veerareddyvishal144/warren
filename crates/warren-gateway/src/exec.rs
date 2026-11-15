@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::{Json, extract::State, http::HeaderMap};
+use axum::{Json, extract::State};
 use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
@@ -33,9 +33,10 @@ use warren_core::{
 };
 
 use crate::{
-    extract::{JsonBody, parse_json, require_instance_token},
+    extract::{JsonBody, parse_json},
     owner::HomeOwner,
     server::SharedState,
+    wrap::is_hidden_var,
 };
 
 /// Fields accepted in an `ExecRequest` body.
@@ -43,14 +44,12 @@ const EXEC_FIELDS: &[&str] = &["command", "user", "timeout_seconds", "workdir", 
 /// Longest exec a client may ask for (24 hours).
 const MAX_EXEC_TIMEOUT_SEC: u32 = 86_400;
 
-/// `POST /v1/exec`: run a shell command inside the instance. Requires the
-/// instance token when the gateway has one.
+/// `POST /v1/exec`: run a shell command inside the instance. The instance
+/// token is enforced by the router's middleware (see `server::require_token`).
 pub async fn exec_handler(
     State(state): State<SharedState>,
-    headers: HeaderMap,
     JsonBody(body): JsonBody,
 ) -> Result<Json<ExecResult>> {
-    require_instance_token(&headers, &state.config.instance_token)?;
     let req: ExecRequest = parse_json(&body, EXEC_FIELDS)?;
     let home = state.home.clone();
     Ok(Json(run_exec(&home, &state.owner, &req).await?))
@@ -231,6 +230,38 @@ fn spawn_error(e: std::io::Error) -> Error {
     }
 }
 
+// ----- environment -----
+
+/// Remove the platform variables (every `WARREN_*` except `WARREN_HOME`, see
+/// [`is_hidden_var`]) from the environment `cmd` will start with, so no
+/// process run on behalf of a user sees the instance token or the gateway's
+/// own settings. Applies to the gateway's current environment; variables the
+/// caller sets on `cmd` afterwards are kept.
+pub fn hide_platform_env(cmd: &mut Command) {
+    hide_platform_env_from(cmd, std::env::vars_os().map(|(k, _)| k));
+}
+
+/// Names of the hidden platform variables currently in the process
+/// environment (for tests and diagnostics).
+pub fn hidden_vars_now() -> Vec<String> {
+    std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .filter(|k| is_hidden_var(k))
+        .collect()
+}
+
+/// [`hide_platform_env`] for an explicit list of variable names.
+pub fn hide_platform_env_from<I>(cmd: &mut Command, keys: I)
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    for key in keys {
+        if key.to_str().is_some_and(is_hidden_var) {
+            cmd.env_remove(key);
+        }
+    }
+}
+
 // ----- user switching -----
 
 /// A user a child process is switched to.
@@ -297,9 +328,11 @@ fn shell_argv(script: &str) -> Vec<String> {
     vec!["/bin/sh".to_string(), "-lc".to_string(), script.to_string()]
 }
 
+/// `argv` as the gateway's own user, without the platform variables.
 fn plain(argv: Vec<String>) -> Command {
     let mut c = Command::new(&argv[0]);
     c.args(&argv[1..]);
+    hide_platform_env(&mut c);
     c
 }
 
@@ -309,6 +342,11 @@ fn plain(argv: Vec<String>) -> Command {
 /// reached. Without a passwd name, or without either helper, the child
 /// changes its ids itself; supplementary groups are then dropped instead of
 /// initialised from `/etc/group`.
+///
+/// Both helpers run with `-m`, which hands the user exactly the environment
+/// we give `runuser`/`su` itself, so the platform variables are removed from
+/// that environment and nothing reintroduces them on the other side of the
+/// switch.
 fn switched(id: &Identity, argv: Vec<String>) -> Command {
     let mut cmd = match (id.named, which("runuser"), which("su")) {
         (true, Some(runuser), _) => {
@@ -335,6 +373,7 @@ fn switched(id: &Identity, argv: Vec<String>) -> Command {
             c
         }
     };
+    hide_platform_env(&mut cmd);
     cmd.env("USER", &id.name).env("LOGNAME", &id.name);
     cmd
 }
@@ -662,6 +701,70 @@ mod tests {
         assert_ne!(effective_gid(), u32::MAX);
         if std::fs::metadata("/etc/passwd").is_ok() {
             assert_eq!(lookup_uid(0).unwrap().name, "root");
+        }
+    }
+
+    fn removed_envs(cmd: &Command) -> Vec<String> {
+        cmd.as_std()
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn platform_variables_are_hidden_from_user_processes() {
+        let mut cmd = Command::new("/bin/sh");
+        hide_platform_env_from(
+            &mut cmd,
+            [
+                "WARREN_INSTANCE_TOKEN",
+                "WARREN_HOME",
+                "PATH",
+                "WARREN_GATEWAY_BIND",
+                "OPENAI_API_KEY",
+                "WARREN_",
+            ]
+            .map(std::ffi::OsString::from),
+        );
+        // `get_envs` is sorted by key.
+        assert_eq!(
+            removed_envs(&cmd),
+            ["WARREN_", "WARREN_GATEWAY_BIND", "WARREN_INSTANCE_TOKEN"]
+        );
+        // Every path a user command takes scrubs the gateway's real
+        // environment: plain, through runuser/su, and with direct id changes.
+        let named = Identity {
+            name: "agent".into(),
+            uid: 1000,
+            gid: 1000,
+            named: true,
+        };
+        let numeric = Identity {
+            name: "1234".into(),
+            uid: 1234,
+            gid: 1234,
+            named: false,
+        };
+        // Other tests in this binary set and unset WARREN_* variables, so
+        // only variables present both before and after building a command
+        // are required to have been removed.
+        let before = hidden_vars_now();
+        let cmds = [
+            plain(shell_argv("env")),
+            switched(&named, shell_argv("env")),
+            switched(&numeric, shell_argv("env")),
+            owner_shell(&HomeOwner::current(), "env"),
+        ];
+        let after = hidden_vars_now();
+        for cmd in cmds {
+            let removed = removed_envs(&cmd);
+            assert!(removed.iter().all(|k| is_hidden_var(k)), "{removed:?}");
+            for k in before.iter().filter(|k| after.contains(k)) {
+                assert!(removed.contains(k), "{k} not hidden: {removed:?}");
+            }
+            // Explicit settings made afterwards survive (USER/LOGNAME here).
+            assert!(removed.iter().all(|k| k != "USER" && k != "LOGNAME"));
         }
     }
 

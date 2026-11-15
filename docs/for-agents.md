@@ -15,7 +15,7 @@ Environment
 - Auth on the Sandbox API: `Authorization: Bearer <key>`. Auth on instance URLs: `X-Warren-Key: <key>`.
 - Every response body is JSON; lists are `{"data":[...]}`; errors are `{"error":{"code","message","details"}}`.
   Codes: invalid_request 400, not_supported 400, invalid_api_key 401, insufficient_balance 402, forbidden 403,
-  not_found 404, conflict 409, instance_limit_reached 409, try_again 503, timeout 504. Unknown JSON fields are rejected.
+  not_found 404, conflict 409, instance_limit_reached 409, internal 500, bad_gateway 502, try_again 503, timeout 504. Unknown JSON fields are rejected.
 
 Instances
 - Create: POST /instances with any of {"template":"warren-base"|"warren-agent"|"warren-opencode", "name", "resources":{"cpu","memory","disk"},
@@ -62,7 +62,7 @@ For a self-hosted Warren, serve `docs/llms.txt` next to your dashboard or keep i
 Agents that speak MCP can skip HTTP entirely:
 
 ```bash
-cargo build --release -p warren-mcp && install -m 755 target/release/mcp ~/.local/bin/warren-mcp
+cargo build --release -p warren-mcp && install -m 755 target/release/warren-mcp ~/.local/bin/
 claude mcp add warren -e WARREN_API_URL=http://api.warren.localhost:7337 -e WARREN_API_KEY=sk_live_... -- warren-mcp
 ```
 

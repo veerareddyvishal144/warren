@@ -13,7 +13,7 @@ use std::{
 use tokio::{process::Command, task::JoinHandle};
 
 use crate::{
-    exec::{Identity, is_root, which},
+    exec::{Identity, hide_platform_env, is_root, which},
     owner::HomeOwner,
 };
 
@@ -75,6 +75,13 @@ fn spawn_ttyd(
     port: u16,
     identity: Option<&Identity>,
 ) -> std::io::Result<tokio::process::Child> {
+    ttyd_command(ttyd, home, port, identity).spawn()
+}
+
+/// The `ttyd` command line: the gateway's environment minus the platform
+/// variables (the shell it serves is the user's), `HOME` the persistent
+/// home, dropped to `identity` when one applies.
+pub fn ttyd_command(ttyd: &Path, home: &Path, port: u16, identity: Option<&Identity>) -> Command {
     let mut cmd = Command::new(ttyd);
     cmd.args([
         "-p",
@@ -92,13 +99,14 @@ fn spawn_ttyd(
     .stdout(Stdio::null())
     .stderr(Stdio::null())
     .kill_on_drop(true);
+    hide_platform_env(&mut cmd);
     if let Some(id) = identity {
         cmd.uid(id.uid)
             .gid(id.gid)
             .env("USER", &id.name)
             .env("LOGNAME", &id.name);
     }
-    cmd.spawn()
+    cmd
 }
 
 /// Doubling backoff capped at [`MAX_BACKOFF`].
@@ -164,6 +172,50 @@ mod tests {
             process_uid: 0,
         };
         assert_eq!(terminal_identity(&root_home), None);
+    }
+
+    #[test]
+    fn ttyd_command_hides_platform_variables() {
+        let agent = Identity {
+            name: "agent".into(),
+            uid: 1000,
+            gid: 1000,
+            named: true,
+        };
+        // Other tests in this binary set and unset WARREN_* variables, so
+        // only variables present both before and after building the command
+        // are required to have been removed.
+        let before = crate::exec::hidden_vars_now();
+        let cmd = ttyd_command(
+            Path::new("/usr/bin/ttyd"),
+            Path::new("/home/agent"),
+            7681,
+            Some(&agent),
+        );
+        let after = crate::exec::hidden_vars_now();
+        let std_cmd = cmd.as_std();
+        assert_eq!(std_cmd.get_program(), "/usr/bin/ttyd");
+        assert_eq!(std_cmd.get_current_dir(), Some(Path::new("/home/agent")));
+        let mut removed = Vec::new();
+        let mut set = Vec::new();
+        for (k, v) in std_cmd.get_envs() {
+            let k = k.to_string_lossy().into_owned();
+            match v {
+                None => removed.push(k),
+                Some(v) => set.push((k, v.to_string_lossy().into_owned())),
+            }
+        }
+        assert!(
+            removed.iter().all(|k| crate::wrap::is_hidden_var(k)),
+            "{removed:?}"
+        );
+        for k in before.iter().filter(|k| after.contains(k)) {
+            assert!(removed.contains(k), "{k} not hidden: {removed:?}");
+        }
+        assert!(set.contains(&("HOME".to_string(), "/home/agent".to_string())));
+        assert!(set.contains(&("USER".to_string(), "agent".to_string())));
+        assert!(set.contains(&("LOGNAME".to_string(), "agent".to_string())));
+        assert!(!removed.contains(&"HOME".to_string()));
     }
 
     #[tokio::test]

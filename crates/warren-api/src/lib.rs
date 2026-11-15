@@ -9,6 +9,10 @@
 //! - `Authorization: Bearer sk_live_...` or `x-warren-key` is resolved through
 //!   `Deps::auth` by a middleware and exposed to handlers as [`Caller`];
 //!   `/v1/health`, `/v1/version` and `POST /v1/signup` need no key.
+//! - `POST /v1/signup` is `404` when `Config::signup_enabled` is off and is
+//!   limited to [`SIGNUPS_PER_HOUR`] per client IP (loopback is exempt in dev
+//!   mode so local suites can sign up freely).
+//! - Browsers may call the API only from the dashboard origin (CORS).
 //! - JSON bodies are read by [`JsonBody`], bounded by
 //!   `warren_core::json::MAX_BODY_BYTES`; unknown fields and type errors are
 //!   answered with `400 invalid_request` and the serde message.
@@ -24,6 +28,7 @@ use warren_core::{
 
 mod auth;
 mod extract;
+mod ratelimit;
 mod requests;
 mod routes;
 mod schedule;
@@ -34,11 +39,15 @@ mod tests;
 
 pub use auth::Caller;
 pub use extract::{JsonBody, Query};
+pub use ratelimit::{ClientIp, RateLimiter};
 pub use requests::{
     CreateBackupRequest, CreateCronRequest, CreateKeyRequest, PatchCronRequest, RestoreRequest,
     SignupRequest, TopUpRequest, UpdateInstanceRequest,
 };
 pub use schedule::{MAX_PROMPT_BYTES, next_run_at, parse_schedule, parse_timezone};
+
+/// Signups one client IP may make per hour.
+pub const SIGNUPS_PER_HOUR: u32 = 10;
 
 /// Everything the routes need. Wrapped in an `Arc` and used as axum state.
 pub struct Deps {

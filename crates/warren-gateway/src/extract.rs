@@ -103,7 +103,10 @@ pub fn required_query(raw: Option<&str>, key: &str) -> Result<String> {
     }
 }
 
-/// Enforce `X-Warren-Instance-Token` when the gateway was given a token.
+/// Enforce `x-warren-instance-token` when the gateway was given a token.
+/// An empty `expected` disables the check (local runs without a token).
+/// Missing or wrong tokens are `401 invalid_api_key`; the comparison takes
+/// the same time whatever the presented value.
 pub fn require_instance_token(headers: &HeaderMap, expected: &str) -> Result<()> {
     if expected.is_empty() {
         return Ok(());
@@ -116,15 +119,23 @@ pub fn require_instance_token(headers: &HeaderMap, expected: &str) -> Result<()>
     if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
         Ok(())
     } else {
-        Err(Error::forbidden("missing or invalid instance token"))
+        Err(Error::invalid_api_key(format!(
+            "missing or invalid instance token: send it in the {HEADER_INSTANCE_TOKEN} header"
+        )))
     }
 }
 
+/// Byte-wise comparison whose running time depends only on the lengths, so a
+/// wrong token does not leak how many leading bytes matched. Unequal lengths
+/// are reported after a full pass over the presented value.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
     }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    diff == 0
 }
 
 #[cfg(test)]
@@ -187,13 +198,28 @@ mod tests {
     fn token_check() {
         let mut h = HeaderMap::new();
         assert!(require_instance_token(&h, "").is_ok());
-        assert_eq!(
-            require_instance_token(&h, "secret").unwrap_err().status,
-            403
-        );
-        h.insert(HEADER_INSTANCE_TOKEN, HeaderValue::from_static("wrong"));
-        assert!(require_instance_token(&h, "secret").is_err());
+        let e = require_instance_token(&h, "secret").unwrap_err();
+        assert_eq!(e.status, 401);
+        assert_eq!(e.code, "invalid_api_key");
+        assert!(e.message.contains(HEADER_INSTANCE_TOKEN), "{}", e.message);
+        for wrong in ["wrong", "secre", "secrets", "", "Secret"] {
+            h.insert(HEADER_INSTANCE_TOKEN, HeaderValue::from_str(wrong).unwrap());
+            let e = require_instance_token(&h, "secret").unwrap_err();
+            assert_eq!(
+                (e.status, e.code.as_str()),
+                (401, "invalid_api_key"),
+                "{wrong:?}"
+            );
+        }
         h.insert(HEADER_INSTANCE_TOKEN, HeaderValue::from_static("secret"));
         assert!(require_instance_token(&h, "secret").is_ok());
+        h.insert(HEADER_INSTANCE_TOKEN, HeaderValue::from_static(" secret "));
+        assert!(require_instance_token(&h, "secret").is_ok());
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"ab", b"abc"));
+        assert!(!constant_time_eq(b"", b"a"));
     }
 }

@@ -1,6 +1,10 @@
 //! CORS on instance hosts. Browsers send preflights without credentials, so
-//! they could never pass instance auth: the edge answers them itself. Every
-//! other response on an instance host echoes the request `Origin`.
+//! they could never pass instance auth: the edge answers them itself. Only
+//! trusted origins are allowed: the dashboard (the root host) and the
+//! instance's own origins. Any other `Origin` gets no
+//! `Access-Control-Allow-Origin` at all, so a page on another origin (another
+//! instance included) can neither read instance responses nor use the
+//! session cookie from a script.
 
 use axum::{body::Body, response::Response};
 use http::{
@@ -11,6 +15,7 @@ use http::{
         ACCESS_CONTROL_REQUEST_HEADERS, ORIGIN, VARY,
     },
 };
+use warren_core::Config;
 
 /// Headers the contract always allows.
 pub(crate) const ALLOW_HEADERS: &str = "X-Warren-Key, Content-Type, Authorization";
@@ -18,16 +23,56 @@ pub(crate) const ALLOW_HEADERS: &str = "X-Warren-Key, Content-Type, Authorizatio
 pub(crate) const ALLOW_METHODS: &str = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
 const MAX_AGE: &str = "600";
 
-/// The answer to an `OPTIONS` request on an instance host.
-pub(crate) fn preflight(request: &HeaderMap) -> Response {
-    let origin = request
-        .get(ORIGIN)
-        .cloned()
-        .unwrap_or_else(|| HeaderValue::from_static("*"));
+/// `scheme://<base>[:port]`: the dashboard's origin, with the public port
+/// unless it is the scheme's default (the same rule as `Config::instance_url`).
+pub(crate) fn root_origin(cfg: &Config) -> String {
+    let implicit = cfg.public_port == 0
+        || (cfg.public_scheme == "http" && cfg.public_port == 80)
+        || (cfg.public_scheme == "https" && cfg.public_port == 443);
+    if implicit {
+        format!("{}://{}", cfg.public_scheme, cfg.base_domain)
+    } else {
+        format!(
+            "{}://{}:{}",
+            cfg.public_scheme, cfg.base_domain, cfg.public_port
+        )
+    }
+}
+
+/// The origins an instance host trusts: the dashboard and the instance's own
+/// URLs for the requested host (`instance_url(id)`, plus `preview_url(id,
+/// port)` on a port host). Lowercase, no trailing slash.
+pub(crate) fn allowed_origins(cfg: &Config, id: &str, host_port: u16) -> Vec<String> {
+    let mut origins = vec![root_origin(cfg), cfg.instance_url(id)];
+    if host_port != 0 {
+        origins.push(cfg.preview_url(id, host_port));
+    }
+    origins
+        .into_iter()
+        .map(|o| o.to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether `origin` (an `Origin` header value) is one of `allowed`.
+pub(crate) fn origin_allowed(origin: &HeaderValue, allowed: &[String]) -> bool {
+    origin
+        .to_str()
+        .ok()
+        .map(|o| o.trim().trim_end_matches('/').to_ascii_lowercase())
+        .is_some_and(|o| allowed.contains(&o))
+}
+
+/// The answer to an `OPTIONS` request on an instance host: `204`, with the
+/// CORS grant only when the Origin is trusted.
+pub(crate) fn preflight(request: &HeaderMap, allowed: &[String]) -> Response {
     let mut resp = Response::new(Body::empty());
     *resp.status_mut() = StatusCode::NO_CONTENT;
     let h = resp.headers_mut();
-    h.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    h.append(VARY, HeaderValue::from_static("Origin"));
+    let Some(origin) = request.get(ORIGIN).filter(|o| origin_allowed(o, allowed)) else {
+        return resp;
+    };
+    h.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
     h.insert(ACCESS_CONTROL_ALLOW_HEADERS, allow_headers(request));
     h.insert(
         ACCESS_CONTROL_ALLOW_METHODS,
@@ -38,7 +83,6 @@ pub(crate) fn preflight(request: &HeaderMap) -> Response {
         HeaderValue::from_static("true"),
     );
     h.insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static(MAX_AGE));
-    h.append(VARY, HeaderValue::from_static("Origin"));
     resp
 }
 
@@ -65,14 +109,18 @@ fn allow_headers(request: &HeaderMap) -> HeaderValue {
     HeaderValue::from_str(&allowed).unwrap_or_else(|_| HeaderValue::from_static(ALLOW_HEADERS))
 }
 
-/// Echo the Origin on a response (proxied or an edge error) when one was sent.
-pub(crate) fn apply(resp: &mut Response, origin: Option<&HeaderValue>) {
+/// Grant CORS on a response (proxied or an edge error) when the request came
+/// from a trusted Origin; otherwise only `Vary: Origin` is added.
+pub(crate) fn apply(resp: &mut Response, origin: Option<&HeaderValue>, allowed: &[String]) {
     let Some(origin) = origin else { return };
     let h = resp.headers_mut();
+    h.append(VARY, HeaderValue::from_static("Origin"));
+    if !origin_allowed(origin, allowed) {
+        return;
+    }
     h.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
     h.insert(
         ACCESS_CONTROL_ALLOW_CREDENTIALS,
         HeaderValue::from_static("true"),
     );
-    h.append(VARY, HeaderValue::from_static("Origin"));
 }

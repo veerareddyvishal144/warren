@@ -14,12 +14,16 @@ use std::{
 
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
-use warren_core::{Instance, InstanceStatus, MetricPoint, Result, STOP_GRACE_SECS};
+use warren_core::{Instance, InstanceStatus, MetricPoint, Result, Runtime, STOP_GRACE_SECS};
 
-use crate::manager::Manager;
+use crate::manager::{Manager, describe};
 
 /// Period of the idle sleeper.
 pub const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+/// Period of the repair pass ([`Manager::repair`]).
+pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
+/// A transitional row not updated for this long is considered stranded.
+pub const STUCK_TRANSITION_SECS: i64 = 600;
 /// Period of the metrics sampler.
 pub const METRICS_INTERVAL: Duration = Duration::from_secs(60);
 /// Period of the activity flush.
@@ -110,6 +114,17 @@ impl Manager {
             },
         ));
 
+        let m = self.clone();
+        tasks.spawn(every(
+            shutdown.clone(),
+            RECONCILE_INTERVAL,
+            "repair",
+            move || {
+                let m = m.clone();
+                async move { m.repair().await }
+            },
+        ));
+
         shutdown.cancelled().await;
         while tasks.join_next().await.is_some() {}
         // Activity recorded since the last tick must not be lost on shutdown.
@@ -122,7 +137,8 @@ impl Manager {
     /// Transitional states left by a crash become `Failed` (or finish, for
     /// `Stopping` and `Deleting`); running instances whose runtime is gone
     /// become `Stopped`; runtimes still running for non-running instances are
-    /// stopped so nothing bills less than it uses.
+    /// stopped so nothing bills less than it uses. A runtime that cannot say
+    /// whether an instance runs leaves the row untouched for the next pass.
     pub async fn reconcile(&self) -> Result<()> {
         let all = self.deps.store.list_all_instances().await?;
         let now = self.now();
@@ -136,7 +152,39 @@ impl Manager {
         Ok(())
     }
 
+    /// `Some(running)` from the runtime, `None` when it does not know; the
+    /// caller must not change the row on `None`.
+    async fn liveness(rt: &dyn Runtime, inst: &Instance, pass: &'static str) -> Option<bool> {
+        match rt.is_running(inst).await {
+            Ok(running) => Some(running),
+            Err(e) => {
+                tracing::warn!(instance = %inst.id, status = %inst.status, error = %e, pass, "runtime liveness unknown; leaving the row for the next pass");
+                None
+            }
+        }
+    }
+
+    /// Bring a runtime object down by force: stop, and when that fails destroy
+    /// the object (the disk stays). Returns a short description for the reason.
+    async fn force_down(rt: &dyn Runtime, inst: &Instance) -> String {
+        match rt.stop(inst, Duration::from_secs(STOP_GRACE_SECS)).await {
+            Ok(()) => return "runtime stopped".to_string(),
+            Err(e) if e.is_not_found() => return "runtime already gone".to_string(),
+            Err(e) => {
+                tracing::warn!(instance = %inst.id, error = %e, "stop failed; destroying the runtime object");
+            }
+        }
+        match rt.destroy(inst, false).await {
+            Ok(()) => "runtime destroyed".to_string(),
+            Err(e) if e.is_not_found() => "runtime already gone".to_string(),
+            Err(e) => format!("forced destroy failed: {}", describe(&e)),
+        }
+    }
+
     async fn reconcile_one(&self, inst: &mut Instance, now: i64) -> Result<()> {
+        if inst.status == InstanceStatus::Deleted {
+            return self.purge_records(inst).await;
+        }
         let rt = match self.runtime_for(inst) {
             Ok(rt) => rt,
             Err(e) => {
@@ -150,7 +198,9 @@ impl Manager {
                 return Ok(());
             }
         };
-        let runtime_running = rt.stats(inst).await.is_ok();
+        let Some(runtime_running) = Self::liveness(rt.as_ref(), inst, "startup").await else {
+            return Ok(());
+        };
         let stop_leftover = |what: &'static str| {
             let rt = rt.clone();
             let inst = inst.clone();
@@ -210,6 +260,120 @@ impl Manager {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// Periodic repair of rows the live operations cannot fix themselves:
+    /// transitional rows not updated for [`STUCK_TRANSITION_SECS`] (the runtime
+    /// is brought down and the row becomes `Failed`, or `Stopped` for an
+    /// interrupted stop), `Failed` rows whose runtime still runs (brought down,
+    /// storage kept), `Running` rows whose runtime is gone (`Stopped`), and
+    /// `Deleting`/`Deleted` leftovers. Busy instances are skipped; a runtime
+    /// that cannot answer leaves the row for the next pass.
+    pub async fn repair(&self) {
+        let all = match self.deps.store.list_all_instances().await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(error = %e, "repair pass could not list instances");
+                return;
+            }
+        };
+        let now = self.now();
+        for inst in all {
+            let Some(_g) = self.try_lock(&inst.id) else {
+                continue;
+            };
+            let mut fresh = match self.deps.store.get_instance(&inst.id).await {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            if let Err(e) = self.repair_one(&mut fresh, now).await {
+                tracing::error!(instance = %inst.id, status = %fresh.status, error = %e, "repair failed");
+            }
+        }
+    }
+
+    async fn repair_one(&self, inst: &mut Instance, now: i64) -> Result<()> {
+        let stuck = now - inst.updated_at >= STUCK_TRANSITION_SECS;
+        match inst.status {
+            InstanceStatus::Deleted => return self.purge_records(inst).await,
+            InstanceStatus::Deleting => {
+                return if stuck {
+                    tracing::warn!(instance = %inst.id, "finishing a stranded delete");
+                    self.delete_locked(inst).await
+                } else {
+                    Ok(())
+                };
+            }
+            InstanceStatus::Stopped | InstanceStatus::Sleeping => return Ok(()),
+            _ => {}
+        }
+        let Ok(rt) = self.runtime_for(inst) else {
+            return Ok(());
+        };
+        let Some(running) = Self::liveness(rt.as_ref(), inst, "repair").await else {
+            return Ok(());
+        };
+        match inst.status {
+            InstanceStatus::Running => {
+                if running {
+                    return Ok(());
+                }
+                tracing::warn!(instance = %inst.id, "runtime exited behind a running instance");
+                inst.stopped_at = now;
+                inst.ip.clear();
+                self.transition(inst, InstanceStatus::Stopped, "runtime not running")
+                    .await
+            }
+            InstanceStatus::Failed => {
+                if !running {
+                    return Ok(());
+                }
+                tracing::warn!(instance = %inst.id, "runtime still running behind a failed instance; bringing it down");
+                let outcome = Self::force_down(rt.as_ref(), inst).await;
+                inst.ip.clear();
+                let reason = if inst.status_reason.is_empty() {
+                    outcome
+                } else {
+                    format!("{}; {outcome}", inst.status_reason)
+                };
+                self.transition(inst, InstanceStatus::Failed, &reason).await
+            }
+            InstanceStatus::Provisioning
+            | InstanceStatus::Starting
+            | InstanceStatus::Waking
+            | InstanceStatus::Restarting
+            | InstanceStatus::Updating
+            | InstanceStatus::Stopping => {
+                if !stuck {
+                    return Ok(());
+                }
+                let age = now - inst.updated_at;
+                tracing::warn!(instance = %inst.id, status = %inst.status, age, "stranded transitional instance");
+                let outcome = if running {
+                    Self::force_down(rt.as_ref(), inst).await
+                } else {
+                    "runtime not running".to_string()
+                };
+                inst.ip.clear();
+                if inst.status == InstanceStatus::Stopping {
+                    inst.stopped_at = now;
+                    let reason = if inst.status_reason.is_empty() {
+                        format!("stop interrupted; {outcome}")
+                    } else {
+                        format!("{}; stop interrupted; {outcome}", inst.status_reason)
+                    };
+                    return self
+                        .transition(inst, InstanceStatus::Stopped, &reason)
+                        .await;
+                }
+                let reason = format!("stuck in {} for {age} seconds; {outcome}", inst.status);
+                self.transition(inst, InstanceStatus::Failed, &reason).await
+            }
+            InstanceStatus::Stopped
+            | InstanceStatus::Sleeping
+            | InstanceStatus::Deleting
+            | InstanceStatus::Deleted => Ok(()),
         }
     }
 

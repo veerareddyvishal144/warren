@@ -423,7 +423,7 @@ async fn ledger_failure_leaves_the_meter_untouched_and_is_reported() {
 }
 
 #[tokio::test]
-async fn meter_save_failure_reverses_the_charge() {
+async fn meter_save_failure_charges_nothing() {
     let (b, store, _) = setup(T0);
     store.put_workspace(workspace("ws_a", 100 * USD, 0));
     store.put_instance(instance(
@@ -435,29 +435,21 @@ async fn meter_save_failure_reverses_the_charge() {
         T0,
     ));
     store
-        .fail_update_instance
+        .fail_set_meter
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
+    // The meter is written before the ledger, so a meter failure never leaves
+    // a charge behind that would need reversing.
     assert_eq!(b.tick(T0 + 60).await.unwrap_err().code, CODE_INTERNAL);
-    let ledger = store.ledger();
-    assert_eq!(ledger.len(), 2);
-    assert_eq!(ledger[0].kind, LedgerKind::Compute);
-    assert_eq!(ledger[0].micros, -108);
-    assert_eq!(ledger[1].kind, LedgerKind::Adjustment);
-    assert_eq!(ledger[1].micros, 108);
-    assert_eq!(ledger[1].instance_id, "aaaaaaaaa1");
-    assert!(ledger[1].note.contains("rollback"));
-    assert_eq!(
-        store.workspace("ws_a").wallet_micros,
-        100 * USD,
-        "the wallet is whole again"
-    );
+    assert!(store.ledger().is_empty());
+    assert_eq!(store.workspace("ws_a").wallet_micros, 100 * USD);
     assert_eq!(store.instance("aaaaaaaaa1").metered_through, T0);
 
     store
-        .fail_update_instance
+        .fail_set_meter
         .store(false, std::sync::atomic::Ordering::SeqCst);
     b.tick(T0 + 60).await.unwrap();
+    assert_eq!(store.ledger().len(), 1);
     assert_eq!(store.workspace("ws_a").wallet_micros, 100 * USD - 108);
     assert_eq!(store.instance("aaaaaaaaa1").metered_through, T0 + 60);
 }
@@ -474,11 +466,17 @@ async fn metering_does_not_overwrite_a_status_change_made_meanwhile() {
         InstanceType::Default,
         T0,
     ));
-    // The lifecycle moves the instance between the biller's listing and its save.
-    store.set_status_on_read("aaaaaaaaa1", InstanceStatus::Stopping);
+    // The lifecycle writes the whole row between the biller's listing and its
+    // meter write, leaving the meter where it was.
+    store.after_next_listing(|instances| {
+        let inst = instances.get_mut("aaaaaaaaa1").unwrap();
+        inst.status = InstanceStatus::Stopping;
+        inst.ip = "10.0.0.9".into();
+    });
     b.tick(T0 + 60).await.unwrap();
     let inst = store.instance("aaaaaaaaa1");
     assert_eq!(inst.status, InstanceStatus::Stopping);
+    assert_eq!(inst.ip, "10.0.0.9");
     assert_eq!(inst.metered_through, T0 + 60);
     assert_eq!(
         charged(&store, "aaaaaaaaa1"),
@@ -488,7 +486,7 @@ async fn metering_does_not_overwrite_a_status_change_made_meanwhile() {
 }
 
 #[tokio::test]
-async fn instance_deleted_during_metering_keeps_its_final_charge() {
+async fn meter_moved_by_the_lifecycle_is_neither_rewound_nor_charged() {
     let (b, store, _) = setup(T0);
     store.put_workspace(workspace("ws_a", 100 * USD, 0));
     store.put_instance(instance(
@@ -499,27 +497,79 @@ async fn instance_deleted_during_metering_keeps_its_final_charge() {
         InstanceType::Default,
         T0,
     ));
-    // Simulate the deletion racing the tick: the listing sees it, the re-read does not.
-    store.set_status_on_read("aaaaaaaaa1", InstanceStatus::Deleted);
-    let store2 = store.clone();
-    let b2 = b.clone();
-    // Remove the row after the listing but before the re-read by racing on the yield in list_all_instances.
-    let remover = async move {
-        tokio::task::yield_now().await;
-        store2.put_instance(instance(
-            "zzzzzzzzz9",
-            "ws_a",
-            InstanceStatus::Deleted,
-            SMALL,
-            InstanceType::Default,
-            0,
-        ));
-        let _ = warren_core::Store::delete_instance(&*store2, "aaaaaaaaa1").await;
-    };
-    let (res, ()) = tokio::join!(b2.tick(T0 + 60), remover);
-    res.unwrap();
-    assert_eq!(charged(&store, "aaaaaaaaa1"), 108);
-    assert_eq!(store.workspace("ws_a").wallet_micros, 100 * USD - 108);
+    // A wake lands between the listing and the meter write and resets the
+    // meter to its own clock, well past where this tick would have put it.
+    store.after_next_listing(|instances| {
+        let inst = instances.get_mut("aaaaaaaaa1").unwrap();
+        inst.status = InstanceStatus::Running;
+        inst.metered_through = T0 + 600;
+        inst.meter_carry_micros = 0.0;
+    });
+    b.tick(T0 + 120).await.unwrap();
+    let inst = store.instance("aaaaaaaaa1");
+    assert_eq!(
+        inst.metered_through,
+        T0 + 600,
+        "the lifecycle's meter position stands"
+    );
+    assert!(
+        store.ledger().is_empty(),
+        "nothing is charged for this tick"
+    );
+    assert_eq!(store.workspace("ws_a").wallet_micros, 100 * USD);
+
+    // The next tick meters from the lifecycle's position.
+    b.tick(T0 + 720).await.unwrap();
+    let entries = store.ledger_for_instance("aaaaaaaaa1");
+    assert_eq!(entries.len(), 1);
+    assert!((entries[0].minutes - 2.0).abs() < 1e-9);
+    assert_eq!(store.instance("aaaaaaaaa1").metered_through, T0 + 720);
+}
+
+#[tokio::test]
+async fn ledger_failure_after_the_meter_moved_rewinds_it() {
+    let (b, store, _) = setup(T0);
+    store.put_workspace(workspace("ws_a", 100 * USD, 0));
+    let mut inst = instance(
+        "aaaaaaaaa1",
+        "ws_a",
+        InstanceStatus::Running,
+        SMALL,
+        InstanceType::Default,
+        T0,
+    );
+    inst.meter_carry_micros = 0.25;
+    store.put_instance(inst);
+    store
+        .fail_ledger
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(b.tick(T0 + 60).await.unwrap_err().code, CODE_INTERNAL);
+    let after = store.instance("aaaaaaaaa1");
+    assert_eq!(after.metered_through, T0, "meter put back for the retry");
+    assert_eq!(after.meter_carry_micros, 0.25, "carry put back too");
+    assert!(store.ledger().is_empty());
+}
+
+#[tokio::test]
+async fn instance_deleted_during_metering_is_skipped() {
+    let (b, store, _) = setup(T0);
+    store.put_workspace(workspace("ws_a", 100 * USD, 0));
+    store.put_instance(instance(
+        "aaaaaaaaa1",
+        "ws_a",
+        InstanceStatus::Running,
+        SMALL,
+        InstanceType::Default,
+        T0,
+    ));
+    // The deletion lands between the listing and the meter write: with no row
+    // to move the meter on, nothing is charged and the tick still succeeds.
+    store.after_next_listing(|instances| {
+        instances.remove("aaaaaaaaa1");
+    });
+    b.tick(T0 + 60).await.unwrap();
+    assert!(store.ledger().is_empty());
+    assert_eq!(store.workspace("ws_a").wallet_micros, 100 * USD);
 }
 
 #[tokio::test]
@@ -856,7 +906,7 @@ async fn assert_can_create_enforces_the_awake_limit() {
 }
 
 #[tokio::test]
-async fn assert_can_wake_checks_only_the_limit() {
+async fn assert_can_wake_requires_a_positive_wallet_and_room() {
     let (b, store, _) = setup(T0);
     store.put_workspace(workspace("ws_a", 0, 0));
     store.put_instance(instance(
@@ -883,8 +933,19 @@ async fn assert_can_wake_checks_only_the_limit() {
         InstanceType::Default,
         T0,
     ));
-    // An empty wallet does not block a wake.
-    b.assert_can_wake(&store.workspace("ws_a")).await.unwrap();
+    // An exhausted wallet blocks a wake or start, however much room there is.
+    for wallet in [0, -5] {
+        let err = b
+            .assert_can_wake(&workspace("ws_a", wallet, 0))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, CODE_INSUFFICIENT_BALANCE);
+        let details = err.details.unwrap();
+        assert_eq!(details["required_micros"], 1);
+        assert_eq!(details["balance_micros"], wallet);
+    }
+    // Any positive balance will do; the one-day rule applies to create only.
+    b.assert_can_wake(&workspace("ws_a", 1, 0)).await.unwrap();
 
     store.put_instance(instance(
         "aaaaaaaaa4",
@@ -895,7 +956,7 @@ async fn assert_can_wake_checks_only_the_limit() {
         T0,
     ));
     let err = b
-        .assert_can_wake(&store.workspace("ws_a"))
+        .assert_can_wake(&workspace("ws_a", 1, 0))
         .await
         .unwrap_err();
     assert_eq!(err.code, CODE_INSTANCE_LIMIT_REACHED);

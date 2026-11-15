@@ -10,7 +10,7 @@ use std::{
 use serde_json::json;
 use tracing::Instrument;
 use warren_core::{
-    Clock, Cron, Error, Lifecycle, Store,
+    Clock, Cron, Error, HEADER_INSTANCE_TOKEN, Lifecycle, Store,
     agentapi::{ResponseObject, ResponseStatus, ResponsesRequest},
     json::ErrorEnvelope,
 };
@@ -126,8 +126,8 @@ impl Firer {
         if let Err(e) = self.lifecycle.ensure_awake(&cron.instance_id).await {
             return format!("wake failed: {}", describe(&e));
         }
-        let endpoint = match self.lifecycle.endpoint(&cron.instance_id).await {
-            Ok(ip) => ip,
+        let (endpoint, token) = match self.lifecycle.gateway_credentials(&cron.instance_id).await {
+            Ok(creds) => creds,
             Err(e) => return format!("error: {}", describe(&e)),
         };
         let url = gateway_url(&endpoint, self.gateway_port);
@@ -138,7 +138,11 @@ impl Firer {
         };
         tracing::debug!(url = %url, "posting cron prompt");
         self.lifecycle.record_activity(&cron.instance_id);
-        let sent = self.client.post(&url).json(&body).send().await;
+        let mut request = self.client.post(&url).json(&body);
+        if !token.is_empty() {
+            request = request.header(HEADER_INSTANCE_TOKEN, token);
+        }
+        let sent = request.send().await;
         self.lifecycle.record_activity(&cron.instance_id);
         let response = match sent {
             Ok(r) => r,

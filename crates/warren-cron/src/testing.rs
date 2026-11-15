@@ -255,6 +255,8 @@ impl Store for FakeStore {
 /// Records wake calls and hands out a fixed endpoint; everything else is unsupported.
 pub struct FakeLifecycle {
     pub endpoint: Mutex<String>,
+    /// The gateway token `gateway_credentials` returns; empty by default.
+    pub token: Mutex<String>,
     pub wake_error: Mutex<Option<Error>>,
     pub endpoint_error: Mutex<Option<Error>>,
     pub awake_calls: Mutex<Vec<String>>,
@@ -266,6 +268,7 @@ impl FakeLifecycle {
     pub fn at(endpoint: impl Into<String>) -> Arc<Self> {
         Arc::new(FakeLifecycle {
             endpoint: Mutex::new(endpoint.into()),
+            token: Mutex::new(String::new()),
             wake_error: Mutex::new(None),
             endpoint_error: Mutex::new(None),
             awake_calls: Mutex::new(Vec::new()),
@@ -275,6 +278,12 @@ impl FakeLifecycle {
     pub fn failing_wake(endpoint: impl Into<String>, err: Error) -> Arc<Self> {
         let lc = Self::at(endpoint);
         *lc.wake_error.lock().unwrap() = Some(err);
+        lc
+    }
+    /// Every instance resolves to `endpoint` with gateway token `token`.
+    pub fn with_token(endpoint: impl Into<String>, token: &str) -> Arc<Self> {
+        let lc = Self::at(endpoint);
+        *lc.token.lock().unwrap() = token.to_string();
         lc
     }
     pub fn failing_endpoint(err: Error) -> Arc<Self> {
@@ -378,6 +387,10 @@ impl Lifecycle for FakeLifecycle {
     fn record_activity(&self, _id: &str) {
         self.activity.fetch_add(1, Ordering::SeqCst);
     }
+    async fn gateway_credentials(&self, id: &str) -> Result<(String, String)> {
+        let endpoint = self.endpoint(id).await?;
+        Ok((endpoint, self.token.lock().unwrap().clone()))
+    }
     async fn endpoint(&self, _id: &str) -> Result<String> {
         if let Some(e) = self.endpoint_error.lock().unwrap().clone() {
             return Err(e);
@@ -440,6 +453,8 @@ pub struct Received {
     pub method: String,
     pub path: String,
     pub content_type: String,
+    /// The `X-Warren-Instance-Token` header, when sent.
+    pub instance_token: Option<String>,
     pub body: serde_json::Value,
 }
 
@@ -528,12 +543,15 @@ async fn serve(
     let path = request_line.next().unwrap_or_default().to_string();
     let mut content_length = 0usize;
     let mut content_type = String::new();
+    let mut instance_token = None;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             if name.eq_ignore_ascii_case("content-length") {
                 content_length = value.trim().parse().unwrap_or(0);
             } else if name.eq_ignore_ascii_case("content-type") {
                 content_type = value.trim().to_string();
+            } else if name.eq_ignore_ascii_case(warren_core::HEADER_INSTANCE_TOKEN) {
+                instance_token = Some(value.trim().to_string());
             }
         }
     }
@@ -550,6 +568,7 @@ async fn serve(
         method,
         path,
         content_type,
+        instance_token,
         body: json,
     });
 

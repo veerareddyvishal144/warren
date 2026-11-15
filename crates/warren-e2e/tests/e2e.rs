@@ -658,9 +658,11 @@ async fn create_exec_edge_body(cx: Ctx) -> Result<()> {
         resp.status()
     );
 
-    // CORS preflight on the instance host.
+    // CORS preflight on the instance host: only the dashboard origin (and the
+    // instance's own origins) are granted; a foreign origin gets no grant.
+    let dashboard_origin = format!("http://warren.localhost:{}", d.port());
     let preflight = [
-        ("origin", "http://example.test"),
+        ("origin", dashboard_origin.as_str()),
         ("access-control-request-method", "GET"),
         ("access-control-request-headers", "x-warren-key"),
     ];
@@ -680,9 +682,22 @@ async fn create_exec_edge_body(cx: Ctx) -> Result<()> {
         resp.status()
     );
     ensure!(
-        header(resp.headers(), "access-control-allow-origin") == "http://example.test",
+        header(resp.headers(), "access-control-allow-origin") == dashboard_origin,
         "preflight origin: {:?}",
         resp.headers()
+    );
+    let foreign = [
+        ("origin", "http://example.test"),
+        ("access-control-request-method", "GET"),
+        ("access-control-request-headers", "x-warren-key"),
+    ];
+    let denied = edge
+        .send(Method::OPTIONS, 0, "/v1/health", Auth::None, None, &foreign)
+        .await?;
+    ensure!(
+        header(denied.headers(), "access-control-allow-origin").is_empty(),
+        "foreign origin must not be granted: {:?}",
+        denied.headers()
     );
     ensure!(
         header(resp.headers(), "access-control-allow-headers")

@@ -33,6 +33,7 @@ use warren_core::{
 
 use crate::{
     DockerRuntime, HOME_DIR, LABEL_INJECTED, LABEL_SCOPE, NETWORK_INTERNAL, NETWORK_PUBLIC,
+    OPT_ENABLE_ICC,
 };
 
 const IMAGE: &str = "alpine:3.20";
@@ -224,14 +225,157 @@ async fn ready_selects_runtime_and_creates_networks() {
             .expect("warren-net exists");
     assert_ne!(public.internal, Some(true));
     assert_eq!(public.driver.as_deref(), Some("bridge"));
+    assert_eq!(
+        public
+            .options
+            .as_ref()
+            .and_then(|o| o.get(OPT_ENABLE_ICC))
+            .map(String::as_str),
+        Some("false"),
+        "warren-net is created with inter-container communication off"
+    );
     let internal =
         f.rt.docker()
             .inspect_network(NETWORK_INTERNAL, None)
             .await
             .expect("warren-internal exists");
     assert_eq!(internal.internal, Some(true));
+    assert_eq!(
+        internal
+            .options
+            .as_ref()
+            .and_then(|o| o.get(OPT_ENABLE_ICC))
+            .map(String::as_str),
+        Some("false")
+    );
+    assert!(
+        f.rt.blocked_networks().is_empty(),
+        "{:?}",
+        f.rt.blocked_networks()
+    );
     f.rt.ready().await.expect("ready is idempotent");
     assert_eq!(f.rt.name(), "docker");
+    // Both bridges resolve to a host interface the egress rules can name.
+    for name in [NETWORK_PUBLIC, NETWORK_INTERNAL] {
+        let bridge = f.rt.bridge_interface(name).await.expect("bridge name");
+        assert!(
+            Path::new("/sys/class/net").join(&bridge).exists(),
+            "{name}: interface {bridge} exists on the host"
+        );
+    }
+}
+
+/// Egress rules need root. As root `ready` installs them and `iptables -C`
+/// confirms the metadata-service drop on the public bridge; unprivileged the
+/// runtime reports them as missing.
+#[tokio::test]
+async fn egress_rules_follow_privilege() {
+    require_docker!();
+    let f = Fixture::new().await;
+    if !crate::netpolicy::is_root() {
+        assert!(!f.rt.egress_rules_installed());
+        eprintln!("skipping the live iptables check: needs root");
+        return;
+    }
+    assert!(f.rt.egress_rules_installed());
+    let iptables = crate::netpolicy::find_tool("iptables").expect("iptables");
+    let bridge = f.rt.bridge_interface(NETWORK_PUBLIC).await.unwrap();
+    let rules = crate::netpolicy::egress_rules(&bridge, false, &[]);
+    for rule in &rules {
+        assert!(
+            crate::netpolicy::succeeds(&iptables, &rule.argv("-C"))
+                .await
+                .unwrap(),
+            "rule present: {:?}",
+            rule.argv("-C")
+        );
+    }
+    f.rt.ready().await.expect("ready is idempotent");
+    assert!(f.rt.egress_rules_installed());
+}
+
+/// Two instances on warren-net: the host reaches the gateway port of one, the
+/// other cannot (inter-container communication is off on the bridge).
+#[tokio::test]
+async fn instances_cannot_reach_each_other_on_the_public_network() {
+    require_docker!();
+    let f = Fixture::new().await;
+    let tpl = template();
+    let mut server = instance(&tpl);
+    let mut client = instance(&tpl);
+    let outcome = icc_check(&f, &tpl, &mut server, &mut client).await;
+    destroy_quietly(&f.rt, &server).await;
+    destroy_quietly(&f.rt, &client).await;
+    outcome.unwrap();
+}
+
+async fn icc_check(
+    f: &Fixture,
+    tpl: &Template,
+    server: &mut Instance,
+    client: &mut Instance,
+) -> Result<(), String> {
+    let rt = &f.rt;
+    let listen = format!("while :; do echo warren | nc -l -p {GATEWAY_PORT}; done");
+    rt.create_with(server, tpl, cmd(&["sh", "-c", &listen]))
+        .await
+        .map_err(|e| format!("create server: {e}"))?;
+    rt.create_with(client, tpl, keepalive())
+        .await
+        .map_err(|e| format!("create client: {e}"))?;
+    let info = rt
+        .start(server)
+        .await
+        .map_err(|e| format!("start server: {e}"))?;
+    rt.start(client)
+        .await
+        .map_err(|e| format!("start client: {e}"))?;
+    ensure!(!info.ip.is_empty(), "server has an ip");
+
+    // The host (edge, daemon) reaches the port.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut from_host = false;
+    while Instant::now() < deadline {
+        if tokio::time::timeout(
+            Duration::from_secs(2),
+            TcpStream::connect((info.ip.as_str(), GATEWAY_PORT)),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+        {
+            from_host = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    ensure!(from_host, "the host connects to {}:{GATEWAY_PORT}", info.ip);
+
+    // Another instance on the same bridge does not.
+    let probe = format!("nc -w 3 {} {GATEWAY_PORT} </dev/null", info.ip);
+    let res = run(rt, client, exec(&probe)).await?;
+    ensure!(
+        res.exit_code != 0 && !res.stdout.contains("warren"),
+        "inter-container connection must fail: exit {} stdout {:?} stderr {:?}",
+        res.exit_code,
+        res.stdout,
+        res.stderr
+    );
+    // Sanity check of the probe itself: the container does see the ip as unreachable,
+    // not nc misbehaving (nc exits 0 after reading the banner when it connects).
+    let own = run(
+        rt,
+        server,
+        exec(&format!("nc -w 3 127.0.0.1 {GATEWAY_PORT} </dev/null")),
+    )
+    .await?;
+    ensure!(
+        own.exit_code == 0 && own.stdout.contains("warren"),
+        "loopback probe works: exit {} stdout {:?}",
+        own.exit_code,
+        own.stdout
+    );
+    Ok(())
 }
 
 #[tokio::test]

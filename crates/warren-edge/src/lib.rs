@@ -24,12 +24,21 @@ mod tests;
 
 use std::{sync::Arc, time::Duration};
 
-use axum::{Router, body::Body};
+use axum::{
+    Router,
+    body::Body,
+    error_handling::HandleErrorLayer,
+    extract::{Request, State},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+};
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioTimer},
 };
-use warren_core::{Authenticator, Config, HostKind, Lifecycle, Signer};
+use tokio::sync::Semaphore;
+use tower::{BoxError, ServiceBuilder, timeout::TimeoutLayer};
+use warren_core::{Authenticator, Config, Error, HostKind, Lifecycle, Signer};
 
 /// Everything the edge needs. Built by `warrend`.
 pub struct Deps {
@@ -58,6 +67,13 @@ pub struct EdgeOptions {
     pub activity_heartbeat: Duration,
     /// How long idle upstream connections stay in the pool.
     pub pool_idle_timeout: Duration,
+    /// Deadline for a Sandbox API request to produce its response, answered
+    /// with `504 timeout`. Proxied instance requests stream and never get one;
+    /// `POST /v1/instances/{id}/exec` is exempt too because it runs up to its
+    /// own `timeout_sec`.
+    pub api_timeout: Duration,
+    /// Requests in flight across the whole listener before new ones queue.
+    pub max_in_flight: usize,
 }
 
 impl Default for EdgeOptions {
@@ -69,6 +85,8 @@ impl Default for EdgeOptions {
             response_timeout: Duration::from_secs(u64::from(warren_core::DEFAULT_EXEC_TIMEOUT_SEC)),
             activity_heartbeat: Duration::from_secs(30),
             pool_idle_timeout: Duration::from_secs(90),
+            api_timeout: Duration::from_secs(60),
+            max_in_flight: 4096,
         }
     }
 }
@@ -103,7 +121,10 @@ pub fn route(cfg: &Config, host: &str, path: &str) -> Route {
 /// Shared state behind the fallback handler.
 pub(crate) struct Edge {
     pub(crate) config: Config,
+    /// The Sandbox API behind the request deadline.
     pub(crate) api: Router,
+    /// The Sandbox API without a deadline, for `exec` only.
+    pub(crate) api_untimed: Router,
     pub(crate) dashboard: Router,
     pub(crate) lifecycle: Arc<dyn Lifecycle>,
     pub(crate) auth: Arc<dyn Authenticator>,
@@ -129,9 +150,17 @@ pub fn router_with(d: Deps, opts: EdgeOptions) -> Router {
         .pool_timer(TokioTimer::new())
         .timer(TokioTimer::new())
         .build(connector);
+    let api_untimed = d.api;
+    let api = api_untimed.clone().layer(
+        ServiceBuilder::new()
+            .layer(HandleErrorLayer::new(api_timeout_error))
+            .layer(TimeoutLayer::new(opts.api_timeout)),
+    );
+    let limiter = Arc::new(Semaphore::new(opts.max_in_flight.max(1)));
     let edge = Arc::new(Edge {
         config: d.config,
-        api: d.api,
+        api,
+        api_untimed,
         dashboard: d.dashboard,
         lifecycle: d.lifecycle,
         auth: d.auth,
@@ -139,5 +168,29 @@ pub fn router_with(d: Deps, opts: EdgeOptions) -> Router {
         client,
         opts,
     });
-    Router::new().fallback(dispatch::handle).with_state(edge)
+    Router::new()
+        .fallback(dispatch::handle)
+        .with_state(edge)
+        .layer(middleware::from_fn_with_state(limiter, limit_in_flight))
+}
+
+/// The JSON envelope for a Sandbox API request that outlived its deadline.
+async fn api_timeout_error(err: BoxError) -> Response {
+    if err.is::<tower::timeout::error::Elapsed>() {
+        Error::timeout("The request did not complete in time.").into_response()
+    } else {
+        Error::internal(err.to_string()).into_response()
+    }
+}
+
+/// Global concurrency limit: a request waits for one of `max_in_flight`
+/// permits and holds it until its response (headers) is ready. Streaming
+/// bodies and tunnels do not hold a permit.
+async fn limit_in_flight(
+    State(limiter): State<Arc<Semaphore>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let _permit = limiter.acquire().await;
+    next.run(req).await
 }

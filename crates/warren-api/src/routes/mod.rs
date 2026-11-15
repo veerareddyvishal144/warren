@@ -1,10 +1,10 @@
 //! The route table and the helpers every handler shares.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
-    Json, Router,
-    http::{HeaderName, Method, StatusCode, Uri},
+    Extension, Json, Router,
+    http::{HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -14,7 +14,7 @@ use serde::Serialize;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use warren_core::{Config, Error, HEADER_API_KEY, Instance, Result, ids, json::List};
 
-use crate::{Deps, auth};
+use crate::{Deps, SIGNUPS_PER_HOUR, auth, ratelimit::RateLimiter};
 
 mod crons;
 mod instances;
@@ -88,20 +88,51 @@ pub fn build(state: Arc<Deps>) -> Router {
             auth::require_key,
         ));
 
+    let signup_limiter = Arc::new(RateLimiter::new(
+        SIGNUPS_PER_HOUR,
+        Duration::from_secs(3600),
+    ));
+    let cors = cors(&state.config);
     Router::new()
         .merge(public)
         .merge(private)
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
-        .layer(cors())
+        .layer(Extension(signup_limiter))
+        .layer(cors)
         .with_state(state)
 }
 
-/// Browser clients (the dashboard on the root host) call the API host
-/// cross-origin: mirror the Origin, allow the key headers and credentials.
-fn cors() -> CorsLayer {
+/// `scheme://<base>[:port]`: the only origin browsers may call the API from.
+/// The port is omitted when it is the scheme's default, as in
+/// `Config::instance_url`.
+pub fn dashboard_origin(cfg: &Config) -> String {
+    let implicit = cfg.public_port == 0
+        || (cfg.public_scheme == "http" && cfg.public_port == 80)
+        || (cfg.public_scheme == "https" && cfg.public_port == 443);
+    if implicit {
+        format!("{}://{}", cfg.public_scheme, cfg.base_domain)
+    } else {
+        format!(
+            "{}://{}:{}",
+            cfg.public_scheme, cfg.base_domain, cfg.public_port
+        )
+    }
+}
+
+/// The dashboard on the root host calls the API host cross-origin: allow
+/// exactly that origin with the key headers and credentials. Any other origin
+/// gets no `Access-Control-Allow-Origin`.
+fn cors(cfg: &Config) -> CorsLayer {
+    let dashboard = dashboard_origin(cfg).to_ascii_lowercase();
     CorsLayer::new()
-        .allow_origin(AllowOrigin::mirror_request())
+        .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, _| {
+            origin.to_str().is_ok_and(|o| {
+                o.trim()
+                    .trim_end_matches('/')
+                    .eq_ignore_ascii_case(&dashboard)
+            })
+        }))
         .allow_methods([
             Method::GET,
             Method::POST,
