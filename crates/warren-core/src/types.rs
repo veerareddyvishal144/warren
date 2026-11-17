@@ -2,16 +2,6 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Integer micro-dollars (USD x 1,000,000). Never use floats for money except
-/// for the per-minute carry inside the meter.
-pub type Money = i64;
-pub const MICROS_PER_DOLLAR: Money = 1_000_000;
-
-/// Render micros as dollars.
-pub fn dollars(m: Money) -> f64 {
-    m as f64 / MICROS_PER_DOLLAR as f64
-}
-
 /// Lifecycle state of an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -83,21 +73,6 @@ impl InstanceStatus {
         )
     }
 
-    /// A minute in this state bills the full running rate. Waking, sleeping and
-    /// stopped minutes bill disk alone; provisioning is free until the instance
-    /// first reaches running (see `Instance::meter_started_at`).
-    pub fn bills_compute(self) -> bool {
-        matches!(
-            self,
-            Self::Running | Self::Stopping | Self::Starting | Self::Restarting | Self::Updating
-        )
-    }
-
-    /// A minute in this state bills the disk rate only.
-    pub fn bills_disk(self) -> bool {
-        matches!(self, Self::Sleeping | Self::Stopped | Self::Waking)
-    }
-
     pub fn terminal(self) -> bool {
         self == Self::Deleted
     }
@@ -116,7 +91,7 @@ pub enum InstanceType {
     /// A container under gVisor (or runc when gVisor is unavailable) on a shared host.
     #[default]
     Default,
-    /// A Firecracker microVM with its own kernel. Compute bills at `Rates::vm_multiplier`.
+    /// A Firecracker microVM with its own kernel.
     Vm,
     /// Reserved for hosts with pinned cores; not available in the single-node build.
     Performance,
@@ -198,26 +173,13 @@ pub struct ShapeRequest {
     pub disk: Option<u32>,
 }
 
-/// Managed-service spend caps. Recorded and exposed to the instance; metering of
-/// managed services is not part of the single-node build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct Budget {
-    #[serde(default)]
-    pub monthly_cap_micros: Money,
-    #[serde(default)]
-    pub credit_micros: Money,
-}
-
-/// A tenant: one wallet, many instances, many API keys.
+/// A tenant: many instances, many API keys. Capacity is bounded by the daemon's
+/// per-workspace quota (`Config::max_awake_instances`), never by money.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Workspace {
     pub id: String,
     pub name: String,
     pub created_at: i64,
-    pub wallet_micros: Money,
-    pub top_up_total_micros: Money,
-    pub free_credit_granted: bool,
 }
 
 /// An API key. Only the SHA-256 of the plaintext is stored.
@@ -328,7 +290,6 @@ pub struct Instance {
     pub network: NetworkMode,
     pub auto_sleep: bool,
     pub idle_timeout_seconds: u32,
-    pub budget: Budget,
     /// Derived by the API layer from the base domain; not stored.
     #[serde(default)]
     pub url: String,
@@ -347,15 +308,6 @@ pub struct Instance {
     pub slept_at: i64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub last_activity_at: i64,
-    /// First time running was reached; 0 means never billed.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub meter_started_at: i64,
-    /// Unix seconds the meter has charged up to.
-    #[serde(skip)]
-    pub metered_through: i64,
-    /// Fractional micros not yet charged.
-    #[serde(skip)]
-    pub meter_carry_micros: f64,
     /// "docker" or "firecracker".
     pub runtime: String,
     /// Container id or VM id.
@@ -384,68 +336,8 @@ impl Instance {
         env.insert(ENV_WORKSPACE_ID.into(), self.workspace_id.clone());
         env.insert(ENV_HOME.into(), self.mount_path.clone());
         env.insert(ENV_GATEWAY_PORT.into(), GATEWAY_PORT.to_string());
-        env.insert(
-            ENV_BUDGET_MONTHLY.into(),
-            self.budget.monthly_cap_micros.to_string(),
-        );
-        env.insert(
-            ENV_BUDGET_CREDIT.into(),
-            self.budget.credit_micros.to_string(),
-        );
         env
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LedgerKind {
-    Compute,
-    Disk,
-    Topup,
-    Credit,
-    Adjustment,
-}
-
-impl LedgerKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Compute => "compute",
-            Self::Disk => "disk",
-            Self::Topup => "topup",
-            Self::Credit => "credit",
-            Self::Adjustment => "adjustment",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "compute" => Some(Self::Compute),
-            "disk" => Some(Self::Disk),
-            "topup" => Some(Self::Topup),
-            "credit" => Some(Self::Credit),
-            "adjustment" => Some(Self::Adjustment),
-            _ => None,
-        }
-    }
-}
-
-/// One movement on a wallet. Charges are negative, top-ups positive.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LedgerEntry {
-    pub id: String,
-    pub workspace_id: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub instance_id: String,
-    pub kind: LedgerKind,
-    pub micros: Money,
-    #[serde(default, skip_serializing_if = "is_zero_f64")]
-    pub minutes: f64,
-    pub at: i64,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub note: String,
-}
-
-fn is_zero_f64(v: &f64) -> bool {
-    *v == 0.0
 }
 
 /// A restore point for an instance's disk.
@@ -550,52 +442,6 @@ pub struct RunInfo {
     pub runtime_ref: String,
 }
 
-/// List prices per month. Per-minute charges are monthly / MINUTES_PER_MONTH.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Rates {
-    pub vcpu_month_micros: Money,
-    pub ram_gb_month_micros: Money,
-    pub disk_gb_month_micros: Money,
-    pub vm_multiplier: f64,
-    pub performance_multiplier: f64,
-}
-
-impl Default for Rates {
-    /// $0.80 per vCPU-month, $0.70 per GB RAM, $0.09 per GB disk, VM 2.5x, performance 4x.
-    fn default() -> Self {
-        Rates {
-            vcpu_month_micros: 800_000,
-            ram_gb_month_micros: 700_000,
-            disk_gb_month_micros: 90_000,
-            vm_multiplier: 2.5,
-            performance_multiplier: 4.0,
-        }
-    }
-}
-
-impl Rates {
-    pub fn multiplier(&self, t: InstanceType) -> f64 {
-        match t {
-            InstanceType::Default => 1.0,
-            InstanceType::Vm => self.vm_multiplier,
-            InstanceType::Performance => self.performance_multiplier,
-        }
-    }
-    /// Monthly price of a running instance of this shape and type.
-    pub fn monthly_running(&self, shape: Shape, t: InstanceType) -> Money {
-        let compute = shape.cpu as f64 * self.vcpu_month_micros as f64
-            + shape.memory as f64 * self.ram_gb_month_micros as f64;
-        (compute * self.multiplier(t)).round() as Money + self.monthly_disk(shape)
-    }
-    /// Monthly price of the disk alone.
-    pub fn monthly_disk(&self, shape: Shape) -> Money {
-        shape.disk as Money * self.disk_gb_month_micros
-    }
-}
-
-/// The billing month: 730 hours.
-pub const MINUTES_PER_MONTH: f64 = 730.0 * 60.0;
-
 // Well-known ports, headers and environment names shared by daemon, edge and gateway.
 pub const GATEWAY_PORT: u16 = 3737;
 pub const TERMINAL_PORT: u16 = 7681;
@@ -611,8 +457,6 @@ pub const ENV_GATEWAY_PORT: &str = "WARREN_GATEWAY_PORT";
 pub const ENV_AGENT_DRIVER: &str = "WARREN_AGENT_DRIVER";
 pub const ENV_AGENT_COMMAND: &str = "WARREN_AGENT_COMMAND";
 pub const ENV_MODEL: &str = "WARREN_MODEL";
-pub const ENV_BUDGET_MONTHLY: &str = "WARREN_BUDGET_MONTHLY_CAP_MICROS";
-pub const ENV_BUDGET_CREDIT: &str = "WARREN_BUDGET_CREDIT_MICROS";
 
 // Limits that do not depend on configuration.
 pub const MIN_IDLE_TIMEOUT_SEC: u32 = 300;

@@ -22,10 +22,10 @@
   </div>
   <nav id="nav" aria-label="Sections" hidden>
     <button type="button" id="nav-instances" class="navbtn" aria-current="page">Instances</button>
-    <button type="button" id="nav-billing" class="navbtn">Billing</button>
   </nav>
   <div id="who" class="who" hidden>
     <span id="workspace-name" class="small"></span>
+    <span id="workspace-awake" class="small muted" title="Awake instances against the workspace limit"></span>
     <code id="key-prefix" class="small muted" title="Stored in this browser's localStorage"></code>
     <button type="button" id="logout-btn" class="btn small">Log out</button>
   </div>
@@ -50,13 +50,13 @@
     <input id="signup-name" name="name" type="text" maxlength="80" placeholder="My workspace">
     <div class="row">
       <button type="submit" class="btn">Create workspace</button>
-      <span class="muted small">Creates a workspace with free credit and a fresh API key.</span>
+      <span class="muted small">Creates a workspace and a fresh API key.</span>
     </div>
   </form>
   <div id="signup-result" class="notice" hidden>
     <p><strong>Workspace created.</strong> This API key is shown once; store it somewhere safe.</p>
     <code id="signup-key" class="keybox"></code>
-    <p id="signup-wallet" class="small muted"></p>
+    <p id="signup-workspace" class="small muted"></p>
     <button type="button" id="signup-continue" class="btn primary">Continue to the dashboard</button>
   </div>
 </section>
@@ -109,7 +109,7 @@
           <label for="create-type">Type</label>
           <select id="create-type" name="type">
             <option value="default">default — gVisor container</option>
-            <option value="vm">vm — Firecracker microVM (2.5× compute)</option>
+            <option value="vm">vm — Firecracker microVM</option>
           </select>
         </div>
         <div class="field">
@@ -123,9 +123,6 @@
           <label class="check"><input id="create-auto-sleep" name="auto_sleep" type="checkbox"> Auto-sleep when idle</label>
           <label for="create-idle" class="small">Idle timeout (seconds, 300–86400)</label>
           <input id="create-idle" name="idle_timeout_seconds" type="number" min="300" max="86400" step="1" value="900" disabled>
-        </div>
-        <div class="field">
-          <p class="small muted" id="create-price">Price: —</p>
         </div>
         <p id="create-error" class="error span2" role="alert" hidden></p>
         <div class="row span2">
@@ -322,40 +319,6 @@
           <tbody id="backups-body"></tbody>
         </table>
       </section>
-    </section>
-
-    <!-- Billing -->
-    <section id="billing-panel" class="panel" aria-labelledby="billing-title" hidden>
-      <div class="row between">
-        <h2 id="billing-title">Billing</h2>
-        <button type="button" id="billing-refresh" class="btn small">Refresh</button>
-      </div>
-      <div class="tiles">
-        <div class="tile"><span class="tile-label">Wallet balance</span><strong id="billing-wallet" class="tile-value">—</strong></div>
-        <div class="tile"><span class="tile-label">Awake instances</span><strong id="billing-awake" class="tile-value">—</strong><span id="billing-awake-note" class="small muted"></span></div>
-        <div class="tile"><span class="tile-label">Total top-ups</span><strong id="billing-topups" class="tile-value">—</strong></div>
-        <div class="tile"><span class="tile-label">Free credit</span><strong id="billing-credit" class="tile-value">—</strong></div>
-      </div>
-      <p id="billing-rates" class="small muted"></p>
-
-      <section id="topup-section" aria-labelledby="topup-title" hidden>
-        <h3 id="topup-title" class="h3">Developer top-up</h3>
-        <form id="topup-form" class="row">
-          <label for="topup-amount">Amount (USD)</label>
-          <input id="topup-amount" type="number" min="5" max="10000" step="1" value="20" required>
-          <input type="hidden" id="topup-provider" value="dev">
-          <button type="submit" id="topup-submit" class="btn primary">Add funds (dev)</button>
-          <span class="muted small">The daemon runs in dev mode: funds are added without a payment provider.</span>
-        </form>
-        <p id="topup-error" class="error" role="alert" hidden></p>
-      </section>
-
-      <h3 class="h3">Ledger</h3>
-      <table class="table">
-        <thead><tr><th scope="col">When</th><th scope="col">Kind</th><th scope="col">Instance</th><th scope="col">Minutes</th><th scope="col">Amount</th><th scope="col">Note</th></tr></thead>
-        <tbody id="ledger-body"></tbody>
-      </table>
-      <p id="ledger-status" class="muted small" aria-live="polite"></p>
     </section>
   </section>
 </main>

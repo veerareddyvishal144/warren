@@ -34,7 +34,7 @@ make dev-up     # cargo build --release of the binaries, then warrend --dev on :
 target/release/warrend --dev --data-dir ./data
 ```
 
-The script accepts `--no-build` and `WARREN_PORT`, `WARREN_DATA_DIR`, `WARREN_BASE_DOMAIN`, `WARREN_LOG` and `WARREN_IMAGE_TAG` in the environment; flags after `--` go to `warrend`. `--dev` enables the `dev` top-up provider, lowers the minimum idle timeout to 5 seconds and keeps everything on `warren.localhost:7337`. The daemon prints `warrend listening` with the API URL when it is ready. Check it:
+The script accepts `--no-build` and `WARREN_PORT`, `WARREN_DATA_DIR`, `WARREN_BASE_DOMAIN`, `WARREN_LOG` and `WARREN_IMAGE_TAG` in the environment; flags after `--` go to `warrend`. `--dev` lowers the minimum idle timeout to 5 seconds, lets instances reach the host at `host.docker.internal`, and keeps everything on `warren.localhost:7337`. The daemon prints `warrend listening` with the API URL when it is ready. Check it:
 
 ```bash
 curl -s http://api.warren.localhost:7337/v1/health
@@ -52,10 +52,9 @@ curl -s -X POST $WARREN_API/signup -H 'Content-Type: application/json' -d '{"nam
 
 ```json
 {
-  "workspace": { "id": "ws_k3j2h4g5f6d7s8a9q0w1", "name": "my workspace", "wallet_micros": 5000000, "top_up_total_micros": 0, "free_credit_granted": true, "created_at": 1763000000 },
+  "workspace": { "id": "ws_k3j2h4g5f6d7s8a9q0w1", "name": "my workspace", "created_at": 1763000000 },
   "api_key": "sk_live_...",
-  "key_id": "...",
-  "wallet_micros": 5000000
+  "key_id": "..."
 }
 ```
 
@@ -65,8 +64,6 @@ The key is shown once. Keep it in a variable for the rest of this page:
 export WARREN_API_KEY=sk_live_...
 AUTH="Authorization: Bearer $WARREN_API_KEY"
 ```
-
-The $5 welcome credit (`wallet_micros: 5000000`) runs the smallest shape for about a month.
 
 ## 4. Create an instance
 
@@ -89,8 +86,6 @@ ID=$(curl -s $WARREN_API/instances -H "$AUTH" | jq -r '.data[0].id')
 until [ "$(curl -s $WARREN_API/instances/$ID -H "$AUTH" | jq -r .status)" = running ]; do sleep 1; done
 curl -s $WARREN_API/instances/$ID -H "$AUTH" | jq '{id, status, url, resources, runtime}'
 ```
-
-Nothing is charged until the instance first reaches `running`.
 
 ## 5. Run commands
 
@@ -165,21 +160,21 @@ Pass the returned `session_id` in the next request to continue the conversation,
 ## 9. Sleep, wake, stop, delete
 
 ```bash
-curl -s -X POST $WARREN_API/instances/$ID/sleep -H "$AUTH"      # {"id":"...","status":"sleeping"}: container stopped, disk kept, disk-only billing
+curl -s -X POST $WARREN_API/instances/$ID/sleep -H "$AUTH"      # {"id":"...","status":"sleeping"}: container stopped, disk kept
 curl -s http://$ID.warren.localhost:7337/v1/health -H "X-Warren-Key: $WARREN_API_KEY"   # held while the instance wakes, then answered
 curl -s -X POST $WARREN_API/instances/$ID/stop -H "$AUTH"       # {"id":"...","status":"stopping"}: never wakes on request
 curl -s -X POST $WARREN_API/instances/$ID/start -H "$AUTH"      # {"id":"...","status":"starting"}
-curl -s -X DELETE $WARREN_API/instances/$ID -H "$AUTH"          # {"id":"...","status":"deleting"}: disk removed, final minutes settled
+curl -s -X DELETE $WARREN_API/instances/$ID -H "$AUTH"          # {"id":"...","status":"deleting"}: disk removed
 ```
 
-## 10. Watch the money
+## 10. Check the awake quota
 
 ```bash
-curl -s $WARREN_API/billing -H "$AUTH" | jq '{wallet_micros, awake_limit, awake_count, rates}'
-curl -s "$WARREN_API/billing/ledger?limit=20" -H "$AUTH" | jq '.data[] | {kind, micros, minutes, instance_id}'
-curl -s -X POST $WARREN_API/billing/top-up -H "$AUTH" -H 'Content-Type: application/json' \
-  -d '{"amount_micros": 10000000, "provider": "dev"}'          # $10, dev mode only
+curl -s $WARREN_API/workspace -H "$AUTH" | jq '{awake_limit, awake_count}'
+# {"awake_limit":null,"awake_count":1}      null: the daemon runs without --max-awake-instances
 ```
+
+When the operator starts the daemon with `--max-awake-instances N`, create, start, wake and fork answer `409 instance_limit_reached` once `N` of the workspace's instances are awake; sleeping and stopped ones do not count. See [quotas.md](quotas.md).
 
 ## Next
 

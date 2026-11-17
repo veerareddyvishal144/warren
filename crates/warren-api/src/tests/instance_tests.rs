@@ -3,9 +3,9 @@
 
 use http::StatusCode;
 use serde_json::{Value, json};
-use warren_core::{Error, Signer};
+use warren_core::{Config, Error, InstanceStatus, Signer};
 
-use super::harness::{Harness, NOW, code, message};
+use super::harness::{Harness, NOW, code, message, test_config};
 
 fn id_of(v: &Value) -> String {
     v["id"].as_str().unwrap().to_string()
@@ -38,14 +38,7 @@ async fn create_instance_happy_path() {
     assert_eq!(v["url"], format!("http://{id}.warren.localhost:7337"));
     assert_eq!(v["created_at"], NOW);
     // Internal fields never leak.
-    for hidden in [
-        "instance_token",
-        "runtime_ref",
-        "ip",
-        "storage_path",
-        "metered_through",
-        "meter_carry_micros",
-    ] {
+    for hidden in ["instance_token", "runtime_ref", "ip", "storage_path"] {
         assert!(v.get(hidden).is_none(), "{hidden} leaked: {v}");
     }
     assert_eq!(h.lifecycle.calls(), vec!["create"]);
@@ -64,8 +57,7 @@ async fn create_instance_with_options() {
         "metadata": { "plan": "pro" },
         "auto_sleep": true,
         "idle_timeout_seconds": 600,
-        "network": "deny-all",
-        "budget": { "monthly_cap_micros": 1000, "credit_micros": 0 }
+        "network": "deny-all"
     });
     let v = h.create_instance(&acct.key, body).await;
     assert_eq!(v["name"], "Prod agent");
@@ -76,7 +68,7 @@ async fn create_instance_with_options() {
     assert_eq!(v["auto_sleep"], true);
     assert_eq!(v["idle_timeout_seconds"], 600);
     assert_eq!(v["network"], "deny-all");
-    assert_eq!(v["budget"]["monthly_cap_micros"], 1000);
+    assert!(v.get("budget").is_none(), "no budget on instances: {v}");
 }
 
 #[tokio::test]
@@ -145,11 +137,6 @@ async fn create_instance_validation_errors() {
             "shape",
         ),
         (
-            json!({ "budget": { "monthly_cap_micros": -1 } }),
-            "invalid_request",
-            "budget",
-        ),
-        (
             json!({ "name": "x".repeat(101) }),
             "invalid_request",
             "name",
@@ -203,17 +190,12 @@ async fn create_instance_validation_errors() {
 }
 
 #[tokio::test]
-async fn create_instance_propagates_billing_and_limit_errors() {
-    let h = Harness::new();
+async fn create_instance_propagates_limit_errors() {
+    let h = Harness::with_config(Config {
+        max_awake_instances: Some(1),
+        ..test_config()
+    });
     let acct = h.signup().await;
-    h.lifecycle
-        .fail_next_with(Error::insufficient_balance(1_000_000, 10));
-    let (status, v) = h
-        .call("POST", "/v1/instances", Some(&acct.key), Some(json!({})))
-        .await;
-    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
-    assert_eq!(code(&v), "insufficient_balance");
-    assert_eq!(v["error"]["details"]["required_micros"], 1_000_000);
     h.lifecycle.fail_next_with(Error::instance_limit(3, 3));
     let (status, v) = h
         .call("POST", "/v1/instances", Some(&acct.key), Some(json!({})))
@@ -229,18 +211,14 @@ async fn create_instance_propagates_billing_and_limit_errors() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(code(&v), "internal");
     assert!(v["error"].get("details").is_none(), "{v}");
-    // The fake biller's real rule: an empty wallet cannot create.
-    let poor = h.signup().await;
-    h.store
-        .lock()
-        .workspaces
-        .get_mut(&poor.workspace_id)
-        .unwrap()
-        .wallet_micros = 0;
+    // The fake lifecycle's real rule: the configured awake limit is enforced.
+    let id = id_of(&h.create_instance(&acct.key, json!({})).await);
+    h.store.lock().instances.get_mut(&id).unwrap().status = InstanceStatus::Running;
     let (status, v) = h
-        .call("POST", "/v1/instances", Some(&poor.key), Some(json!({})))
+        .call("POST", "/v1/instances", Some(&acct.key), Some(json!({})))
         .await;
-    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{v}");
+    assert_eq!(status, StatusCode::CONFLICT, "{v}");
+    assert_eq!(code(&v), "instance_limit_reached");
 }
 
 #[tokio::test]

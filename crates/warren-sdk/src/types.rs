@@ -1,11 +1,10 @@
 //! Response and request bodies of the two APIs that have no counterpart in
-//! `warren_core`. Everything else (instances, templates, keys, ledger entries,
-//! backups, crons, exec, the Agent API objects) is decoded straight into the
-//! core types.
+//! `warren_core`. Everything else (instances, templates, keys, backups, crons,
+//! exec, the Agent API objects) is decoded straight into the core types.
 
 use serde::{Deserialize, Serialize};
 use warren_core::agentapi::ResponseStatus;
-use warren_core::{ApiKey, InstanceStatus, LedgerEntry, Money, Rates, Shape, Workspace};
+use warren_core::{ApiKey, InstanceStatus, Shape, Workspace};
 
 /// `POST /v1/signup`: a new workspace with its first key, shown once.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -14,7 +13,6 @@ pub struct SignupResponse {
     /// The plaintext key; it is never shown again.
     pub api_key: String,
     pub key_id: String,
-    pub wallet_micros: Money,
 }
 
 /// `GET /v1/workspace`: the workspace plus its awake-instance counters.
@@ -22,8 +20,9 @@ pub struct SignupResponse {
 pub struct WorkspaceResponse {
     #[serde(flatten)]
     pub workspace: Workspace,
+    /// Instances the workspace may keep awake at once; `None` means unlimited.
     #[serde(default)]
-    pub awake_limit: u32,
+    pub awake_limit: Option<u32>,
     #[serde(default)]
     pub awake_count: u32,
 }
@@ -47,28 +46,6 @@ pub struct DeletedKey {
 pub struct DeletedTemplate {
     pub name: String,
     pub deleted: bool,
-}
-
-/// `GET /v1/billing`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BillingResponse {
-    pub wallet_micros: Money,
-    #[serde(default)]
-    pub top_up_total_micros: Money,
-    #[serde(default)]
-    pub awake_limit: u32,
-    #[serde(default)]
-    pub awake_count: u32,
-    pub rates: Rates,
-    #[serde(default)]
-    pub free_credit_granted: bool,
-}
-
-/// `POST /v1/billing/top-up`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TopUpResponse {
-    pub workspace: Workspace,
-    pub entry: LedgerEntry,
 }
 
 /// The `{ "id", "status" }` answer of stop, start, sleep, restart and delete.
@@ -113,7 +90,7 @@ pub struct HealthResponse {
     pub version: String,
     #[serde(default)]
     pub runtimes: Vec<String>,
-    /// True when the daemon runs with `--dev` (dev top-ups accepted).
+    /// True when the daemon runs with `--dev`.
     #[serde(default)]
     pub dev_mode: bool,
     /// Unix seconds.

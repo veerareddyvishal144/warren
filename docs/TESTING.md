@@ -15,11 +15,11 @@ source scripts/env.sh
 ## Unit tests
 
 Every crate tests itself with in-memory fakes of the traits it consumes
-(`Store`, `Runtime`, `Biller`, ...). Nothing here needs Docker.
+(`Store`, `Runtime`, ...). Nothing here needs Docker.
 
 ```bash
 cargo test --workspace --exclude warren-e2e          # everything (also: make test)
-cargo test -p warren-billing                         # one crate
+cargo test -p warren-core                            # one crate
 cargo test -p warren-e2e                             # the e2e harness's own unit tests only
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
@@ -40,7 +40,7 @@ unavailable.
 ## End-to-end suite
 
 `crates/warren-e2e/tests/e2e.rs` walks the whole contract against a real
-daemon: signup and billing, create/exec/edge auth, agent chat and streaming,
+daemon: signup and workspace, create/exec/edge auth, agent chat and streaming,
 the files API, lifecycle (stop/start/restart/sleep/wake/auto-sleep), fork,
 backup/restore, resize, update, the awake limit, crons and workspace templates
 (registered images with the injected gateway, see below).
@@ -70,7 +70,7 @@ cargo test -p warren-e2e -- --ignored --test-threads=1 --nocapture
 What the harness does for each test:
 
 - resolves the static gateway: `WARREN_GATEWAY_BIN`, else `<repo>/target/x86_64-unknown-linux-musl/release/warren-gateway`, else `<repo>/target-musl/x86_64-unknown-linux-musl/release/warren-gateway`, else the same path under `$CARGO_TARGET_DIR`; when none exists the daemon is not started and the error says how to build one;
-- picks a free port and starts `warrend --dev --listen [::]:PORT --public-port PORT --data-dir <tempdir>/data --base-domain warren.localhost --meter-interval 2s --min-idle-seconds 5 --gateway-bin <gateway> --log info`, capturing its output in `<tempdir>/warrend.log`;
+- picks a free port and starts `warrend --dev --listen [::]:PORT --public-port PORT --data-dir <tempdir>/data --base-domain warren.localhost --max-awake-instances 3 --min-idle-seconds 5 --gateway-bin <gateway> --log info`, capturing its output in `<tempdir>/warrend.log`;
 - waits for `GET http://api.warren.localhost:PORT/v1/health`;
 - builds its HTTP clients with `warren_sdk::client_with_resolve`, pinning `api.warren.localhost` and every instance hostname to `127.0.0.1`, so the tests never depend on the OS resolving `*.localhost`;
 - signs up a fresh workspace, runs the scenario with a 180 s wait for `running` and a 290 s budget per test, deletes the instances it created (also when the test failed or panicked), prints the daemon log tail on failure, and kills the daemon on drop (SIGTERM, then SIGKILL after 15 s).
@@ -123,10 +123,10 @@ If a test is killed before cleanup, leftover containers are visible with
 remove them with `docker rm -f <container>`. Temp directories live under
 `$TMPDIR/warren-e2e-*`.
 
-The `402 insufficient_balance` path is not exercised end to end: a fresh wallet
-holds $5 and creating a 2 vCPU / 4 GB / 4 GB instance needs about $0.16 (one
-day of rate), so the awake limit always trips first. `warren-billing` covers
-the balance rule and the exhausted-wallet stop with unit tests.
+The awake limit the suite exercises is the daemon's `--max-awake-instances`
+(`WARREN_MAX_AWAKE_INSTANCES`); the harness starts every daemon with 3, and
+`GET /v1/workspace` reports it as `awake_limit` (`null` when unset, meaning
+unlimited) next to `awake_count`.
 
 ## Troubleshooting the e2e suite
 
@@ -181,7 +181,7 @@ that message in the log tail.
 
 ## Dashboard smoke test (real browser)
 
-`scripts/dashboard-smoke.mjs` drives the embedded dashboard in headless Chrome against a dev daemon it starts itself: signup through the UI, create an instance from the form, wait for `running`, run a command in the exec console, open the billing panel, delete the instance. It fails on any browser console error, page error or failed request.
+`scripts/dashboard-smoke.mjs` drives the embedded dashboard in headless Chrome against a dev daemon it starts itself: signup through the UI, create an instance from the form, wait for `running`, run a command in the exec console, delete the instance. It fails on any browser console error, page error or failed request.
 
 ```bash
 make build                          # release binaries and the static gateway
@@ -216,21 +216,17 @@ export BASE=warren.localhost:7337
 curl -s $API/health | jq .                      # {"healthy":true,"version":...,"runtimes":["docker"],...}
 curl -s $API/version | jq .
 curl -s -X POST $API/signup -H 'content-type: application/json' -d '{"name":"demo"}' | tee /tmp/signup.json | jq .
-export KEY=$(jq -r .api_key /tmp/signup.json)   # sk_live_..., shown once; the wallet holds the $5 free credit
+export KEY=$(jq -r .api_key /tmp/signup.json)   # sk_live_..., shown once (201: workspace, api_key, key_id)
 ```
 
-### Workspace, keys, billing
+### Workspace and keys
 
 ```bash
-curl -s $API/workspace -H "authorization: bearer $KEY" | jq .          # awake_limit 3, awake_count 0
+curl -s $API/workspace -H "authorization: bearer $KEY" | jq .          # awake_limit (number, or null when --max-awake-instances is unset), awake_count 0
 curl -s $API/api-keys -H "authorization: bearer $KEY" | jq .
 curl -s -X POST $API/api-keys -H "authorization: bearer $KEY" -H 'content-type: application/json' \
   -d '{"name":"ci"}' | tee /tmp/key.json | jq .
 curl -s -X DELETE $API/api-keys/$(jq -r .key.id /tmp/key.json) -H "authorization: bearer $KEY" | jq .
-curl -s $API/billing -H "authorization: bearer $KEY" | jq .            # wallet_micros 5000000, rates, free_credit_granted
-curl -s -X POST $API/billing/top-up -H "authorization: bearer $KEY" -H 'content-type: application/json' \
-  -d '{"amount_micros":10000000,"provider":"dev"}' | jq .              # dev mode only; awake_limit becomes 10
-curl -s "$API/billing/ledger?limit=100" -H "authorization: bearer $KEY" | jq .  # credit, topup, later compute/disk
 curl -s $API/workspace -H "x-warren-key: $KEY" | jq .awake_limit       # X-Warren-Key works too
 ```
 
@@ -341,7 +337,7 @@ curl -s -i "http://$ID.$BASE/v1/files/content?path=../../etc/passwd" -H "x-warre
 ```bash
 curl -s -X POST $API/instances/$ID/stop -H "authorization: bearer $KEY" | jq .      # stopping -> stopped; URL answers 409
 curl -s -X POST $API/instances/$ID/start -H "authorization: bearer $KEY" | jq .     # starting -> running (enforces the awake limit)
-curl -s -X POST $API/instances/$ID/sleep -H "authorization: bearer $KEY" | jq .     # sleeping now; disk-only billing
+curl -s -X POST $API/instances/$ID/sleep -H "authorization: bearer $KEY" | jq .     # sleeping now; does not count as awake
 curl -s http://$ID.$BASE/v1/health -H "x-warren-key: $KEY" | jq .                   # held while the instance wakes, then 200
 curl -s $API/instances/$ID -H "authorization: bearer $KEY" | jq .status             # running
 curl -s -X POST $API/instances/$ID/restart -H "authorization: bearer $KEY" | jq .
@@ -396,7 +392,7 @@ curl -s -X DELETE $API/instances/$ID/crons/$CID -H "authorization: bearer $KEY" 
 
 ```bash
 for i in 1 2 3 4; do curl -s -X POST $API/instances -H "authorization: bearer $KEY" -H 'content-type: application/json' \
-  -d '{"template":"warren-base"}' | jq -c '{id,status,error}'; done   # the 4th awake instance on the free tier: 409 instance_limit_reached
+  -d '{"template":"warren-base"}' | jq -c '{id,status,error}'; done   # with --max-awake-instances 3 the 4th awake instance: 409 instance_limit_reached
 curl -s -X POST $API/instances -H "authorization: bearer $KEY" -H 'content-type: application/json' \
   -d '{"template":"warren-base","type":"performance"}' | jq .error.code   # not_supported
 curl -s -X POST $API/instances -H "authorization: bearer $KEY" -H 'content-type: application/json' \
@@ -414,4 +410,4 @@ curl -s -X DELETE $API/templates/my-alpine -H "authorization: bearer $KEY" | jq 
 
 The dashboard at `http://warren.localhost:7337/` drives the same API from a
 browser: paste the key, create instances, open the terminal through a signed
-URL, chat, exec and top up.
+URL, chat and exec.

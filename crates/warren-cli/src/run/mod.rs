@@ -83,7 +83,6 @@ pub async fn run(cli: Cli) -> Result<i32, Failure> {
         Command::Whoami => account::whoami(&ctx).await,
         Command::Health => account::health(&ctx).await,
         Command::Keys { cmd } => account::keys(&ctx, cmd).await,
-        Command::Billing { cmd } => account::billing(&ctx, cmd).await,
         Command::Templates { cmd } => templates::run(&ctx, cmd).await,
         Command::Instances { cmd } => instances::run(&ctx, cmd).await,
         Command::Chat(args) => agent::chat(&ctx, args).await,

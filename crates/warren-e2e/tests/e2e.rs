@@ -19,9 +19,8 @@ use reqwest::Method;
 use serde_json::{Value, json};
 use warren_core::{
     COOKIE_NAME, Config, CreateInstanceRequest, ENV_AGENT_DRIVER, Error, ExecRequest, ForkRequest,
-    GATEWAY_PORT, Instance, InstanceStatus, InstanceType, LedgerKind, MICROS_PER_DOLLAR,
-    PatchInstanceRequest, RegisterTemplateRequest, Result, Shape, ShapeRequest, TERMINAL_PORT,
-    TemplateScope,
+    GATEWAY_PORT, Instance, InstanceStatus, InstanceType, PatchInstanceRequest,
+    RegisterTemplateRequest, Result, Shape, ShapeRequest, TERMINAL_PORT, TemplateScope,
     agentapi::{EVENT_COMPLETED, EVENT_CREATED, EVENT_DELTA, ResponseStatus, ResponsesRequest},
     errors::{
         CODE_CONFLICT, CODE_FORBIDDEN, CODE_INSTANCE_LIMIT_REACHED, CODE_INVALID_API_KEY,
@@ -29,7 +28,7 @@ use warren_core::{
     },
 };
 use warren_e2e::{
-    Auth, Daemon, METER_INTERVAL, SdkError, SseEvent, TRANSITION_TIMEOUT, Workspace, ensure,
+    Auth, Daemon, MAX_AWAKE_INSTANCES, SdkError, SseEvent, TRANSITION_TIMEOUT, Workspace, ensure,
     event_names, expect_status, fail, header, now_unix, poll_until, session_cookie,
 };
 use warren_sdk::{CronPatchRequest, CronRequest, EventStream, SignupResponse};
@@ -187,15 +186,15 @@ async fn ensure_running(ws: &Workspace, id: &str) -> Result<Instance> {
 }
 
 // ---------------------------------------------------------------------------
-// signup_and_billing
+// signup_and_workspace
 
 #[tokio::test]
 #[ignore]
-async fn signup_and_billing() {
-    run_case("signup_and_billing", signup_and_billing_body).await
+async fn signup_and_workspace() {
+    run_case("signup_and_workspace", signup_and_workspace_body).await
 }
 
-async fn signup_and_billing_body(cx: Ctx) -> Result<()> {
+async fn signup_and_workspace_body(cx: Ctx) -> Result<()> {
     let sdk = cx.ws.sdk();
 
     // Health and version need no key.
@@ -207,7 +206,8 @@ async fn signup_and_billing_body(cx: Ctx) -> Result<()> {
     );
     ensure!(!sdk.version().await?.is_empty(), "version should be set");
 
-    // Signup granted the free credit once.
+    // Signup answered 201 with the workspace, its first key (shown once) and
+    // the id of that key.
     let signup = &cx.signup;
     ensure!(
         signup.api_key.starts_with("sk_live_") && signup.api_key.len() == 48,
@@ -219,40 +219,30 @@ async fn signup_and_billing_body(cx: Ctx) -> Result<()> {
         "workspace id: {}",
         signup.workspace.id
     );
+    ensure!(
+        !signup.workspace.name.is_empty() && signup.workspace.created_at > 0,
+        "workspace fields: {:?}",
+        signup.workspace
+    );
     ensure!(!signup.key_id.is_empty(), "key_id missing: {signup:?}");
+    let keys = sdk.api_keys().await?;
     ensure!(
-        signup.wallet_micros == 5 * MICROS_PER_DOLLAR,
-        "free credit should be $5, got {} micros",
-        signup.wallet_micros
+        keys.len() == 1 && keys[0].id == signup.key_id,
+        "key_id names the workspace's only key: {keys:?}"
     );
-    let billing = sdk.billing().await?;
+
+    // whoami: the workspace plus the daemon's awake quota and the awake count.
+    let whoami = sdk.workspace().await?;
     ensure!(
-        billing.free_credit_granted,
-        "free_credit_granted: {billing:?}"
-    );
-    ensure!(
-        billing.wallet_micros == 5 * MICROS_PER_DOLLAR,
-        "wallet: {billing:?}"
-    );
-    ensure!(
-        billing.awake_limit == 3,
-        "the awake limit before any top-up is 3: {billing:?}"
+        whoami.workspace.id == signup.workspace.id
+            && whoami.workspace.name == signup.workspace.name,
+        "GET /v1/workspace returns the signed-up workspace: {whoami:?}"
     );
     ensure!(
-        billing.awake_count == 0 && billing.top_up_total_micros == 0,
-        "fresh counters: {billing:?}"
+        whoami.awake_limit == Some(MAX_AWAKE_INSTANCES),
+        "awake_limit is the daemon's --max-awake-instances ({MAX_AWAKE_INSTANCES}): {whoami:?}"
     );
-    ensure!(
-        billing.rates.vcpu_month_micros > 0 && billing.rates.disk_gb_month_micros > 0,
-        "rates: {billing:?}"
-    );
-    let ledger = sdk.ledger(100).await?;
-    ensure!(
-        ledger
-            .iter()
-            .any(|e| e.kind == LedgerKind::Credit && e.micros == 5 * MICROS_PER_DOLLAR),
-        "the ledger should hold the free credit entry: {ledger:?}"
-    );
+    ensure!(whoami.awake_count == 0, "nothing is awake yet: {whoami:?}");
 
     // Keys: a bad key is 401; a second key works until it is deleted.
     let bogus = format!("sk_live_{}", "x".repeat(40));
@@ -284,7 +274,7 @@ async fn signup_and_billing_body(cx: Ctx) -> Result<()> {
         "the new key maps to the same workspace: {workspace:?}"
     );
     ensure!(
-        workspace.awake_limit == 3 && workspace.awake_count == 0,
+        workspace.awake_limit == Some(MAX_AWAKE_INSTANCES) && workspace.awake_count == 0,
         "workspace counters: {workspace:?}"
     );
     let deleted = sdk.delete_api_key(&created.key.id).await?;
@@ -303,100 +293,14 @@ async fn signup_and_billing_body(cx: Ctx) -> Result<()> {
         "one key after deleting the second"
     );
 
-    // A dev top-up of 10 USD raises the awake limit to 10 and lands in the ledger.
-    expect_api_error(
-        "top-up below the minimum",
-        sdk.top_up(MICROS_PER_DOLLAR, Some("dev")).await,
-        400,
-        CODE_INVALID_REQUEST,
-    )?;
-    expect_api_error(
-        "unknown provider",
-        sdk.top_up(10 * MICROS_PER_DOLLAR, Some("card")).await,
-        400,
-        CODE_NOT_SUPPORTED,
-    )?;
-    let topup = sdk.top_up(10 * MICROS_PER_DOLLAR, Some("dev")).await?;
-    ensure!(
-        topup.entry.kind == LedgerKind::Topup && topup.entry.micros == 10 * MICROS_PER_DOLLAR,
-        "top-up entry: {:?}",
-        topup.entry
-    );
-    ensure!(
-        topup.workspace.wallet_micros == 15 * MICROS_PER_DOLLAR,
-        "wallet after top-up: {:?}",
-        topup.workspace
-    );
-    ensure!(
-        topup.workspace.top_up_total_micros == 10 * MICROS_PER_DOLLAR,
-        "top-up total: {:?}",
-        topup.workspace
-    );
-    let billing = sdk.billing().await?;
-    ensure!(
-        billing.awake_limit == 10,
-        "the awake limit after the first top-up is 10: {billing:?}"
-    );
-    ensure!(
-        billing.wallet_micros == 15 * MICROS_PER_DOLLAR
-            && billing.top_up_total_micros == 10 * MICROS_PER_DOLLAR,
-        "billing: {billing:?}"
-    );
-    ensure!(
-        sdk.workspace().await?.awake_limit == 10,
-        "workspace view agrees on the limit"
-    );
-    let ledger = sdk.ledger(100).await?;
-    ensure!(
-        ledger
-            .iter()
-            .any(|e| e.kind == LedgerKind::Topup && e.micros == 10 * MICROS_PER_DOLLAR),
-        "the ledger should hold the top-up: {ledger:?}"
-    );
-    ensure!(
-        ledger.len() >= 2 && ledger[0].at >= ledger[ledger.len() - 1].at,
-        "the ledger is newest first: {ledger:?}"
-    );
-
-    // A running instance produces compute entries. The meter ticks every
-    // METER_INTERVAL but charges whole minutes, so the first entry lands about a
-    // minute after the instance first reached running.
+    // awake_count tracks a running instance and drops back once it is deleted;
+    // the limit itself never moves.
     let inst = cx.ws.create_and_wait("warren-base", &[]).await?;
-    ensure!(
-        inst.meter_started_at > 0,
-        "meter_started_at is set once running: {inst:?}"
-    );
-    ensure!(
-        sdk.workspace().await?.awake_count == 1,
-        "one awake instance"
-    );
     let id = inst.id.as_str();
-    let entry = poll_until(
-        "a compute ledger entry",
-        Duration::from_secs(150),
-        2 * METER_INTERVAL,
-        || async move {
-            let ledger = sdk.ledger(200).await?;
-            Ok::<_, Error>(
-                ledger
-                    .into_iter()
-                    .find(|e| e.kind == LedgerKind::Compute && e.instance_id == id),
-            )
-        },
-    )
-    .await?;
+    let whoami = sdk.workspace().await?;
     ensure!(
-        entry.micros < 0 && entry.minutes >= 1.0,
-        "compute entries are negative whole minutes: {entry:?}"
-    );
-    let billing = sdk.billing().await?;
-    ensure!(
-        billing.wallet_micros < 15 * MICROS_PER_DOLLAR,
-        "the wallet decreased: {billing:?}"
-    );
-    ensure!(
-        billing.wallet_micros > 14 * MICROS_PER_DOLLAR,
-        "a minute of 2 vCPU / 4 GB costs far less than a dollar: {billing:?}"
+        whoami.awake_count == 1 && whoami.awake_limit == Some(MAX_AWAKE_INSTANCES),
+        "one awake instance, the limit unchanged: {whoami:?}"
     );
     let _ = sdk.metrics(id, 1).await?;
     cx.ws.delete_and_wait(id).await?;
@@ -404,11 +308,6 @@ async fn signup_and_billing_body(cx: Ctx) -> Result<()> {
         sdk.workspace().await?.awake_count == 0,
         "deleted instances do not count"
     );
-
-    // The 402 insufficient_balance path cannot be reached here: a fresh wallet
-    // holds $5 and creating 2 vCPU / 4 GB / 4 GB needs about $0.16 (one day of
-    // rate), so the awake limit trips long before the balance does. warren-billing
-    // covers the balance rule and the exhausted-wallet stop with unit tests.
     Ok(())
 }
 
@@ -1474,27 +1373,32 @@ async fn limits_body(cx: Ctx) -> Result<()> {
         template: Some("warren-base".into()),
         ..Default::default()
     };
+    ensure!(
+        sdk.workspace().await?.awake_limit == Some(MAX_AWAKE_INSTANCES),
+        "the daemon runs with --max-awake-instances {MAX_AWAKE_INSTANCES}"
+    );
     let mut ids = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..MAX_AWAKE_INSTANCES {
         ids.push(sdk.create_instance(&req).await?.id);
     }
     ensure!(
-        sdk.workspace().await?.awake_count == 3,
+        sdk.workspace().await?.awake_count == MAX_AWAKE_INSTANCES,
         "provisioning instances count as awake"
     );
 
-    // The fourth awake instance is refused on the free tier, with details.
+    // One more awake instance is refused by the daemon's quota, with details.
     match sdk.create_instance(&req).await {
         Err(e) if e.status() == Some(409) && e.code() == Some(CODE_INSTANCE_LIMIT_REACHED) => {
             let details = e.api().and_then(|a| a.details.clone()).unwrap_or_default();
             ensure!(
-                details["limit"] == 3 && details["awake"] == 3,
+                details["limit"] == MAX_AWAKE_INSTANCES && details["awake"] == MAX_AWAKE_INSTANCES,
                 "limit details: {details}"
             );
         }
         other => {
             return Err(fail(format!(
-                "the fourth instance should be 409 instance_limit_reached, got {other:?}"
+                "instance {} should be 409 instance_limit_reached, got {other:?}",
+                MAX_AWAKE_INSTANCES + 1
             )));
         }
     }
@@ -1502,19 +1406,19 @@ async fn limits_body(cx: Ctx) -> Result<()> {
         cx.ws.wait_running(id).await?;
     }
 
-    // Stopping one frees a slot; starting it again while four are awake is refused.
+    // Stopping one frees a slot; starting it again while the quota is full is refused.
     sdk.stop(&ids[0]).await?;
     cx.ws
         .wait_for_status(&ids[0], InstanceStatus::Stopped, TRANSITION_TIMEOUT)
         .await?;
     ensure!(
-        sdk.workspace().await?.awake_count == 2,
-        "two awake after a stop"
+        sdk.workspace().await?.awake_count == MAX_AWAKE_INSTANCES - 1,
+        "one slot free after a stop"
     );
-    let fourth = sdk.create_instance(&req).await?;
+    let next = sdk.create_instance(&req).await?;
     ensure!(
-        fourth.status.awake(),
-        "the new instance is awake: {fourth:?}"
+        next.status.awake(),
+        "the new instance takes the freed slot: {next:?}"
     );
     expect_api_error(
         "start over the limit",
@@ -1522,7 +1426,7 @@ async fn limits_body(cx: Ctx) -> Result<()> {
         409,
         CODE_INSTANCE_LIMIT_REACHED,
     )?;
-    cx.ws.wait_running(&fourth.id).await?;
+    cx.ws.wait_running(&next.id).await?;
     Ok(())
 }
 

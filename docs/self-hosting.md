@@ -4,7 +4,7 @@ Warren runs as one process on one Linux host. This page sets it up for real use:
 
 ## 1. Host
 
-Size the machine for the instances you want awake at once: their vCPUs and RAM add up (the daemon enforces CPU and memory limits per container), plus about 1 GB for Docker and the daemon. Put the data directory on a volume with room for every instance's disk, the backups and the images (about 700 MB for `warren/base`). The host needs outbound internet for image builds and for instances with `allow-all`.
+Size the machine for the instances you want awake at once: their vCPUs and RAM add up (the daemon enforces CPU and memory limits per container), plus about 1 GB for Docker and the daemon; set `--max-awake-instances` ([quotas.md](quotas.md)) so one workspace cannot take all of it. Put the data directory on a volume with room for every instance's disk, the backups and the images (about 700 MB for `warren/base`). The host needs outbound internet for image builds and for instances with `allow-all`.
 
 ## 2. Docker
 
@@ -71,11 +71,10 @@ WARREN_RUNTIME=runsc                    # auto | runsc | runc
 WARREN_IMAGE_TAG=prod
 WARREN_REGION=fra1                      # label reported on instances
 WARREN_LOG=info                         # tracing filter, e.g. info,warren_edge=debug
-# WARREN_DEV=false                      # never true in production: it enables free dev top-ups
+# WARREN_DEV=false                      # never true in production: 5 s idle timeouts, host.docker.internal
 # WARREN_SECRET=                        # generated into <data>/secret when unset
-# WARREN_FREE_CREDIT_MICROS=5000000     # welcome credit per signup
+# WARREN_MAX_AWAKE_INSTANCES=           # awake instances per workspace; unset = unlimited
 # WARREN_MIN_IDLE_SECONDS=300           # lowest idle timeout instances may ask for
-# WARREN_METER_INTERVAL=60s
 # WARREN_ENABLE_FIRECRACKER=false       # see vm-instances.md
 # WARREN_FIRECRACKER_BIN=/usr/local/bin/firecracker
 # WARREN_KERNEL_IMAGE=
@@ -90,11 +89,10 @@ WARREN_LOG=info                         # tracing filter, e.g. info,warren_edge=
 | `WARREN_DATA_DIR` | `--data-dir` | `/var/lib/warren` | Everything persistent |
 | `WARREN_RUNTIME` | `--runtime` | `auto` | Docker OCI runtime for `default` instances |
 | `WARREN_REGION` | `--region` | `local` | Reported on instances; the multi-node scheduler will use it |
-| `WARREN_DEV` | `--dev` | `false` | Dev top-ups, 5 s minimum idle timeout |
-| `WARREN_FREE_CREDIT_MICROS` | `--free-credit-micros` | `5000000` | Set `0` to grant nothing |
+| `WARREN_DEV` | `--dev` | `false` | 5 s minimum idle timeout and `host.docker.internal` inside instances; never in production |
+| `WARREN_MAX_AWAKE_INSTANCES` | `--max-awake-instances` | unset | Cap on awake instances per workspace; unset means unlimited ([quotas.md](quotas.md)) |
 | `WARREN_MIN_IDLE_SECONDS` | `--min-idle-seconds` | `300` (5 in dev) | |
 | `WARREN_SECRET` | `--secret` | generated | Rotating it invalidates every signed URL and cookie |
-| `WARREN_METER_INTERVAL` | `--meter-interval` | `60s` | |
 | `WARREN_IMAGE_TAG` | `--image-tag` | `dev` | Tag of the built-in images |
 | `WARREN_ENABLE_FIRECRACKER`, `WARREN_FIRECRACKER_BIN`, `WARREN_KERNEL_IMAGE` | `--firecracker`, `--firecracker-bin`, `--kernel` | off | [vm-instances.md](vm-instances.md) |
 | `WARREN_GATEWAY_BIN` | `--gateway-bin` | next to `warrend`, else `/usr/local/bin/warren-gateway` | Static gateway injected into registered images |
@@ -102,14 +100,14 @@ WARREN_LOG=info                         # tracing filter, e.g. info,warren_edge=
 | `WARREN_ALLOW_PRIVATE_EGRESS` | `--allow-private-egress` | `false` | Lets instances reach RFC 1918 ranges and the host; 169.254.0.0/16 stays blocked |
 | `WARREN_LOG` | `--log` | `info` | tracing `EnvFilter` syntax |
 
-Signup is on by default (`POST /v1/signup` needs no auth and grants the free credit) and limited to 10 signups per client IP per hour. On a public host either turn it off with `--signup-enabled false` and create workspaces through your own flow, or set `WARREN_FREE_CREDIT_MICROS=0` so anonymous signups cost you nothing.
+Signup is on by default (`POST /v1/signup` needs no auth) and limited to 10 signups per client IP per hour. On a public host turn it off with `--signup-enabled false` and create workspaces through your own flow, and set `WARREN_MAX_AWAKE_INSTANCES` so an anonymous workspace cannot take the whole host.
 
 ## 6. systemd
 
 ```ini
 # /etc/systemd/system/warrend.service
 [Unit]
-Description=Warren daemon (sandbox API, edge, lifecycle, metering, cron)
+Description=Warren daemon (sandbox API, edge, lifecycle, cron)
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
@@ -135,7 +133,7 @@ sudo journalctl -u warrend -f
 curl -s http://127.0.0.1:7337/v1/health -H 'Host: api.warren.example.com'
 ```
 
-On `SIGTERM` the daemon stops its loops and the listener; containers keep running under Docker, and the reconciler adopts them at the next start, fixing any transitional states and resuming the meter from `metered_through`. Restarting the daemon therefore does not restart instances.
+On `SIGTERM` the daemon stops its loops and the listener; containers keep running under Docker, and the reconciler adopts them at the next start, fixing any transitional states. Restarting the daemon therefore does not restart instances.
 
 ## 7. DNS and TLS
 
@@ -217,7 +215,7 @@ tar czf "$BK/instances.tar.gz" -C /var/lib/warren instances         # live homes
 tar czf "$BK/backups.tar.gz"   -C /var/lib/warren backups
 ```
 
-- `warren.db` holds workspaces, key hashes, templates, instances, ledger, crons, metrics and backup records. Never copy it with plain `cp` while the daemon runs; use `.backup` or stop the daemon.
+- `warren.db` holds workspaces, key hashes, templates, instances, crons, metrics and backup records. Never copy it with plain `cp` while the daemon runs; use `.backup` or stop the daemon.
 - `secret` signs URLs and cookies. Losing it only invalidates outstanding signed URLs; leaking it lets anyone mint them, so keep the backup as private as the host.
 - `instances/<id>/home` is the users' data. For a crash-consistent copy of a busy instance, take a Warren backup (`POST /v1/instances/{id}/backups`, which archives the home without stopping it) and include `backups/` in the host backup.
 - Instance disks and the VM rootfs images are plain files; filesystem snapshots (ZFS, btrfs, LVM) of the data directory are the simplest whole-host backup.

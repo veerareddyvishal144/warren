@@ -87,6 +87,4 @@ pub trait Backend: Send + Sync + 'static {
     ) -> impl Future<Output = Result<SignedUrl>> + Send;
     /// `GET /v1/templates`.
     fn list_templates(&self) -> impl Future<Output = Result<Vec<Template>>> + Send;
-    /// `GET /v1/billing`, passed through as JSON.
-    fn billing(&self) -> impl Future<Output = Result<serde_json::Value>> + Send;
 }

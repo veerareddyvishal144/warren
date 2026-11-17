@@ -162,8 +162,4 @@ impl Backend for SdkBackend {
     async fn list_templates(&self) -> Result<Vec<Template>> {
         Ok(self.client.templates().await?)
     }
-
-    async fn billing(&self) -> Result<serde_json::Value> {
-        Ok(serde_json::to_value(self.client.billing().await?)?)
-    }
 }

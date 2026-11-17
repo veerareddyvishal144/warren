@@ -14,7 +14,7 @@ Environment
 - API key: sk_live_...                                        (replace; never print it or write it to files)
 - Auth on the Sandbox API: `Authorization: Bearer <key>`. Auth on instance URLs: `X-Warren-Key: <key>`.
 - Every response body is JSON; lists are `{"data":[...]}`; errors are `{"error":{"code","message","details"}}`.
-  Codes: invalid_request 400, not_supported 400, invalid_api_key 401, insufficient_balance 402, forbidden 403,
+  Codes: invalid_request 400, not_supported 400, invalid_api_key 401, forbidden 403,
   not_found 404, conflict 409, instance_limit_reached 409, internal 500, bad_gateway 502, try_again 503, timeout 504. Unknown JSON fields are rejected.
 
 Instances
@@ -27,15 +27,16 @@ Instances
   DELETE /v1/files?path=f  POST /v1/files/move {"from","to"}  GET /v1/files/download?path=dir (tar.gz).
 - Anything listening on port P inside the instance is reachable at http://{id}-P.<base>/ with the X-Warren-Key header.
   For a browser or a human: GET /instances/{id}/signed-url?port=P&ttl=3600 -> {"url"}; share that URL instead of the key.
-- Lifecycle: POST /instances/{id}/stop | start | sleep | restart; DELETE /instances/{id}. Sleeping instances wake on any request and bill disk only;
+- Lifecycle: POST /instances/{id}/stop | start | sleep | restart; DELETE /instances/{id}. Sleeping instances wake on any request and keep only their disk;
   stopped ones answer 409 until started. Processes and packages outside /home/agent are lost on sleep, stop and restart; files in /home/agent persist.
 - Agent templates (warren-agent, warren-opencode) answer POST {url}/v1/responses {"input":"...", "session_id"?, "stream"?} with
   {"id","session_id","status","output_text"}; pass session_id back to continue a conversation.
 
-Money and limits
-- Prepaid wallet in micro-dollars (1,000,000 = $1); signup grants $5. A 2 vCPU / 4 GB / 4 GB instance costs $4.76 a month running, $0.36 sleeping.
-  Creating needs one day of the running rate in the wallet. At most 3 instances may be awake before any top-up.
-- Prefer one instance per task, "auto_sleep": true, and DELETE instances you no longer need. Check GET /billing when you get 402 or 409 instance_limit_reached.
+Limits
+- The operator may cap how many instances a workspace keeps awake at once. GET /workspace -> {"awake_limit": N | null, "awake_count": n};
+  null means unlimited. Sleeping and stopped instances do not count. Create, start, wake and fork answer 409 instance_limit_reached at the cap.
+- Prefer one instance per task, "auto_sleep": true, and DELETE instances you no longer need. On 409 instance_limit_reached, sleep or delete an
+  instance you are done with, then retry.
 
 Working style
 - Do the work inside the instance with exec; keep outputs under /home/agent and read them back with the files API.
@@ -66,7 +67,7 @@ cargo build --release -p warren-mcp && install -m 755 target/release/warren-mcp 
 claude mcp add warren -e WARREN_API_URL=http://api.warren.localhost:7337 -e WARREN_API_KEY=sk_live_... -- warren-mcp
 ```
 
-Tools: `create_instance`, `exec`, `read_file`, `write_file`, `list_files`, `chat`, `signed_url`, `stop_instance`, `start_instance`, `sleep_instance`, `delete_instance`, `list_instances`, `get_instance`, `list_templates`, `billing`. See [mcp/README.md](../mcp/README.md) for Cursor, Claude Desktop and Windsurf.
+Tools: `create_instance`, `exec`, `read_file`, `write_file`, `list_files`, `chat`, `signed_url`, `stop_instance`, `start_instance`, `sleep_instance`, `delete_instance`, `list_instances`, `get_instance`, `list_templates`. See [mcp/README.md](../mcp/README.md) for Cursor, Claude Desktop and Windsurf.
 
 ## What agents get wrong
 

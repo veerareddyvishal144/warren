@@ -230,7 +230,7 @@ test("WarrenError.fromBody decodes the envelope, bare objects and plain text", (
 
 test("codeForStatus maps bare statuses", () => {
   assert.equal(codeForStatus(400), "invalid_request");
-  assert.equal(codeForStatus(402), "insufficient_balance");
+  assert.equal(codeForStatus(401), "invalid_api_key");
   assert.equal(codeForStatus(403), "forbidden");
   assert.equal(codeForStatus(503), "try_again");
   assert.equal(codeForStatus(504), "timeout");
@@ -314,8 +314,9 @@ test("query strings and path segments are encoded", async () => {
   assert.equal(u.searchParams.get("ttl"), "3600");
   assert.equal(u.searchParams.get("path"), "/a b");
 
-  await w.ledger(5);
-  assert.equal(r.last().url, `${API_URL}/v1/billing/ledger?limit=5`);
+  const ws = await w.workspace();
+  assert.equal(r.last().url, `${API_URL}/v1/workspace`);
+  assert.equal(ws.awake_limit, undefined); // the recorder answers {} by default
 
   await w.getTemplate("my-agent@2");
   assert.equal(r.last().url, `${API_URL}/v1/templates/my-agent@2`);
@@ -332,7 +333,7 @@ test("lists are unwrapped and signup works without a key", async () => {
   const r = recorder(
     json(200, { data: [{ id: "a" }, { id: "b" }] }),
     json(200, { data: [{ at: 1, cpu_percent: 0.5, memory_bytes: 1, disk_bytes: 2 }] }),
-    json(201, { workspace: { id: "ws_x" }, api_key: "sk_live_x", key_id: "k", wallet_micros: 5_000_000 }),
+    json(201, { workspace: { id: "ws_x" }, api_key: "sk_live_x", key_id: "k" }),
   );
   const w = new Warren(API_URL, KEY, { fetch: r.fetchImpl });
   assert.deepEqual((await w.listInstances()).map((i) => i.id), ["a", "b"]);
@@ -359,13 +360,13 @@ test("exec accepts a string or a request and extends the timeout", async () => {
 });
 
 test("non-2xx answers reject with the decoded WarrenError", async () => {
-  const body = { error: { code: "insufficient_balance", message: "Wallet balance is below the required.", details: { required_micros: 1, balance_micros: 0 } } };
-  const r = recorder(json(402, body), text(502, "this template has no default port\n"));
+  const body = { error: { code: "instance_limit_reached", message: "This workspace may keep 3 instances awake at once and 3 are awake.", details: { limit: 3, awake: 3 } } };
+  const r = recorder(json(409, body), text(502, "this template has no default port\n"));
   const w = new Warren(API_URL, KEY, { fetch: r.fetchImpl });
   const e = await rejects(w.createInstance());
-  assert.equal(e.code, "insufficient_balance");
-  assert.equal(e.status, 402);
-  assert.deepEqual(e.details, { required_micros: 1, balance_micros: 0 });
+  assert.equal(e.code, "instance_limit_reached");
+  assert.equal(e.status, 409);
+  assert.deepEqual(e.details, { limit: 3, awake: 3 });
   const g = await rejects(w.getInstance("ab12cd34ef"));
   assert.equal(g.code, "bad_gateway");
   assert.equal(g.status, 502);

@@ -11,7 +11,7 @@ use serde_json::Value;
 use tower::ServiceExt;
 use warren_core::{Config, HmacSigner, KeyAuthenticator};
 
-use super::fakes::{FakeBiller, FakeLifecycle, FakeTemplates, FixedClock, MemStore};
+use super::fakes::{FakeLifecycle, FakeTemplates, FixedClock, MemStore};
 use crate::{Deps, router};
 
 /// 2026-01-01T00:00:00Z
@@ -55,11 +55,9 @@ impl Harness {
             clock.clone(),
         ));
         templates.seed();
-        let biller = Arc::new(FakeBiller::new(store.clone(), clock.clone()));
         let lifecycle = Arc::new(FakeLifecycle::new(
             store.clone(),
             templates.clone(),
-            biller.clone(),
             config.clone(),
             clock.clone(),
         ));
@@ -68,7 +66,6 @@ impl Harness {
         let app = router(Deps {
             store: store.clone(),
             lifecycle: lifecycle.clone(),
-            biller,
             templates,
             auth,
             signer: signer.clone(),

@@ -24,8 +24,9 @@ pub const DEFAULT_KERNEL: &str = "/data/sandbox-probe/vmlinux-6.1.155";
 /// Firecracker binary used unless `WARREN_E2E_FIRECRACKER_BIN` is set (only
 /// passed when it exists; otherwise the daemon's own default applies).
 pub const DEFAULT_FIRECRACKER_BIN: &str = "/data/sandbox-probe/firecracker";
-/// Meter interval the daemon runs with; tests on billing wait a few of these.
-pub const METER_INTERVAL: Duration = Duration::from_secs(2);
+/// Awake-instance quota every daemon runs with (`--max-awake-instances`); the
+/// limits scenario fills it and expects the next instance to be refused.
+pub const MAX_AWAKE_INSTANCES: u32 = 3;
 /// Smallest idle timeout the daemon accepts in tests.
 pub const MIN_IDLE_SECONDS: u32 = 5;
 /// How long the daemon may take to answer its health endpoint after spawn.
@@ -217,7 +218,8 @@ impl Daemon {
         )
     }
 
-    /// Spawn `warrend --dev` on a free port with a fresh data directory and
+    /// Spawn `warrend --dev` on a free port with a fresh data directory,
+    /// `--max-awake-instances` set to [`MAX_AWAKE_INSTANCES`] and
     /// `--gateway-bin` pointing at the static gateway, capture its output to
     /// `warrend.log` in the temp directory and wait for `GET /v1/health`. On
     /// failure the log tail is printed and the error says why.
@@ -245,10 +247,7 @@ impl Daemon {
             .arg("--data-dir")
             .arg(&data_dir)
             .args(["--base-domain", &base_domain])
-            .args([
-                "--meter-interval",
-                &format!("{}s", METER_INTERVAL.as_secs()),
-            ])
+            .args(["--max-awake-instances", &MAX_AWAKE_INSTANCES.to_string()])
             .args(["--min-idle-seconds", &MIN_IDLE_SECONDS.to_string()])
             .arg("--gateway-bin")
             .arg(&gateway_bin)

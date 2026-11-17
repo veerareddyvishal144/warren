@@ -133,7 +133,7 @@ class SandboxApiTests(unittest.TestCase):
         self.recorder.answers = [json_response({"id": "ab12cd34ef", "status": "updating"})]
         self.w.update_instance("ab12cd34ef", template="my-agent@3")
         self.assertEqual(json.loads(self.recorder.last.data.decode()), {"template": "my-agent@3"})
-        self.recorder.answers = [json_response({"workspace": {}, "api_key": "sk_live_x", "key_id": "k", "wallet_micros": 5000000})]
+        self.recorder.answers = [json_response({"workspace": {}, "api_key": "sk_live_x", "key_id": "k"})]
         Warren(API_URL, None).signup()
         self.assertEqual(json.loads(self.recorder.last.data.decode()), {})
         self.assertNotIn("authorization", headers_of(self.recorder.last))
@@ -153,9 +153,9 @@ class SandboxApiTests(unittest.TestCase):
             self.recorder.last.full_url, API_URL + "/v1/instances/ab12cd34ef/signed-url?port=7681&ttl=3600&path=/a%20b"
         )
 
-        self.recorder.answers = [json_response({"data": []})]
-        self.w.ledger(limit=5)
-        self.assertEqual(self.recorder.last.full_url, API_URL + "/v1/billing/ledger?limit=5")
+        self.recorder.answers = [json_response({"id": "ws_x", "name": "me", "created_at": 1, "awake_limit": None, "awake_count": 0})]
+        self.assertIsNone(self.w.workspace()["awake_limit"])
+        self.assertEqual(self.recorder.last.full_url, API_URL + "/v1/workspace")
 
     def test_path_segments_are_encoded(self):
         self.recorder.answers = [json_response({"name": "my-agent", "revision": 2})]

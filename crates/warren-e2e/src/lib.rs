@@ -32,7 +32,7 @@ pub mod util;
 pub mod workspace;
 
 pub use daemon::{
-    DEFAULT_GATEWAY_BINS, Daemon, METER_INTERVAL, MIN_IDLE_SECONDS, MUSL_GATEWAY_REL,
+    DEFAULT_GATEWAY_BINS, Daemon, MAX_AWAKE_INSTANCES, MIN_IDLE_SECONDS, MUSL_GATEWAY_REL,
 };
 pub use edge::{Auth, Edge, expect_status, header, read_ok, session_cookie};
 pub use util::{

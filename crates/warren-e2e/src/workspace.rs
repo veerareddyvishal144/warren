@@ -27,7 +27,7 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// `POST /v1/signup` through the SDK: a new workspace with the free credit.
+    /// `POST /v1/signup` through the SDK: a new workspace with its first key.
     /// Returns the workspace client and the raw signup answer.
     pub async fn signup(daemon: Arc<Daemon>, name: &str) -> Result<(Workspace, SignupResponse)> {
         let anon = Client::with_http(daemon.api_url(), "", daemon.client(&daemon.api_host())?);

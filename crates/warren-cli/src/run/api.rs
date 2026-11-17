@@ -81,7 +81,7 @@ impl Api {
         })
     }
 
-    // ----- health, signup, workspace, keys, billing --------------------------------
+    // ----- health, signup, workspace, keys ----------------------------------------
 
     pub async fn health(&self) -> R {
         call!(self.client.health())
@@ -105,19 +105,6 @@ impl Api {
 
     pub async fn delete_api_key(&self, id: &str) -> R {
         call!(self.client.delete_api_key(id))
-    }
-
-    pub async fn billing(&self) -> R {
-        call!(self.client.billing())
-    }
-
-    /// Dev top-up (the only provider in this build).
-    pub async fn top_up(&self, micros: i64) -> R {
-        call!(self.client.top_up(micros, Some("dev")))
-    }
-
-    pub async fn ledger(&self, limit: Option<u32>) -> R {
-        list!(self.client.ledger(limit.unwrap_or(0)))
     }
 
     // ----- templates ------------------------------------------------------------------

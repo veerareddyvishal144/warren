@@ -1,7 +1,7 @@
 # Warren Python client
 
 `warren.py` is a one-file client for the Warren **Sandbox API** (instances,
-templates, billing, backups, crons) and the **Agent API** served inside every
+templates, backups, crons) and the **Agent API** served inside every
 instance (chat with streaming, sessions, files, exec). It needs only the
 Python standard library (`urllib` for requests, `http.client` for streaming)
 and Python 3.8 or newer.
@@ -38,7 +38,7 @@ print(agent.list_files("notes"))
 ```
 
 No key yet? `Warren(api_url).signup(name="me")` returns a workspace, the
-plaintext `api_key` (shown once) and the free credit.
+plaintext `api_key` (shown once) and its `key_id`.
 
 ## Authentication
 
@@ -59,14 +59,14 @@ try:
 except WarrenError as e:
     if e.code == "instance_limit_reached":
         print(e.message, e.details)      # {"limit": 3, "awake": 3}
-    elif e.code == "insufficient_balance":
+    elif e.code == "not_found":
         ...
     else:
         raise
 ```
 
-`code` is one of `invalid_request`, `invalid_api_key`, `insufficient_balance`,
-`forbidden`, `not_found`, `conflict`, `instance_limit_reached`,
+`code` is one of `invalid_request`, `invalid_api_key`, `forbidden`,
+`not_found`, `conflict`, `instance_limit_reached`,
 `not_supported`, `try_again`, `timeout`, `bad_gateway`, `internal`. `status`
 is the HTTP status, or 0 when the request never completed (connection refused,
 socket timeout, client-side validation). A plain-text answer (for example the
@@ -78,11 +78,10 @@ edge's `502` for a port nothing listens on) is mapped from its status.
 |---|---|
 | `health()`, `version()` | `GET /v1/health`, `GET /v1/version` |
 | `signup(name=None)` | `POST /v1/signup` |
-| `workspace()` | `GET /v1/workspace` |
+| `workspace()` | `GET /v1/workspace` (adds `awake_limit`, `None` = unlimited, and `awake_count`) |
 | `list_api_keys()`, `create_api_key(name, expires_at)`, `delete_api_key(id)` | `/v1/api-keys` |
-| `billing()`, `top_up(amount_micros, provider="dev")`, `ledger(limit)` | `/v1/billing`, `/v1/billing/top-up`, `/v1/billing/ledger` |
 | `list_templates()`, `get_template(name)`, `register_template(name, image_ref, ...)`, `delete_template(name)` | `/v1/templates` |
-| `create_instance(template, resources, type, region, name, metadata, env, budget, auto_sleep, idle_timeout_seconds, network)` | `POST /v1/instances` |
+| `create_instance(template, resources, type, region, name, metadata, env, auto_sleep, idle_timeout_seconds, network)` | `POST /v1/instances` |
 | `list_instances()`, `get_instance(id)`, `patch_instance(id, ...)`, `delete_instance(id)` | `/v1/instances[/{id}]` |
 | `stop_instance`, `start_instance`, `sleep_instance`, `restart_instance` | `POST /v1/instances/{id}/{stop,start,sleep,restart}` |
 | `resize_instance(id, cpu, memory, disk)`, `update_instance(id, template)`, `fork_instance(id, ...)` | `POST .../{resize,update,fork}` |
@@ -94,8 +93,8 @@ edge's `502` for a port nothing listens on) is mapped from its status.
 | `instance_url(id, port=None)`, `agent(instance)` | helpers |
 
 List endpoints return plain lists (the `{"data": [...]}` envelope is
-unwrapped); everything else returns the JSON object as a `dict`. Money is in
-integer micros (`5_000_000` = $5); timestamps are unix seconds.
+unwrapped); everything else returns the JSON object as a `dict`. Timestamps
+are unix seconds.
 
 ## Agent API (`class Agent`)
 

@@ -97,7 +97,7 @@ async fn handle(mut sock: TcpStream, addr: SocketAddr) {
 }
 
 fn workspace() -> Value {
-    json!({ "id": "ws_abc", "name": "acme", "created_at": 1763000000, "wallet_micros": 5000000, "top_up_total_micros": 0, "free_credit_granted": true })
+    json!({ "id": "ws_abc", "name": "acme", "created_at": 1763000000 })
 }
 
 fn instance(addr: SocketAddr) -> Value {
@@ -105,10 +105,10 @@ fn instance(addr: SocketAddr) -> Value {
         "id": ID, "workspace_id": "ws_abc", "name": "Production agent", "template": "warren-agent", "template_name": "warren-agent",
         "template_revision": 1, "image_ref": "warren/agent:dev", "type": "default", "status": "running", "status_reason": "",
         "resources": { "cpu": 2, "memory": 4, "disk": 4 }, "region": "local", "metadata": {}, "env": {}, "network": "allow-all",
-        "auto_sleep": true, "idle_timeout_seconds": 900, "budget": { "monthly_cap_micros": 0, "credit_micros": 0 },
+        "auto_sleep": true, "idle_timeout_seconds": 900,
         "url": format!("http://{addr}"), "default_port": 3737, "mount_path": "/home/agent", "agent_api": true, "parent_id": "",
         "created_at": 1763000000, "updated_at": 1763000100, "started_at": 1763000050, "stopped_at": 0, "slept_at": 0,
-        "last_activity_at": 1763000100, "meter_started_at": 1763000050, "runtime": "docker", "disk_used_bytes": 123456
+        "last_activity_at": 1763000100, "runtime": "docker", "disk_used_bytes": 123456
     })
 }
 
@@ -129,7 +129,7 @@ fn route(
         ("POST", "/v1/signup") => (
             201,
             JSON,
-            json!({ "workspace": workspace(), "api_key": "sk_live_new", "key_id": "k1", "wallet_micros": 5000000 }).to_string(),
+            json!({ "workspace": workspace(), "api_key": "sk_live_new", "key_id": "k1" }).to_string(),
         ),
         _ if !authed => (401, JSON, json!({ "error": { "code": "invalid_api_key", "message": "Missing or invalid API key." } }).to_string()),
         ("GET", "/v1/workspace") => {
@@ -240,11 +240,9 @@ async fn health_login_and_whoami() {
 
     let (code, out, _) = warren(&fake, &config, &["whoami"]).await;
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("id:                   ws_abc"), "{out}");
-    assert!(
-        out.contains("wallet_micros:        5000000 ($5.00)"),
-        "{out}"
-    );
+    assert!(out.contains("id:           ws_abc"), "{out}");
+    assert!(out.contains("awake_limit:  3"), "{out}");
+    assert!(out.contains("awake_count:  1"), "{out}");
 
     let (code, out, _) = warren(&fake, &config, &["whoami", "--json"]).await;
     assert_eq!(code, 0);
@@ -279,9 +277,9 @@ async fn instances_exec_and_error_codes() {
 
     let (code, out, _) = warren(&fake, &config, &["instances", "get", ID]).await;
     assert_eq!(code, 0);
-    assert!(out.contains("status:                     running"), "{out}");
+    assert!(out.contains("status:                running"), "{out}");
     assert!(
-        out.contains("disk_used_bytes:            123456 (120.6 KB)"),
+        out.contains("disk_used_bytes:       123456 (120.6 KB)"),
         "{out}"
     );
 

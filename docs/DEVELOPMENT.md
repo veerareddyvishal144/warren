@@ -30,8 +30,8 @@ Only touch files inside your crate (and the scripts/docs you own). Other crates 
 ## Contract
 
 - `docs/API.md` is the wire contract. `docs/DESIGN.md` is the architecture. `crates/warren-core/src/` holds the types and traits; read `traits.rs`, `types.rs`, `errors.rs`, `config.rs`, `agentapi.rs` before writing code.
-- Every fallible function returns `warren_core::Result<T>` (`warren_core::Error`). Use the constructors (`Error::invalid`, `not_found`, `conflict`, `try_again`, `not_supported`, `insufficient_balance`, `instance_limit`, `internal`). Never panic on bad input.
-- Money is integer micros. Timestamps are unix seconds (ms on the Agent API). Ids come from `warren_core::ids`.
+- Every fallible function returns `warren_core::Result<T>` (`warren_core::Error`). Use the constructors (`Error::invalid`, `not_found`, `conflict`, `try_again`, `not_supported`, `instance_limit`, `internal`). Never panic on bad input.
+- Timestamps are unix seconds (ms on the Agent API). Ids come from `warren_core::ids`.
 - Logging: `tracing`. No `println!` in library crates.
 - Tests: unit tests in each crate with in-memory fakes for the traits you consume. Integration tests live in `crates/warren-e2e`.
 - Style: `cargo fmt`, `cargo clippy -- -D warnings` clean. Small modules, doc comments on public items, no unsafe without a comment explaining why.

@@ -36,9 +36,6 @@ pub fn build(state: Arc<Deps>) -> Router {
             get(workspace::list_keys).post(workspace::create_key),
         )
         .route("/v1/api-keys/{id}", delete(workspace::delete_key))
-        .route("/v1/billing", get(workspace::billing))
-        .route("/v1/billing/top-up", post(workspace::top_up))
-        .route("/v1/billing/ledger", get(workspace::ledger))
         .route(
             "/v1/templates",
             get(templates::list).post(templates::register),

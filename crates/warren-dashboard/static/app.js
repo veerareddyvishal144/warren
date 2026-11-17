@@ -25,19 +25,16 @@
   const TERMINAL_PORT = 7681;
   const TABS = ['exec', 'chat', 'sessions', 'files', 'logs', 'metrics', 'backups'];
   const AGENT_TABS = ['chat', 'sessions'];
-  const DEFAULT_RATES = { vcpu_month_micros: 800000, ram_gb_month_micros: 700000, disk_gb_month_micros: 90000, vm_multiplier: 2.5 };
   const BUSY = ['provisioning', 'starting', 'restarting', 'updating', 'stopping', 'waking', 'deleting'];
 
   const state = {
     key: null,
     workspace: null,
     health: null,
-    billing: null,
     templates: [],
     instances: [],
     selectedId: null,
     selected: null,
-    view: 'instances', // instances | billing
     panel: 'empty', // empty | create | detail
     tab: 'exec',
     listSig: '',
@@ -83,13 +80,6 @@
   }
 
   // ------------------------------------------------------------- formatting
-  function fmtUsd(micros) {
-    const v = (Number(micros) || 0) / 1e6;
-    const abs = Math.abs(v);
-    const digits = abs !== 0 && abs < 0.01 ? 6 : 2;
-    return (v < 0 ? '-' : '') + '$' + abs.toFixed(digits);
-  }
-
   function fmtBytes(n) {
     n = Number(n) || 0;
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -248,16 +238,30 @@
     show(el('main'), true);
     show(el('nav'), true);
     show(el('who'), true);
-    const ws = state.workspace || {};
-    el('workspace-name').textContent = ws.name || ws.id || '';
     el('key-prefix').textContent = state.key ? state.key.slice(0, 14) + '…' : '';
   }
 
-  async function enter() {
+  function renderWorkspace() {
+    const ws = state.workspace || {};
+    el('workspace-name').textContent = ws.name || ws.id || '';
+    const awake = el('workspace-awake');
+    if (ws.awake_count == null) {
+      awake.textContent = '';
+    } else {
+      awake.textContent = `awake: ${ws.awake_count} of ${ws.awake_limit == null ? 'unlimited' : ws.awake_limit}`;
+    }
+  }
+
+  async function refreshWorkspace() {
     state.workspace = await api('GET', '/workspace');
+    renderWorkspace();
+  }
+
+  async function enter() {
+    await refreshWorkspace();
     showApp();
-    showView('instances');
-    await Promise.all([loadTemplates(), refreshInstances(), loadBilling(false)]);
+    showPanel(state.panel);
+    await Promise.all([loadTemplates(), refreshInstances()]);
     startPolling();
   }
 
@@ -291,7 +295,7 @@
       const r = await api('POST', '/signup', name ? { name } : {}, { auth: false });
       setKey(r.api_key);
       el('signup-key').textContent = r.api_key;
-      el('signup-wallet').textContent = `Workspace ${r.workspace && r.workspace.id ? r.workspace.id : ''} · starting balance ${fmtUsd(r.wallet_micros)}.`;
+      el('signup-workspace').textContent = r.workspace && r.workspace.id ? `Workspace ${r.workspace.id}.` : '';
       show(el('signup-result'), true);
       show(el('login-error'), false);
       el('signup-continue').focus();
@@ -326,40 +330,15 @@
       el('server-info').textContent = W.version ? 'warrend ' + W.version : '';
     }
     updateTypeOptions();
-    show(el('topup-section'), Boolean(state.health && state.health.dev_mode));
   }
 
   // ------------------------------------------------------------- navigation
-  function showView(view) {
-    state.view = view;
-    el('nav-instances').setAttribute('aria-current', view === 'instances' ? 'page' : 'false');
-    el('nav-billing').setAttribute('aria-current', view === 'billing' ? 'page' : 'false');
-    show(el('billing-panel'), view === 'billing');
-    if (view === 'billing') {
-      show(el('empty-panel'), false);
-      show(el('create-panel'), false);
-      show(el('detail-panel'), false);
-      loadBilling(true);
-    } else {
-      showPanel(state.panel);
-    }
-  }
-
   function showPanel(panel) {
     state.panel = panel;
-    if (state.view !== 'instances') {
-      state.view = 'instances';
-      el('nav-instances').setAttribute('aria-current', 'page');
-      el('nav-billing').setAttribute('aria-current', 'false');
-      show(el('billing-panel'), false);
-    }
     show(el('empty-panel'), panel === 'empty');
     show(el('create-panel'), panel === 'create');
     show(el('detail-panel'), panel === 'detail');
-    if (panel === 'create') {
-      updatePrice();
-      el('create-template').focus();
-    }
+    if (panel === 'create') el('create-template').focus();
   }
 
   // ---------------------------------------------------------- instance list
@@ -423,8 +402,7 @@
   async function poll() {
     if (document.hidden || !state.key) return;
     try {
-      await refreshInstances();
-      if (state.view === 'billing') await loadBilling(false);
+      await Promise.all([refreshInstances(), refreshWorkspace()]);
       pollFailures = 0;
     } catch (e) {
       pollFailures += 1;
@@ -459,7 +437,6 @@
       }
     }
     updateTypeOptions();
-    updatePrice();
   }
 
   function updateTypeOptions() {
@@ -484,15 +461,6 @@
     const [cpu, memory, disk] = el('create-shape').value.split(',').map(Number);
     const override = el('create-disk').value.trim();
     return { cpu, memory, disk: override ? Number(override) : disk };
-  }
-
-  function updatePrice() {
-    const rates = Object.assign({}, DEFAULT_RATES, (state.billing && state.billing.rates) || {});
-    const s = createShape();
-    const mult = el('create-type').value === 'vm' ? Number(rates.vm_multiplier) || 1 : 1;
-    const compute = (s.cpu * rates.vcpu_month_micros + s.memory * rates.ram_gb_month_micros) * mult;
-    const disk = s.disk * rates.disk_gb_month_micros;
-    el('create-price').textContent = `Price: ${fmtUsd(compute + disk)}/month running · ${fmtUsd(disk)}/month asleep or stopped. Creating requires one day of the running rate in the wallet.`;
   }
 
   async function onCreate(ev) {
@@ -521,8 +489,7 @@
       selectInstance(inst.id);
     } catch (e) {
       let msg = errText(e);
-      if (e.code === 'insufficient_balance') msg += ' Add funds under Billing.';
-      if (e.code === 'instance_limit_reached') msg += ' Sleep or stop another instance, or top up to raise the limit.';
+      if (e.code === 'instance_limit_reached') msg += ' Sleep or stop another instance to free an awake slot.';
       errBox.textContent = msg;
       show(errBox, true);
     } finally {
@@ -1263,88 +1230,19 @@
     }
   }
 
-  // ---------------------------------------------------------------- billing
-  async function loadBilling(showErrors) {
-    if (!state.key) return;
-    try {
-      const [b, l] = await Promise.all([api('GET', '/billing'), state.view === 'billing' ? api('GET', '/billing/ledger?limit=100') : Promise.resolve(null)]);
-      state.billing = b;
-      el('billing-wallet').textContent = fmtUsd(b.wallet_micros);
-      el('billing-awake').textContent = `${b.awake_count} / ${b.awake_limit}`;
-      el('billing-awake-note').textContent = 'awake limit rises with cumulative top-ups';
-      el('billing-topups').textContent = fmtUsd(b.top_up_total_micros);
-      el('billing-credit').textContent = b.free_credit_granted ? 'granted' : 'not granted';
-      const r = Object.assign({}, DEFAULT_RATES, b.rates || {});
-      el('billing-rates').textContent = `Rates per month: ${fmtUsd(r.vcpu_month_micros)} per vCPU, ${fmtUsd(r.ram_gb_month_micros)} per GB RAM, ${fmtUsd(r.disk_gb_month_micros)} per GB disk; vm type bills compute at ${r.vm_multiplier}×. Billed per minute; sleeping and stopped instances pay for disk only.`;
-      show(el('topup-section'), Boolean(state.health && state.health.dev_mode));
-      if (l) renderLedger(Array.isArray(l.data) ? l.data : []);
-      if (state.panel === 'create') updatePrice();
-    } catch (e) {
-      if (showErrors) toastError(e);
-    }
-  }
-
-  function renderLedger(entries) {
-    const body = el('ledger-body');
-    clear(body);
-    for (const e of entries) {
-      body.append(
-        h(
-          'tr',
-          null,
-          h('td', { text: fmtTime(e.at) }),
-          h('td', null, h('span', { class: 'badge kind-' + e.kind, text: e.kind })),
-          h('td', null, e.instance_id ? h('button', { type: 'button', class: 'link', onclick: () => selectInstance(e.instance_id) }, h('code', { text: e.instance_id })) : '—'),
-          h('td', { class: 'num', text: e.minutes ? Number(e.minutes).toFixed(2) : '' }),
-          h('td', { class: 'num ' + (e.micros < 0 ? 'neg' : 'pos'), text: fmtUsd(e.micros) }),
-          h('td', { class: 'small muted', text: e.note || '' })
-        )
-      );
-    }
-    el('ledger-status').textContent = entries.length ? `${entries.length} most recent entries` : 'No ledger entries yet.';
-  }
-
-  async function onTopUp(ev) {
-    ev.preventDefault();
-    const err = el('topup-error');
-    show(err, false);
-    const usd = Number(el('topup-amount').value);
-    if (!(usd >= 5 && usd <= 10000)) {
-      err.textContent = 'Amount must be between $5 and $10,000.';
-      show(err, true);
-      return;
-    }
-    const btn = el('topup-submit');
-    btn.disabled = true;
-    try {
-      const r = await api('POST', '/billing/top-up', { amount_micros: Math.round(usd * 1e6), provider: el('topup-provider').value || 'dev' });
-      toast(`Added ${fmtUsd(r.entry ? r.entry.micros : usd * 1e6)}; balance ${fmtUsd(r.workspace ? r.workspace.wallet_micros : 0)}.`);
-      await loadBilling(true);
-    } catch (e) {
-      err.textContent = errText(e);
-      show(err, true);
-    } finally {
-      btn.disabled = false;
-    }
-  }
-
   // ------------------------------------------------------------------- init
   function wire() {
     el('login-form').addEventListener('submit', onLogin);
     el('signup-form').addEventListener('submit', onSignup);
     el('signup-continue').addEventListener('click', () => enter().catch((e) => showLogin(e)));
     el('logout-btn').addEventListener('click', logout);
-    el('nav-instances').addEventListener('click', () => showView('instances'));
-    el('nav-billing').addEventListener('click', () => showView('billing'));
+    el('nav-instances').addEventListener('click', () => showPanel(state.panel));
     el('new-instance-btn').addEventListener('click', () => showPanel('create'));
     el('empty-new-btn').addEventListener('click', () => showPanel('create'));
 
     el('create-form').addEventListener('submit', onCreate);
     el('create-cancel').addEventListener('click', () => showPanel(state.selectedId ? 'detail' : 'empty'));
     el('create-template').addEventListener('change', onTemplateChange);
-    el('create-shape').addEventListener('change', updatePrice);
-    el('create-disk').addEventListener('input', updatePrice);
-    el('create-type').addEventListener('change', updatePrice);
     el('create-auto-sleep').addEventListener('change', (ev) => {
       el('create-idle').disabled = !ev.target.checked;
     });
@@ -1422,9 +1320,6 @@
     el('metrics-refresh').addEventListener('click', loadMetrics);
     el('metrics-hours').addEventListener('change', loadMetrics);
     el('backups-refresh').addEventListener('click', loadBackups);
-
-    el('billing-refresh').addEventListener('click', () => loadBilling(true));
-    el('topup-form').addEventListener('submit', onTopUp);
 
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden && state.key) poll();

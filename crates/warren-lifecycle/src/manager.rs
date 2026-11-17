@@ -14,15 +14,14 @@ use std::{
 use parking_lot::Mutex;
 use tokio::sync::OwnedMutexGuard;
 use warren_core::{
-    Biller, Clock, Config, Error, Instance, InstanceStatus, InstanceType, MAX_IDLE_TIMEOUT_SEC,
-    Result, Runtime, Runtimes, Store, Template, TemplateService,
+    Clock, Config, Error, Instance, InstanceStatus, InstanceType, MAX_IDLE_TIMEOUT_SEC, Result,
+    Runtime, Runtimes, Store, Template, TemplateService,
 };
 
 /// Everything the lifecycle needs from the rest of the daemon.
 pub struct Deps {
     pub store: Arc<dyn Store>,
     pub runtimes: Runtimes,
-    pub biller: Arc<dyn Biller>,
     pub templates: Arc<dyn TemplateService>,
     pub config: Config,
     pub clock: Arc<dyn Clock>,
@@ -34,9 +33,9 @@ pub struct Manager {
     pub(crate) deps: Deps,
     /// One async mutex per instance id; operations on one instance serialize.
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// One async mutex per workspace id, held from the biller's awake-limit
-    /// check through the insert or transition that consumes the slot, so
-    /// concurrent create/start/wake/fork requests cannot exceed the ladder.
+    /// One async mutex per workspace id, held from the awake-quota check
+    /// through the insert or transition that consumes the slot, so concurrent
+    /// create/start/wake/fork requests cannot exceed `max_awake_instances`.
     ws_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Instance id -> last activity (unix seconds), flushed to the store periodically.
     activity: Mutex<HashMap<String, i64>>,
@@ -116,7 +115,7 @@ impl Manager {
         self.lock_handle(id).try_lock_owned().ok()
     }
 
-    /// Serialize the awake-limit check and the slot-consuming write for one
+    /// Serialize the awake-quota check and the slot-consuming write for one
     /// workspace. Always taken after the instance lock (or before a brand-new
     /// instance's lock, which nobody else can hold), so the two never cycle.
     pub(crate) async fn ws_lock(&self, workspace_id: &str) -> OwnedMutexGuard<()> {
@@ -127,6 +126,20 @@ impl Manager {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         handle.lock_owned().await
+    }
+
+    /// Refuse with `instance_limit` when the workspace already keeps
+    /// `Config::max_awake_instances` instances awake; `None` means unlimited.
+    /// The caller holds [`Self::ws_lock`] from this check through the write
+    /// that consumes the slot.
+    pub(crate) async fn check_awake_quota(&self, workspace_id: &str) -> Result<()> {
+        if let Some(limit) = self.deps.config.max_awake_instances {
+            let awake = self.deps.store.count_awake_instances(workspace_id).await?;
+            if awake >= limit {
+                return Err(Error::instance_limit(limit, awake));
+            }
+        }
+        Ok(())
     }
 
     /// Run `op` on a detached task that owns the instance lock, and wait for it.
@@ -204,47 +217,20 @@ impl Manager {
             .await
     }
 
-    /// Persist `inst`. The meter position belongs to the biller, which may have
-    /// advanced it while a runtime call was in flight, so the newer position wins.
+    /// Persist `inst`, stamping `updated_at`.
     pub(crate) async fn save(&self, inst: &mut Instance) -> Result<()> {
         inst.updated_at = self.now();
-        if let Ok(current) = self.deps.store.get_instance(&inst.id).await
-            && current.metered_through > inst.metered_through
-        {
-            inst.metered_through = current.metered_through;
-            inst.meter_carry_micros = current.meter_carry_micros;
-        }
         self.deps.store.update_instance(inst).await
     }
 
-    /// Move `inst` to `status` with `reason` and persist it, keeping the meter
-    /// honest: entering a compute-billing state from a state that did not bill
-    /// compute restarts the meter position, and the first `Running` stamps
-    /// `meter_started_at`.
-    ///
-    /// The meter columns belong to the biller and `update_instance` does not
-    /// write them, so the restart goes through `Store::set_meter`, and it goes
-    /// first: a biller tick landing between the two writes then sees the old
-    /// (disk-only) status with a fresh position rather than the new compute
-    /// status with a stale one.
+    /// Move `inst` to `status` with `reason` and persist it.
     pub(crate) async fn transition(
         &self,
         inst: &mut Instance,
         status: InstanceStatus,
         reason: &str,
     ) -> Result<()> {
-        let now = self.now();
         let from = inst.status;
-        if status.bills_compute() && !from.bills_compute() {
-            inst.metered_through = now;
-            self.deps
-                .store
-                .set_meter(&inst.id, now, inst.meter_carry_micros, None)
-                .await?;
-        }
-        if status == InstanceStatus::Running && inst.meter_started_at == 0 {
-            inst.meter_started_at = now;
-        }
         inst.status = status;
         inst.status_reason = truncate(reason, MAX_REASON_CHARS);
         if from != status {
@@ -264,8 +250,8 @@ impl Manager {
         }
     }
 
-    /// A stop or destroy failed. A `Failed` row bills nothing, so the runtime
-    /// object must not keep running behind it: force it down with
+    /// A stop or destroy failed. A `Failed` row holds no awake slot, so the
+    /// runtime object must not keep running behind it: force it down with
     /// `destroy(remove_storage = false)` (the disk stays), then record both the
     /// original error and the outcome of the forced destroy as the reason.
     pub(crate) async fn fail_force(&self, inst: &mut Instance, err: &Error, what: &str) {

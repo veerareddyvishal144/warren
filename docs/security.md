@@ -7,9 +7,9 @@ What Warren protects, how, and what it does not protect yet. Read this before pu
 | Asset | Threatened by |
 |---|---|
 | The host: its kernel, Docker daemon, other instances, the data directory | Code running inside an instance (agents run arbitrary code by design) |
-| A workspace's instances, files, sessions and wallet | Other workspaces; anyone on the network who reaches the edge |
+| A workspace's instances, files, sessions and keys | Other workspaces; anyone on the network who reaches the edge |
 | API keys and the signed-URL secret | Leaks through instances, logs, backups, the dashboard |
-| The operator's money and capacity | Abuse of open signup, runaway instances |
+| The operator's capacity | Abuse of open signup, runaway instances |
 | Private networks and cloud metadata reachable from the host | Egress from instances |
 
 Trust boundaries: the edge (everything outside is untrusted), the instance boundary (everything inside is untrusted by the host), the workspace boundary (instances and keys of one tenant are invisible to another), and the instance-to-instance boundary (one instance cannot reach another, even on the same host).
@@ -64,7 +64,7 @@ Check the rules after the first start with `sudo iptables -S DOCKER-USER`. When 
 
 ## Signup and abuse
 
-`POST /v1/signup` is served while `--signup-enabled` is true (`WARREN_SIGNUP_ENABLED`, default `true`) and grants `--free-credit-micros` (`WARREN_FREE_CREDIT_MICROS`, default 5,000,000, that is $5) to each new workspace. Signups are limited to 10 per source IP per hour; the loopback address is exempt from the limit in `--dev` so local scripts and tests are not throttled. For a hosted deployment either turn open signup off with `--signup-enabled=false` and create workspaces from your own flow, or keep the API host reachable only from your own backend and call `POST /v1/signup` from there after your own checks. In either case set `--free-credit-micros` deliberately; `0` grants nothing. Only signup is rate limited; the rest of the API relies on the key, the 60 s request timeout and the listener's concurrency limit, so put a proxy with rate limits in front on a public host.
+`POST /v1/signup` is served while `--signup-enabled` is true (`WARREN_SIGNUP_ENABLED`, default `true`) and creates a workspace with its first key for anyone who can reach the API host. Signups are limited to 10 per source IP per hour; the loopback address is exempt from the limit in `--dev` so local scripts and tests are not throttled. For a hosted deployment either turn open signup off with `--signup-enabled=false` and create workspaces from your own flow, or keep the API host reachable only from your own backend and call `POST /v1/signup` from there after your own checks. In either case set `--max-awake-instances` so a single workspace cannot occupy the whole host ([quotas.md](quotas.md)). Only signup is rate limited; the rest of the API relies on the key, the 60 s request timeout and the listener's concurrency limit, so put a proxy with rate limits in front on a public host.
 
 ## Known limitations
 
@@ -72,17 +72,16 @@ Be explicit about these when you decide what to run.
 
 - **Instance subdomains share a registrable domain.** Instances are `<id>.<base-domain>`, and browsers treat subdomains of one registrable domain as same-site: cookies set for the base domain, and some same-site checks, would span tenants. Register the base domain on the [Public Suffix List](https://publicsuffix.org/) or give each tenant its own domain, so that instance origins are cross-site to each other. Until then, browser-side isolation between instances of different tenants is weaker than between unrelated sites.
 - **No per-instance egress allowlist.** Only `allow-all` and `deny-all` exist, plus the host-wide block of the metadata and private ranges described above; an instance that may reach the internet may reach all of it. Allowlists are on the roadmap.
-- **Ledger growth.** The meter writes one ledger row per instance per tick (`--meter-interval`, default `60s`), so the ledger grows linearly in instances x ticks: 100 instances at the default interval add about 144,000 rows a day. Use a longer `--meter-interval`, or prune old rows once you have exported what you need.
 - **Root inside the instance, by design.** Containers start as root, the gateway drops to `agent` for shells and honours the requested exec user, and `agent` has passwordless sudo inside its own instance; `exec` as `root` is allowed. Agents need this to install packages and change system files. Under gVisor or in a VM it is contained, but there is no privilege boundary inside the instance: assume anything the agent runs can change the whole instance, including its persistent disk.
 - **`runc` fallback.** Without gVisor the container shares the host kernel with ordinary namespacing only. Fine for your own code, not for untrusted code.
-- **Disk quotas.** The disk size is a sizing and billing number; the bind-mounted home has no filesystem quota in this build, so an instance can fill the data volume. Watch `disk_used_bytes` and free space on the host.
-- **No production payments.** The `dev` top-up provider works only with `--dev`; a production wallet can only be funded by the welcome credit at signup.
+- **Disk quotas.** The disk size is a sizing number; the bind-mounted home has no filesystem quota in this build, so an instance can fill the data volume. Watch `disk_used_bytes` and free space on the host.
+- **Only the awake count is capped.** `--max-awake-instances` limits how many instances a workspace keeps awake; their combined vCPUs, RAM and disk are not, so size the quota for the largest shape ([quotas.md](quotas.md)).
 - **TLS.** The daemon speaks plain HTTP; TLS comes from Caddy, Cloudflare or another proxy ([self-hosting.md](self-hosting.md)). Do not expose 7337 directly.
 - **Signed URLs and cookies are bearer credentials.** Anyone who gets the URL can use it until it expires; the cookie keeps a browser authenticated on that host for the token's lifetime (same-origin requests only). There is no per-token revocation, only secret rotation. Use short TTLs.
 - **The dashboard stores the key in the browser** (local storage). Treat a shared browser as a leaked key and rotate.
 - **Side channels and resource exhaustion.** CPU and memory are limited per instance; disk I/O, network bandwidth and PIDs are not, so a noisy instance can degrade its neighbours.
 - **VM type.** Experimental and requires the whole daemon to run as root.
-- **Audit log.** The ledger records money, not actions; there is no per-request audit trail beyond the daemon's logs.
+- **Audit log.** There is no per-request audit trail beyond the daemon's logs.
 
 ## Reporting
 

@@ -51,7 +51,7 @@ or chat (agent templates only) -> sleep_instance or stop_instance when idle -> d
 Instance ids are 10 lowercase alphanumerics (e.g. ab12cd34ef). File paths are relative to the instance home. \
 Sleeping instances wake on the first exec or request; stopped instances must be started explicitly. \
 Tool errors read `<code>: <message>` using the Warren API codes (invalid_request, not_found, conflict, \
-insufficient_balance, instance_limit_reached, not_supported, try_again, timeout, internal). \
+instance_limit_reached, not_supported, try_again, timeout, internal). \
 The resource warren://instances lists every instance as JSON.";
 
 /// A tool failure the model should see: the Warren error code and message.
@@ -310,7 +310,7 @@ impl<B: Backend> WarrenServer<B> {
     }
 
     #[tool(
-        description = "Create a persistent Linux instance and wait up to 120 seconds for it to be running, then return the instance object. All arguments are optional: template (default warren-base; warren-agent for chat), type default|vm, cpu/memory/disk, name, auto_sleep, idle_timeout_seconds, env. Billing starts when the instance first runs; the wallet must hold one day of its rate (insufficient_balance) and the workspace awake limit applies (instance_limit_reached). If the instance is not running after the wait it is still returned with its current status; poll get_instance.",
+        description = "Create a persistent Linux instance and wait up to 120 seconds for it to be running, then return the instance object. All arguments are optional: template (default warren-base; warren-agent for chat), type default|vm, cpu/memory/disk, name, auto_sleep, idle_timeout_seconds, env. The workspace's awake-instance limit applies (instance_limit_reached). If the instance is not running after the wait it is still returned with its current status; poll get_instance.",
         annotations(
             title = "Create instance",
             read_only_hint = false,
@@ -512,15 +512,6 @@ impl<B: Backend> WarrenServer<B> {
     async fn list_templates(&self) -> ToolOutcome {
         let templates = self.backend.list_templates().await?;
         Ok(ok_json(&List::new(templates))?)
-    }
-
-    #[tool(
-        description = "Show the workspace wallet and limits: wallet_micros and top_up_total_micros (USD x 1,000,000), awake_limit and awake_count, the price list (rates) and whether the free credit was granted.",
-        annotations(title = "Billing", read_only_hint = true, idempotent_hint = true)
-    )]
-    async fn billing(&self) -> ToolOutcome {
-        let billing = self.backend.billing().await?;
-        Ok(ok_json(&billing)?)
     }
 }
 
@@ -770,10 +761,6 @@ mod tests {
         async fn list_templates(&self) -> WarrenResult<Vec<Template>> {
             Ok(self.enter("list_templates")?.templates.clone())
         }
-        async fn billing(&self) -> WarrenResult<serde_json::Value> {
-            drop(self.enter("billing")?);
-            Ok(json!({ "wallet_micros": 5_000_000, "awake_limit": 3, "awake_count": 1 }))
-        }
     }
 
     fn server(fake: Fake) -> WarrenServer<Fake> {
@@ -796,8 +783,7 @@ mod tests {
             .expect("structured content")
     }
 
-    const TOOLS: [&str; 15] = [
-        "billing",
+    const TOOLS: [&str; 14] = [
         "chat",
         "create_instance",
         "delete_instance",
@@ -904,7 +890,7 @@ mod tests {
                 .unwrap()
                 .contains(&json!("integer"))
         );
-        for name in ["list_instances", "list_templates", "billing"] {
+        for name in ["list_instances", "list_templates"] {
             assert_eq!(
                 by_name(name)["properties"],
                 json!({}),
@@ -1255,7 +1241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signed_url_templates_and_billing() {
+    async fn signed_url_and_templates() {
         let srv = server(Fake::with(|st| {
             st.templates.push(Template {
                 name: "warren-base".into(),
@@ -1277,16 +1263,11 @@ mod tests {
 
         let result = srv.list_templates().await.unwrap();
         assert_eq!(structured(&result)["data"][0]["name"], json!("warren-base"));
-
-        let result = srv.billing().await.unwrap();
-        assert_eq!(structured(&result)["wallet_micros"], json!(5_000_000));
     }
 
     #[tokio::test]
     async fn api_errors_become_tool_errors_with_code_and_message() {
-        let srv = server(Fake::with(|st| {
-            st.fail = Some(Error::insufficient_balance(2_000_000, 500_000))
-        }));
+        let srv = server(Fake::with(|st| st.fail = Some(Error::instance_limit(3, 3))));
         let err = srv
             .create_instance(Parameters(CreateInstanceArgs::default()))
             .await
@@ -1298,13 +1279,12 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         let shown = text(&result);
         assert!(
-            shown.starts_with("insufficient_balance: Wallet balance"),
+            shown.starts_with("instance_limit_reached: This workspace may keep 3 instances"),
             "{shown}"
         );
-        assert!(shown.contains("required_micros"), "{shown}");
         let body = structured(&result);
-        assert_eq!(body["error"]["code"], json!("insufficient_balance"));
-        assert_eq!(body["error"]["details"]["balance_micros"], json!(500_000));
+        assert_eq!(body["error"]["code"], json!("instance_limit_reached"));
+        assert_eq!(body["error"]["details"]["awake"], json!(3));
     }
 
     #[tokio::test]

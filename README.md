@@ -1,8 +1,8 @@
 # Warren
 
-Warren gives every AI agent, or every end user of your product, a persistent Linux computer of its own: a container under gVisor (or a Firecracker microVM) with a real shell, a home directory that survives restarts, a browser terminal, a files API and an optional built-in agent, all reachable over HTTPS at a URL derived from the instance id. Instances sleep when idle and then cost disk only; a prepaid wallet is metered by the minute; a single API key drives both the control plane and the instances themselves.
+Warren gives every AI agent, or every end user of your product, a persistent Linux computer of its own: a container under gVisor (or a Firecracker microVM) with a real shell, a home directory that survives restarts, a browser terminal, a files API and an optional built-in agent, all reachable over HTTPS at a URL derived from the instance id. Instances sleep when idle and keep only their disk; a single API key drives both the control plane and the instances themselves.
 
-Warren is a single Rust binary (`warrend`) that runs the whole platform on one Linux host: Sandbox API, edge proxy, lifecycle, metering and cron. A second small binary (`warren-gateway`) runs inside every instance and serves the Agent API, the files API and exec. Everything is open source under Apache-2.0, and the whole wire contract fits in one document: [docs/API.md](docs/API.md).
+Warren is a single Rust binary (`warrend`) that runs the whole platform on one Linux host: Sandbox API, edge proxy, lifecycle and cron. A second small binary (`warren-gateway`) runs inside every instance and serves the Agent API, the files API and exec. Everything is open source under Apache-2.0, and the whole wire contract fits in one document: [docs/API.md](docs/API.md).
 
 ## Features
 
@@ -11,14 +11,14 @@ Warren is a single Rust binary (`warrend`) that runs the whole platform on one L
 | Persistent computers | Debian 12 with Node 24, Python 3, git and build tools; `/home/agent` persists across sleep, stop, restart, resize and template updates. |
 | One URL per instance | `https://<id>.<base>/` reaches the default port, `https://<id>-<port>.<base>/` reaches any port a process listens on. WebSockets pass through. |
 | Two planes, one key | The same `sk_live_...` key authenticates the Sandbox API (`api.<base>/v1`) and every instance URL. Signed URLs and a cookie let browsers in without the key. |
-| Auto-sleep and wake on request | Idle instances stop and bill disk only; the first request to any of their URLs wakes them and is held until the gateway answers. |
+| Auto-sleep and wake on request | Idle instances stop and keep only their disk; the first request to any of their URLs wakes them and is held until the gateway answers. |
 | Agent API | `POST /v1/responses` with sessions, SSE streaming, cancel and replay, on the built-in agent (any OpenAI-compatible model), OpenCode, or your own command. |
 | Files and exec | List, read, write, move, delete and download the home directory over HTTP; run shell commands with a captured exit code, stdout and stderr. |
 | Browser terminal | `ttyd` on port 7681 inside every instance, opened with a signed URL from the dashboard or the API. |
 | Templates | Three built-in images plus your own: register any Linux image (Alpine included) and Warren injects its static gateway and wraps the image's own entrypoint, so files, exec and health work without changing the image. Publish revisions, pin instances to `name@rev`, update in place. |
 | Fork, backup, restore, resize | Copy an instance with its disk, take backups without stopping, restore, grow the disk or change the shape. |
 | Crons | Scheduled prompts for agent instances; each firing wakes the instance and runs one turn. |
-| Prepaid metering | Per-minute charges from monthly list prices, a $5 welcome credit, a ledger, awake-instance limits that grow with top-ups. |
+| Capacity quota | An optional cap on how many instances a workspace may keep awake at once (`--max-awake-instances`); sleeping and stopped instances never count. |
 | Isolation | gVisor (`runsc`) for the default type; Firecracker microVMs for the experimental `vm` type. |
 | Clients | `warren` CLI, an MCP server for Claude Code and Cursor, a Rust SDK, one-file Python and TypeScript clients, a dashboard. |
 
@@ -39,9 +39,9 @@ In a second shell, sign up, create an instance, run a command and open its termi
 ```bash
 export WARREN_API=http://api.warren.localhost:7337/v1
 
-# 1. A workspace, a key and $5 of credit
+# 1. A workspace and a key
 curl -s -X POST $WARREN_API/signup -H 'Content-Type: application/json' -d '{"name":"me"}'
-# {"workspace":{"id":"ws_...","wallet_micros":5000000,...},"api_key":"sk_live_...","key_id":"...","wallet_micros":5000000}
+# {"workspace":{"id":"ws_...","name":"me","created_at":...},"api_key":"sk_live_...","key_id":"..."}
 export WARREN_API_KEY=sk_live_...      # paste the api_key from the response
 AUTH="Authorization: Bearer $WARREN_API_KEY"
 
@@ -60,7 +60,7 @@ curl -s "$WARREN_API/instances/$ID/signed-url?port=7681&ttl=3600" -H "$AUTH"
 # {"url":"http://ab12cd34ef-7681.warren.localhost:7337/?warren_token=...","expires_at":...}
 ```
 
-Chrome, Firefox and hosts running systemd-resolved resolve `*.localhost` to the loopback address, so the instance URLs work in a browser and in curl without DNS setup; on other hosts add `--resolve api.warren.localhost:7337:127.0.0.1` (and the same for each instance host) to curl, or add the names to `/etc/hosts`. The dashboard is at `http://warren.localhost:7337/`; paste the key there to see the instance, its wallet and the ledger. [docs/quickstart.md](docs/quickstart.md) continues with the built-in agent, files, sleep and wake.
+Chrome, Firefox and hosts running systemd-resolved resolve `*.localhost` to the loopback address, so the instance URLs work in a browser and in curl without DNS setup; on other hosts add `--resolve api.warren.localhost:7337:127.0.0.1` (and the same for each instance host) to curl, or add the names to `/etc/hosts`. The dashboard is at `http://warren.localhost:7337/`; paste the key there to see your instances. [docs/quickstart.md](docs/quickstart.md) continues with the built-in agent, files, sleep and wake.
 
 ## Architecture
 
@@ -80,9 +80,8 @@ Chrome, Firefox and hosts running systemd-resolved resolve `*.localhost` to the 
 |     |                                                                                            |
 |     v                                                                                            |
 |  warren-lifecycle   the only mover of instance status: create, start, stop, sleep, wake, fork,   |
-|     |               resize, update, backups, idle sleeper, reconciler, metrics sampler           |
-|     |-- warren-billing     per-minute meter, wallet ledger, one-day rule, awake limits           |
-|     |-- warren-templates   built-in catalog, workspace images, revisions and pins               |
+|     |               resize, update, backups, idle sleeper, reconciler, metrics sampler, quota    |
+|     |-- warren-templates   built-in catalog, workspace images, revisions and pins                |
 |     |-- warren-cron        due prompts every 30 s -> POST /v1/responses inside the instance      |
 |     v                                                                                            |
 |  Runtime trait  --> warren-runtime-docker (gVisor runsc, runc fallback)                          |
@@ -101,27 +100,24 @@ Chrome, Firefox and hosts running systemd-resolved resolve `*.localhost` to the 
 
 Every crate depends on `warren-core` (types, traits, errors, config) and on nothing else inside the workspace; `warrend` wires them together. [docs/DESIGN.md](docs/DESIGN.md) describes each crate.
 
-## Pricing and metering
+## Capacity and quotas
 
-Warren is prepaid. A workspace has a wallet in integer micro-dollars; signup grants $5 once. Every instance has a monthly list price computed from its shape and type with the default rates, which the operator can change:
+Warren is free software you host yourself. It does no billing: there is no wallet, no metering and no price on anything; the only limit on a workspace is the host's capacity and, if you set one, an awake quota. Operators who run Warren as a hosted service build their own billing on top of the API, which exposes everything needed for it: the instance list, each instance's status, shape (`resources`) and uptime (`started_at`, `last_activity_at`, per-minute `metrics`).
 
-| Rate | Default |
-|---|---|
-| vCPU per month | $0.80 |
-| GB of RAM per month | $0.70 |
-| GB of disk per month | $0.09 |
-| `vm` type | compute (vCPU + RAM) x 2.5, disk unchanged |
+The host's vCPUs and RAM are the real limit: every awake instance holds its full shape, while sleeping and stopped instances hold only their disk. To keep one workspace from taking the whole machine, start the daemon with `--max-awake-instances N` (`WARREN_MAX_AWAKE_INSTANCES`). Unset means unlimited.
 
-`monthly = cpu x 0.80 + memory x 0.70 + disk x 0.09` for the default type. The meter charges whole minutes at `monthly / 43,800` (730 hours a month), carrying fractions forward, and writes a ledger entry per instance per tick. Running and transitional states (`running`, `starting`, `restarting`, `updating`, `stopping`) bill the full rate; `sleeping`, `stopped` and `waking` bill disk only; `provisioning` is free until the instance first reaches `running`.
+```bash
+target/release/warrend --dev --data-dir ./data --max-awake-instances 3
+```
 
-| Shape (vCPU / GB RAM / GB disk) | Running | Per hour | Sleeping or stopped | `vm` running |
-|---|---|---|---|---|
-| 2 / 4 / 4 | $4.76 / month | $0.0065 | $0.36 / month | $11.36 / month |
-| 4 / 8 / 6 | $9.34 / month | $0.0128 | $0.54 / month | $22.54 / month |
-| 4 / 16 / 12 | $15.48 / month | $0.0212 | $1.08 / month | $37.08 / month |
-| 4 / 32 / 24 | $27.76 / month | $0.0380 | $2.16 / month | $66.16 / month |
+The quota counts instances that are `provisioning`, `running`, `starting`, `restarting`, `updating`, `stopping` or `waking`. Create, start, wake and fork answer `409 instance_limit_reached` with `details: { "limit", "awake" }` when the workspace is at the limit; `GET /v1/workspace` returns `awake_limit` (a number, or `null` when unlimited) and `awake_count`. Auto-sleep is how you keep many instances alive with few slots. Details: [docs/quotas.md](docs/quotas.md).
 
-Creating an instance requires one day of its running rate in the wallet (`monthly / 30`, about $0.16 for the smallest shape), else `402 insufficient_balance`. When a wallet reaches zero every running instance in the workspace is stopped with `status_reason: "insufficient_balance"`; they stay stopped until a top-up and an explicit start. The number of awake instances is capped by cumulative top-ups: 3 before any top-up, 10 after the first, 50 at $50, 200 at $250, 1,000 at $1,000. Sleeping and stopped instances never count. In this build the only top-up provider is `dev`, accepted when the daemon runs with `--dev`; Stripe is on the roadmap. Details: [docs/billing.md](docs/billing.md).
+| Shape (vCPU / GB RAM) | Default disk | Disk range, `default` | Disk range, `vm` |
+|---|---|---|---|
+| 2 / 4 | 4 GB | 2 - 12 GB | 2 - 100 GB |
+| 4 / 8 | 6 GB | 2 - 20 GB | 2 - 100 GB |
+| 4 / 16 | 12 GB | 2 - 40 GB | 2 - 100 GB |
+| 4 / 32 | 24 GB | 2 - 80 GB | 2 - 100 GB |
 
 ## Instance types
 
@@ -129,7 +125,6 @@ Creating an instance requires one day of its running rate in the wallet (`monthl
 |---|---|---|---|
 | Isolation | Container under gVisor (`runsc`); `runc` fallback for development | Firecracker microVM with its own kernel | Reserved for hosts with pinned cores |
 | Host needs | Docker | Root, `/dev/kvm`, a Firecracker binary and a kernel | Not available in this build: `not_supported` |
-| Compute price | 1x | 2.5x | 4x (future) |
 | Disk | 2 GB up to the shape's maximum (12 / 20 / 40 / 80 GB) | 2 GB up to 100 GB | - |
 | Exec | `docker exec` | the in-instance gateway, authenticated with a per-instance token | - |
 | Sleep and wake | Stop the container, keep the disk, boot on request | Same | - |
@@ -154,7 +149,6 @@ Shapes are the four CPU/RAM pairs above (`2/4`, `4/8`, `4/16`, `4/32`); a reques
 - **Memory checkpoints**: gVisor checkpoint/restore and Firecracker snapshots so sleep keeps processes and memory, not only files. The API does not change.
 - **Multi-node scheduler**: place instances across hosts; the `region` field is already on every instance.
 - **Allowlist egress**: per-instance outbound rules beyond today's `allow-all` and `deny-all`. 0.1.0 already blocks cloud metadata (`169.254.0.0/16`) and, unless `--allow-private-egress` is set, private ranges host-wide; the allowlist adds per-instance destinations.
-- **Stripe**: real top-ups next to the `dev` provider.
 - **Cloudflare edge**: terminate TLS and authenticate at the edge, with the daemon as origin.
 
 ## License

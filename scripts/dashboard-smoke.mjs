@@ -60,11 +60,6 @@ await step('exec console runs a command', async () => {
   await page.locator('#exec-output', { hasText: 'dash-ok' }).waitFor({ timeout: 30000 });
   const out = await text('#exec-output'); if (!out.includes('agent')) throw new Error('unexpected user in output: ' + out.slice(0, 120));
 });
-await step('billing panel shows the wallet', async () => {
-  await page.click('#nav-billing'); await page.locator('#billing-panel').waitFor({ state: 'visible', timeout: 10000 });
-  const w = await text('#billing-wallet'); if (!/4\.|5\.|\$/.test(w)) throw new Error('wallet text: ' + w);
-  await page.click('#nav-instances');
-});
 await step('delete the instance from the UI', async () => {
   if (!created) throw new Error('nothing created');
   await page.locator('#instance-list button').first().click();

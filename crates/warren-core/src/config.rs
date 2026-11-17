@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use crate::{InstanceType, Shape, Template, TemplateScope, types::*};
 
@@ -31,12 +31,11 @@ pub struct Config {
     /// default; the cloud metadata range 169.254.0.0/16 is always blocked when the
     /// daemon can install firewall rules.
     pub allow_private_egress: bool,
-    pub free_credit_micros: Money,
     pub min_idle_timeout_sec: u32,
-    pub rates: Rates,
+    /// Instances a workspace may keep awake at once; None means unlimited.
+    pub max_awake_instances: Option<u32>,
     /// HMAC secret for signed URLs.
     pub secret: String,
-    pub meter_interval: Duration,
     /// Tag of the built-in template images, e.g. "dev".
     pub image_tag: String,
     pub version: String,
@@ -59,11 +58,9 @@ impl Default for Config {
             dev_mode: false,
             signup_enabled: true,
             allow_private_egress: false,
-            free_credit_micros: 5 * MICROS_PER_DOLLAR,
             min_idle_timeout_sec: MIN_IDLE_TIMEOUT_SEC,
-            rates: Rates::default(),
+            max_awake_instances: None,
             secret: String::new(),
-            meter_interval: Duration::from_secs(60),
             image_tag: "dev".into(),
             version: "dev".into(),
         }

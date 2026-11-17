@@ -3,12 +3,10 @@
 
 use async_trait::async_trait;
 use warren_core::{
-    ApiKey, Backup, Cron, Instance, LedgerEntry, MetricPoint, Result, Store, Template, Workspace,
+    ApiKey, Backup, Cron, Instance, MetricPoint, Result, Store, Template, Workspace,
 };
 
-use crate::{
-    SqliteStore, api_keys, backups, crons, instances, ledger, metrics, templates, workspaces,
-};
+use crate::{SqliteStore, api_keys, backups, crons, instances, metrics, templates, workspaces};
 
 #[async_trait]
 impl Store for SqliteStore {
@@ -125,20 +123,6 @@ impl Store for SqliteStore {
         self.run(move |c| instances::delete(c, &id)).await
     }
 
-    async fn set_meter(
-        &self,
-        id: &str,
-        metered_through: i64,
-        carry_micros: f64,
-        expected_from: Option<i64>,
-    ) -> Result<bool> {
-        let id = id.to_owned();
-        self.run(move |c| {
-            instances::set_meter(c, &id, metered_through, carry_micros, expected_from)
-        })
-        .await
-    }
-
     async fn count_awake_instances(&self, workspace_id: &str) -> Result<u32> {
         let workspace_id = workspace_id.to_owned();
         self.run(move |c| instances::count_awake(c, &workspace_id))
@@ -148,24 +132,6 @@ impl Store for SqliteStore {
     async fn count_instances_using_template(&self, workspace_id: &str, name: &str) -> Result<u32> {
         let (workspace_id, name) = (workspace_id.to_owned(), name.to_owned());
         self.run(move |c| templates::count_instances_using(c, &workspace_id, &name))
-            .await
-    }
-
-    async fn apply_ledger(&self, entry: &mut LedgerEntry) -> Result<()> {
-        let mut e = entry.clone();
-        let e = self
-            .run(move |c| {
-                ledger::apply(c, &mut e)?;
-                Ok(e)
-            })
-            .await?;
-        *entry = e;
-        Ok(())
-    }
-
-    async fn list_ledger(&self, workspace_id: &str, limit: u32) -> Result<Vec<LedgerEntry>> {
-        let workspace_id = workspace_id.to_owned();
-        self.run(move |c| ledger::list(c, &workspace_id, limit))
             .await
     }
 

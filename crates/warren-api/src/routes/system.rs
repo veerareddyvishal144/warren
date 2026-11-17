@@ -38,10 +38,9 @@ pub struct SignupResponse {
     pub workspace: Workspace,
     pub api_key: String,
     pub key_id: String,
-    pub wallet_micros: i64,
 }
 
-/// `POST /v1/signup`: a workspace, its free credit (once) and a first key.
+/// `POST /v1/signup`: a workspace and its first key.
 /// `404` when signups are disabled; `429 try_again` past [`SIGNUPS_PER_HOUR`]
 /// from one client IP (unknown peers share one bucket; loopback is exempt in
 /// dev mode).
@@ -72,23 +71,12 @@ pub async fn signup(
         .to_string();
     validate::name("name", &name)?;
     let now = d.clock.now_unix();
-    let mut ws = Workspace {
+    let ws = Workspace {
         id: ids::new_workspace_id(),
         name,
         created_at: now,
-        wallet_micros: 0,
-        top_up_total_micros: 0,
-        free_credit_granted: false,
     };
     d.store.create_workspace(&ws).await?;
-    if d.config.free_credit_micros > 0 {
-        ws = d
-            .biller
-            .grant_credit(&ws.id, d.config.free_credit_micros, "welcome credit")
-            .await?;
-        ws.free_credit_granted = true;
-        d.store.update_workspace(&ws).await?;
-    }
     let (plain, hash, prefix) = ids::new_api_key();
     let key = ApiKey {
         id: ids::new_id(),
@@ -101,9 +89,8 @@ pub async fn signup(
         last_used_at: 0,
     };
     d.store.create_api_key(&key).await?;
-    tracing::info!(workspace = %ws.id, wallet_micros = ws.wallet_micros, "workspace created");
+    tracing::info!(workspace = %ws.id, "workspace created");
     Ok(created(SignupResponse {
-        wallet_micros: ws.wallet_micros,
         workspace: ws,
         api_key: plain,
         key_id: key.id,

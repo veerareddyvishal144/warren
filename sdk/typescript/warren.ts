@@ -18,9 +18,8 @@
  *
  * Every failed call rejects with {@link WarrenError} carrying the stable error
  * `code`, the server `message`, the HTTP `status` (0 when no answer arrived)
- * and the optional `details` object. Money is in integer micros (USD x
- * 1,000,000); timestamps are unix seconds on the Sandbox API and unix
- * milliseconds on the Agent API, exactly as on the wire.
+ * and the optional `details` object. Timestamps are unix seconds on the
+ * Sandbox API and unix milliseconds on the Agent API, exactly as on the wire.
  *
  * The Sandbox API is authenticated with `Authorization: Bearer <key>`;
  * requests to an instance URL carry the same key in the `x-warren-key` header.
@@ -49,7 +48,6 @@ export type InstanceStatus =
 export type InstanceType = "default" | "vm" | "performance";
 export type NetworkMode = "allow-all" | "deny-all";
 export type TemplateScope = "system" | "workspace";
-export type LedgerKind = "compute" | "disk" | "topup" | "credit" | "adjustment";
 
 /** CPU count, memory in GB and disk in GB. */
 export interface Shape {
@@ -65,25 +63,17 @@ export interface ShapeRequest {
   disk?: number;
 }
 
-/** Managed-service spend caps recorded on an instance. */
-export interface Budget {
-  monthly_cap_micros: number;
-  credit_micros: number;
-}
-
-/** A tenant: one wallet, many instances, many API keys. */
+/** A tenant: many instances, many API keys. */
 export interface Workspace {
   id: string;
   name: string;
   created_at: number;
-  wallet_micros: number;
-  top_up_total_micros: number;
-  free_credit_granted: boolean;
 }
 
 /** `GET /v1/workspace`: the workspace plus its awake-instance counters. */
 export interface WorkspaceInfo extends Workspace {
-  awake_limit: number;
+  /** Instances the workspace may keep awake at once; null means unlimited. */
+  awake_limit: number | null;
   awake_count: number;
 }
 
@@ -136,7 +126,6 @@ export interface Instance {
   network: NetworkMode;
   auto_sleep: boolean;
   idle_timeout_seconds: number;
-  budget: Budget;
   url: string;
   default_port: number;
   mount_path: string;
@@ -148,21 +137,8 @@ export interface Instance {
   stopped_at?: number;
   slept_at?: number;
   last_activity_at?: number;
-  meter_started_at?: number;
   runtime: string;
   disk_used_bytes: number;
-}
-
-/** One movement on a wallet; charges are negative, top-ups positive. */
-export interface LedgerEntry {
-  id: string;
-  workspace_id: string;
-  instance_id?: string;
-  kind: LedgerKind;
-  micros: number;
-  minutes?: number;
-  at: number;
-  note?: string;
 }
 
 /** A restore point for an instance's disk. */
@@ -200,15 +176,6 @@ export interface MetricPoint {
   disk_bytes: number;
 }
 
-/** List prices per month in micros. */
-export interface Rates {
-  vcpu_month_micros: number;
-  ram_gb_month_micros: number;
-  disk_gb_month_micros: number;
-  vm_multiplier: number;
-  performance_multiplier: number;
-}
-
 /** `GET /v1/health` of the daemon. */
 export interface DaemonHealth {
   healthy: boolean;
@@ -230,7 +197,6 @@ export interface SignupResult {
   workspace: Workspace;
   api_key: string;
   key_id: string;
-  wallet_micros: number;
 }
 
 export interface CreateApiKeyRequest {
@@ -243,28 +209,6 @@ export interface CreateApiKeyRequest {
 export interface CreateApiKeyResult {
   key: ApiKey;
   api_key: string;
-}
-
-/** `GET /v1/billing`. */
-export interface Billing {
-  wallet_micros: number;
-  top_up_total_micros: number;
-  awake_limit: number;
-  awake_count: number;
-  rates: Rates;
-  free_credit_granted: boolean;
-}
-
-export interface TopUpRequest {
-  /** 5,000,000 .. 10,000,000,000 micros. */
-  amount_micros: number;
-  /** Only `"dev"` exists in this build (daemon started with `--dev`). */
-  provider?: string;
-}
-
-export interface TopUpResult {
-  workspace: Workspace;
-  entry: LedgerEntry;
 }
 
 /** Body of `POST /v1/templates`. */
@@ -288,7 +232,6 @@ export interface CreateInstanceRequest {
   name?: string;
   metadata?: Record<string, string>;
   env?: Record<string, string>;
-  budget?: Budget;
   auto_sleep?: boolean;
   idle_timeout_seconds?: number;
   network?: NetworkMode;
@@ -302,7 +245,6 @@ export interface PatchInstanceRequest {
   auto_sleep?: boolean;
   idle_timeout_seconds?: number;
   network?: NetworkMode;
-  budget?: Budget;
 }
 
 /** Body of `POST /v1/instances/{id}/fork`. */
@@ -557,7 +499,7 @@ export interface SSEEvent {
 
 /**
  * Every failure of this client. `code` is one of the stable API codes
- * (`invalid_request`, `invalid_api_key`, `insufficient_balance`, `forbidden`,
+ * (`invalid_request`, `invalid_api_key`, `forbidden`,
  * `not_found`, `conflict`, `instance_limit_reached`, `not_supported`,
  * `try_again`, `timeout`, `bad_gateway`, `internal`); `status` is the HTTP
  * status, or 0 when the request never completed.
@@ -609,8 +551,6 @@ export function codeForStatus(status: number): string {
       return "invalid_request";
     case 401:
       return "invalid_api_key";
-    case 402:
-      return "insufficient_balance";
     case 403:
       return "forbidden";
     case 404:
@@ -1052,12 +992,12 @@ export class Warren {
     return (await this.http.json<VersionInfo>("GET", "/v1/version", options)).version;
   }
 
-  /** `POST /v1/signup`: a workspace with the free credit; the key is shown once. No auth. */
+  /** `POST /v1/signup`: a new workspace and its first key, shown once. No auth. */
   async signup(req: SignupRequest = {}, options?: RequestOptions): Promise<SignupResult> {
     return this.http.json("POST", "/v1/signup", { ...options, json: compact(req) });
   }
 
-  // -- workspace, keys, billing ---------------------------------------------
+  // -- workspace, keys ------------------------------------------------------
 
   /** `GET /v1/workspace`. */
   async workspace(options?: RequestOptions): Promise<WorkspaceInfo> {
@@ -1077,21 +1017,6 @@ export class Warren {
   /** `DELETE /v1/api-keys/{id}`. */
   async deleteApiKey(keyId: string, options?: RequestOptions): Promise<Deleted> {
     return this.http.json("DELETE", `/v1/api-keys/${seg(keyId)}`, options);
-  }
-
-  /** `GET /v1/billing`. */
-  async billing(options?: RequestOptions): Promise<Billing> {
-    return this.http.json("GET", "/v1/billing", options);
-  }
-
-  /** `POST /v1/billing/top-up`; only `provider: "dev"` exists and needs a `--dev` daemon. */
-  async topUp(req: TopUpRequest, options?: RequestOptions): Promise<TopUpResult> {
-    return this.http.json("POST", "/v1/billing/top-up", { ...options, json: compact({ provider: "dev", ...req }) });
-  }
-
-  /** `GET /v1/billing/ledger?limit=`, newest first. */
-  async ledger(limit?: number, options?: RequestOptions): Promise<LedgerEntry[]> {
-    return unwrapList<LedgerEntry>(await this.http.json("GET", "/v1/billing/ledger", { ...options, query: { limit } }));
   }
 
   // -- templates ------------------------------------------------------------
@@ -1143,7 +1068,7 @@ export class Warren {
     return this.http.json("DELETE", inst(id), options);
   }
 
-  /** `POST /v1/instances/{id}/stop`: disk-only billing, never wakes on request. */
+  /** `POST /v1/instances/{id}/stop`: frees CPU and memory; never wakes on request. */
   async stopInstance(id: string, options?: RequestOptions): Promise<StatusChange> {
     return this.http.json("POST", inst(id, "stop"), options);
   }

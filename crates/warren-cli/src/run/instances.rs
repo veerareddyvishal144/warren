@@ -150,7 +150,6 @@ pub fn create_request(args: &CreateArgs) -> Result<CreateInstanceRequest, Failur
         name: args.name.clone(),
         metadata: (!metadata.is_empty()).then_some(metadata),
         env: (!env.is_empty()).then_some(env),
-        budget: None,
         auto_sleep: args.auto_sleep.then_some(true),
         idle_timeout_seconds: args.idle,
         network: args.network,

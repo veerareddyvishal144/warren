@@ -1,7 +1,7 @@
 //! Rust client for the Warren Sandbox API and Agent API.
 //!
 //! * [`Client`] talks to the daemon's Sandbox API (`/v1` on the API host):
-//!   signup, workspace, keys, billing, templates, instances and their
+//!   signup, workspace, keys, templates, instances and their
 //!   lifecycle, exec, logs, metrics, signed URLs, backups and crons.
 //! * [`AgentClient`] talks to the gateway inside one instance through the edge:
 //!   responses (plain and streamed as [`SseEvent`]s), sessions, models, files
@@ -36,7 +36,7 @@
 //! # }
 //! ```
 //!
-//! Wire types that exist only on the wire (signup, billing, status answers,
+//! Wire types that exist only on the wire (signup, workspace, status answers,
 //! cron requests...) live in [`types`]; everything else is `warren_core`.
 
 pub mod agent;

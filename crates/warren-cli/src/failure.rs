@@ -104,8 +104,13 @@ mod tests {
         let j: serde_json::Value = serde_json::from_str(&f.render(true)).unwrap();
         assert_eq!(j["error"]["code"], "conflict");
         assert_eq!(j["error"]["message"], "instance is stopped");
-        let f = Failure::from(Error::insufficient_balance(2_000_000, 1_000_000));
-        assert!(f.render(false).contains("required_micros"));
+        let f = Failure::from(Error::instance_limit(3, 3));
+        assert!(
+            f.render(false)
+                .starts_with("warren: instance_limit_reached: ")
+        );
+        let j: serde_json::Value = serde_json::from_str(&f.render(true)).unwrap();
+        assert_eq!(j["error"]["details"]["limit"], 3);
         assert!(
             Failure::usage("no key")
                 .render(false)

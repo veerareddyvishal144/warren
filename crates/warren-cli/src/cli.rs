@@ -7,8 +7,6 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 use warren_core::{InstanceType, NetworkMode};
 
-use crate::util::parse_usd;
-
 /// Sandbox API base URL used when neither a flag, an environment variable nor
 /// the config file names one.
 pub const DEFAULT_API_URL: &str = "http://api.warren.localhost:7337";
@@ -79,11 +77,6 @@ pub enum Command {
     Keys {
         #[command(subcommand)]
         cmd: KeysCmd,
-    },
-    /// Wallet, top-ups and the ledger.
-    Billing {
-        #[command(subcommand)]
-        cmd: BillingCmd,
     },
     /// Talk to the agent running inside an instance.
     Chat(ChatArgs),
@@ -341,25 +334,6 @@ pub enum KeysCmd {
     },
     /// Delete a key by id.
     Delete { id: String },
-}
-
-/// `warren billing ...`
-#[derive(Debug, Subcommand)]
-pub enum BillingCmd {
-    /// Wallet balance, limits and rates.
-    Show,
-    /// Add funds (dev provider; the daemon must run with --dev).
-    Topup {
-        /// Amount in US dollars, e.g. 5 or 12.50.
-        #[arg(long, value_name = "AMOUNT", value_parser = parse_usd)]
-        usd: i64,
-    },
-    /// Wallet movements, newest first.
-    Ledger {
-        /// Maximum entries (default 100).
-        #[arg(long)]
-        limit: Option<u32>,
-    },
 }
 
 /// Arguments of `warren chat`.
@@ -865,7 +839,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_billing_chat_files() {
+    fn keys_chat_files() {
         assert!(matches!(
             parse(&["keys", "list"]).command,
             Command::Keys { cmd: KeysCmd::List }
@@ -876,29 +850,6 @@ mod tests {
         assert!(
             matches!(parse(&["keys", "delete", "k1"]).command, Command::Keys { cmd: KeysCmd::Delete { id } } if id == "k1")
         );
-        assert!(matches!(
-            parse(&["billing", "show"]).command,
-            Command::Billing {
-                cmd: BillingCmd::Show
-            }
-        ));
-        assert!(matches!(
-            parse(&["billing", "topup", "--usd", "12.50"]).command,
-            Command::Billing {
-                cmd: BillingCmd::Topup { usd: 12_500_000 }
-            }
-        ));
-        assert_eq!(
-            fails(&["billing", "topup", "--usd", "0"]).kind(),
-            ErrorKind::ValueValidation
-        );
-        assert_eq!(fails(&["billing", "topup", "--usd", "-1"]).exit_code(), 2);
-        assert!(matches!(
-            parse(&["billing", "ledger", "--limit", "5"]).command,
-            Command::Billing {
-                cmd: BillingCmd::Ledger { limit: Some(5) }
-            }
-        ));
         let Command::Chat(c) = parse(&[
             "chat",
             "i",

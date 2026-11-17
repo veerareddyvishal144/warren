@@ -22,15 +22,11 @@ These belong to the Agent API served inside an instance. A **response** is one t
 
 ## Workspace
 
-A workspace is the tenant: one wallet, many instances, many API keys, its own templates. `POST /v1/signup` creates one and returns its first key. Keys are `sk_live_` followed by 40 characters; only their SHA-256 is stored, so the plaintext is shown exactly once. `GET /v1/workspace` returns the workspace with its `awake_limit` and `awake_count`; `GET /v1/api-keys`, `POST /v1/api-keys` and `DELETE /v1/api-keys/{id}` manage keys (deleting the key you are using is allowed).
+A workspace is the tenant: many instances, many API keys, its own templates. `POST /v1/signup` creates one and returns `{ "workspace", "api_key", "key_id" }`; the workspace object is `id`, `name` and `created_at`. Keys are `sk_live_` followed by 40 characters; only their SHA-256 is stored, so the plaintext is shown exactly once. `GET /v1/workspace` returns the workspace with its `awake_limit` and `awake_count`; `GET /v1/api-keys`, `POST /v1/api-keys` and `DELETE /v1/api-keys/{id}` manage keys (deleting the key you are using is allowed).
 
-## Wallet
+## Awake quota
 
-The wallet is the workspace's prepaid balance in integer micro-dollars (`wallet_micros`; $1 = 1,000,000). Signup grants a $5 credit once. Instances are metered by the minute against the wallet; top-ups raise it and also raise `top_up_total_micros`, which sets how many instances may be awake at once. Every movement is a ledger entry: `compute` and `disk` charges (negative), `topup` and `credit` (positive), `adjustment`. See [billing.md](billing.md).
-
-## Budget
-
-`budget` on an instance (`monthly_cap_micros`, `credit_micros`) records spend caps for managed services the instance might consume, and is exposed inside the instance as `WARREN_BUDGET_MONTHLY_CAP_MICROS` and `WARREN_BUDGET_CREDIT_MICROS`. In the single-node build nothing meters against it; it is a contract for agents to read and for a later build to enforce. It is not the wallet.
+The operator may cap how many of a workspace's instances are awake at once with `--max-awake-instances N` on the daemon (`WARREN_MAX_AWAKE_INSTANCES`); unset means unlimited. Awake is every state that holds CPU and memory (`provisioning`, `running`, `starting`, `restarting`, `updating`, `stopping`, `waking`); `sleeping` and `stopped` instances hold only their disk and never count. Create, start, wake and fork answer `409 instance_limit_reached` when the workspace is at the limit, and `GET /v1/workspace` shows `awake_limit` (a number or `null`) next to `awake_count`. Auto-sleep is how you keep many instances for few slots. See [quotas.md](quotas.md).
 
 ## Two planes, one key
 
@@ -38,7 +34,7 @@ Warren has two HTTP planes, and the same API key opens both.
 
 | Plane | Host | What it does | Auth |
 |---|---|---|---|
-| Sandbox API | `api.<base>` (also `<base>/v1/...`) | Workspaces, keys, billing, templates, instances and their actions | `Authorization: Bearer sk_live_...` or `X-Warren-Key: sk_live_...` |
+| Sandbox API | `api.<base>` (also `<base>/v1/...`) | Workspaces, keys, templates, instances and their actions | `Authorization: Bearer sk_live_...` or `X-Warren-Key: sk_live_...` |
 | Instance plane | `<id>.<base>` and `<id>-<port>.<base>` | Whatever runs inside the instance: the gateway (Agent API, files, health) on the default port, your own processes on other ports, ttyd on 7681 | the same key in `X-Warren-Key` or `Authorization: Bearer`, **or** a signed URL (`?warren_token=`) which sets the `warren_session` cookie |
 
 The edge in front of both authenticates every instance request and checks that the instance belongs to the key's workspace (`404 not_found` otherwise), wakes a sleeping instance and holds the request until it answers, strips `X-Warren-Key` and the session cookie before forwarding, and passes `Authorization` through unchanged so your own service inside the instance can use it. Nothing inside an instance ever sees the workspace key; the only secret injected is a per-instance token that the daemon uses for exec on VM instances. The dashboard lives on the bare base host and stores the key in the browser.

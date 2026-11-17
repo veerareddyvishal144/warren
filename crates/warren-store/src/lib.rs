@@ -16,7 +16,6 @@ mod backups;
 mod crons;
 mod errors;
 mod instances;
-mod ledger;
 mod metrics;
 mod migrations;
 mod rows;

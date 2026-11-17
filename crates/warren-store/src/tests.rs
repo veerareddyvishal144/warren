@@ -5,15 +5,16 @@ use std::{collections::BTreeMap, sync::Arc};
 use rusqlite::ffi;
 use tempfile::TempDir;
 use warren_core::{
-    ApiKey, Backup, Budget, Cron, Instance, InstanceStatus, InstanceType, LedgerEntry, LedgerKind,
-    MetricPoint, NetworkMode, Shape, Store, Template, TemplateScope, Workspace,
+    ApiKey, Backup, Cron, Instance, InstanceStatus, InstanceType, MetricPoint, NetworkMode, Shape,
+    Store, Template, TemplateScope, Workspace,
     errors::{CODE_CONFLICT, CODE_INTERNAL, CODE_NOT_FOUND},
 };
 
 use crate::{
     SqliteStore,
     errors::{is_unique_violation, map_err},
-    migrations,
+    instances, migrations,
+    rows::query_many,
 };
 
 fn open() -> (TempDir, Arc<SqliteStore>) {
@@ -27,9 +28,6 @@ fn ws(id: &str, created_at: i64) -> Workspace {
         id: id.into(),
         name: format!("name of {id}"),
         created_at,
-        wallet_micros: 5_000_000,
-        top_up_total_micros: 0,
-        free_credit_granted: true,
     }
 }
 
@@ -97,10 +95,6 @@ fn inst(id: &str, workspace_id: &str, status: InstanceStatus, created_at: i64) -
         network: NetworkMode::DenyAll,
         auto_sleep: true,
         idle_timeout_seconds: 900,
-        budget: Budget {
-            monthly_cap_micros: 1_000_000,
-            credit_micros: 250_000,
-        },
         url: String::new(),
         default_port: 3737,
         mount_path: "/home/agent".into(),
@@ -112,9 +106,6 @@ fn inst(id: &str, workspace_id: &str, status: InstanceStatus, created_at: i64) -
         stopped_at: created_at + 3,
         slept_at: created_at + 4,
         last_activity_at: created_at + 5,
-        meter_started_at: created_at + 6,
-        metered_through: created_at + 7,
-        meter_carry_micros: 0.375,
         runtime: "firecracker".into(),
         runtime_ref: format!("vm-{id}"),
         ip: "172.30.0.7".into(),
@@ -151,19 +142,6 @@ fn cron(id: &str, instance_id: &str, enabled: bool, next_run_at: i64, created_at
         next_run_at,
         created_at,
         updated_at: created_at,
-    }
-}
-
-fn entry(workspace_id: &str, kind: LedgerKind, micros: i64, at: i64) -> LedgerEntry {
-    LedgerEntry {
-        id: String::new(),
-        workspace_id: workspace_id.into(),
-        instance_id: "ab12cd34ef".into(),
-        kind,
-        micros,
-        minutes: 1.5,
-        at,
-        note: "note".into(),
     }
 }
 
@@ -215,6 +193,298 @@ async fn open_configures_the_connection_and_migrates_once() {
     assert_eq!(rows, migrations::MIGRATIONS.len() as i64);
 }
 
+/// The schema exactly as migration 1 created it, with the billing columns and
+/// the ledger. Spelled out here rather than taken from `migrations.rs` so the
+/// upgrade is tested against what a development database really contains.
+const V1_SCHEMA: &str = "CREATE TABLE migrations (
+    version    INTEGER PRIMARY KEY,
+    name       TEXT    NOT NULL,
+    applied_at INTEGER NOT NULL
+);
+INSERT INTO migrations (version, name, applied_at) VALUES (1, 'initial', 1700000000);
+
+CREATE TABLE workspaces (
+    id                  TEXT    PRIMARY KEY,
+    name                TEXT    NOT NULL DEFAULT '',
+    created_at          INTEGER NOT NULL DEFAULT 0,
+    wallet_micros       INTEGER NOT NULL DEFAULT 0,
+    top_up_total_micros INTEGER NOT NULL DEFAULT 0,
+    free_credit_granted INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX workspaces_created ON workspaces (created_at);
+
+CREATE TABLE api_keys (
+    id           TEXT    PRIMARY KEY,
+    workspace_id TEXT    NOT NULL,
+    name         TEXT    NOT NULL DEFAULT '',
+    prefix       TEXT    NOT NULL DEFAULT '',
+    hash         TEXT    NOT NULL UNIQUE,
+    created_at   INTEGER NOT NULL DEFAULT 0,
+    expires_at   INTEGER NOT NULL DEFAULT 0,
+    last_used_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX api_keys_workspace ON api_keys (workspace_id, created_at);
+
+CREATE TABLE templates (
+    workspace_id TEXT    NOT NULL DEFAULT '',
+    name         TEXT    NOT NULL,
+    scope        TEXT    NOT NULL,
+    image_ref    TEXT    NOT NULL DEFAULT '',
+    image_digest TEXT    NOT NULL DEFAULT '',
+    default_port INTEGER NOT NULL DEFAULT 0,
+    mount_path   TEXT    NOT NULL DEFAULT '',
+    agent        INTEGER NOT NULL DEFAULT 0,
+    description  TEXT    NOT NULL DEFAULT '',
+    types        TEXT    NOT NULL DEFAULT '[]',
+    shape_cpu    INTEGER NOT NULL DEFAULT 0,
+    shape_memory INTEGER NOT NULL DEFAULT 0,
+    shape_disk   INTEGER NOT NULL DEFAULT 0,
+    env          TEXT    NOT NULL DEFAULT '{}',
+    revision     INTEGER NOT NULL DEFAULT 1,
+    created_at   INTEGER NOT NULL DEFAULT 0,
+    updated_at   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (workspace_id, name)
+);
+
+CREATE TABLE template_revisions (
+    workspace_id TEXT    NOT NULL DEFAULT '',
+    name         TEXT    NOT NULL,
+    scope        TEXT    NOT NULL,
+    image_ref    TEXT    NOT NULL DEFAULT '',
+    image_digest TEXT    NOT NULL DEFAULT '',
+    default_port INTEGER NOT NULL DEFAULT 0,
+    mount_path   TEXT    NOT NULL DEFAULT '',
+    agent        INTEGER NOT NULL DEFAULT 0,
+    description  TEXT    NOT NULL DEFAULT '',
+    types        TEXT    NOT NULL DEFAULT '[]',
+    shape_cpu    INTEGER NOT NULL DEFAULT 0,
+    shape_memory INTEGER NOT NULL DEFAULT 0,
+    shape_disk   INTEGER NOT NULL DEFAULT 0,
+    env          TEXT    NOT NULL DEFAULT '{}',
+    revision     INTEGER NOT NULL DEFAULT 1,
+    created_at   INTEGER NOT NULL DEFAULT 0,
+    updated_at   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (workspace_id, name, revision)
+);
+
+CREATE TABLE instances (
+    id                        TEXT    PRIMARY KEY,
+    workspace_id              TEXT    NOT NULL,
+    name                      TEXT    NOT NULL DEFAULT '',
+    template                  TEXT    NOT NULL DEFAULT '',
+    template_name             TEXT    NOT NULL DEFAULT '',
+    template_revision         INTEGER NOT NULL DEFAULT 0,
+    image_ref                 TEXT    NOT NULL DEFAULT '',
+    kind                      TEXT    NOT NULL,
+    status                    TEXT    NOT NULL,
+    status_reason             TEXT    NOT NULL DEFAULT '',
+    cpu                       INTEGER NOT NULL DEFAULT 0,
+    memory                    INTEGER NOT NULL DEFAULT 0,
+    disk                      INTEGER NOT NULL DEFAULT 0,
+    region                    TEXT    NOT NULL DEFAULT '',
+    metadata                  TEXT    NOT NULL DEFAULT '{}',
+    env                       TEXT    NOT NULL DEFAULT '{}',
+    network                   TEXT    NOT NULL,
+    auto_sleep                INTEGER NOT NULL DEFAULT 0,
+    idle_timeout_seconds      INTEGER NOT NULL DEFAULT 0,
+    budget_monthly_cap_micros INTEGER NOT NULL DEFAULT 0,
+    budget_credit_micros      INTEGER NOT NULL DEFAULT 0,
+    default_port              INTEGER NOT NULL DEFAULT 0,
+    mount_path                TEXT    NOT NULL DEFAULT '',
+    agent_api                 INTEGER NOT NULL DEFAULT 0,
+    parent_id                 TEXT    NOT NULL DEFAULT '',
+    created_at                INTEGER NOT NULL DEFAULT 0,
+    updated_at                INTEGER NOT NULL DEFAULT 0,
+    started_at                INTEGER NOT NULL DEFAULT 0,
+    stopped_at                INTEGER NOT NULL DEFAULT 0,
+    slept_at                  INTEGER NOT NULL DEFAULT 0,
+    last_activity_at          INTEGER NOT NULL DEFAULT 0,
+    meter_started_at          INTEGER NOT NULL DEFAULT 0,
+    metered_through           INTEGER NOT NULL DEFAULT 0,
+    meter_carry_micros        REAL    NOT NULL DEFAULT 0,
+    runtime                   TEXT    NOT NULL DEFAULT '',
+    runtime_ref               TEXT    NOT NULL DEFAULT '',
+    ip                        TEXT    NOT NULL DEFAULT '',
+    storage_path              TEXT    NOT NULL DEFAULT '',
+    instance_token            TEXT    NOT NULL DEFAULT '',
+    disk_used_bytes           INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX instances_workspace ON instances (workspace_id, created_at);
+CREATE INDEX instances_status    ON instances (status);
+CREATE INDEX instances_template  ON instances (workspace_id, template_name);
+
+CREATE TABLE ledger (
+    id           TEXT    PRIMARY KEY,
+    workspace_id TEXT    NOT NULL,
+    instance_id  TEXT    NOT NULL DEFAULT '',
+    kind         TEXT    NOT NULL,
+    micros       INTEGER NOT NULL,
+    minutes      REAL    NOT NULL DEFAULT 0,
+    at           INTEGER NOT NULL,
+    note         TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX ledger_workspace ON ledger (workspace_id, at);
+
+CREATE TABLE metrics (
+    instance_id  TEXT    NOT NULL,
+    at           INTEGER NOT NULL,
+    cpu_percent  REAL    NOT NULL DEFAULT 0,
+    memory_bytes INTEGER NOT NULL DEFAULT 0,
+    disk_bytes   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX metrics_instance_at ON metrics (instance_id, at);
+
+CREATE TABLE backups (
+    id           TEXT    PRIMARY KEY,
+    instance_id  TEXT    NOT NULL,
+    workspace_id TEXT    NOT NULL,
+    path         TEXT    NOT NULL DEFAULT '',
+    size_bytes   INTEGER NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL DEFAULT 0,
+    note         TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX backups_instance ON backups (instance_id, created_at);
+
+CREATE TABLE crons (
+    id           TEXT    PRIMARY KEY,
+    instance_id  TEXT    NOT NULL,
+    workspace_id TEXT    NOT NULL,
+    name         TEXT    NOT NULL DEFAULT '',
+    prompt       TEXT    NOT NULL DEFAULT '',
+    schedule     TEXT    NOT NULL DEFAULT '',
+    timezone     TEXT    NOT NULL DEFAULT '',
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    last_run_at  INTEGER NOT NULL DEFAULT 0,
+    last_status  TEXT    NOT NULL DEFAULT '',
+    next_run_at  INTEGER NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL DEFAULT 0,
+    updated_at   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX crons_instance ON crons (instance_id, created_at);
+CREATE INDEX crons_due      ON crons (enabled, next_run_at);
+
+INSERT INTO workspaces (id, name, created_at, wallet_micros, top_up_total_micros, free_credit_granted)
+VALUES ('ws_old', 'name of ws_old', 100, 5000000, 7000000, 1);
+
+INSERT INTO instances (
+    id, workspace_id, name, template, template_name, template_revision, image_ref, kind, status,
+    status_reason, cpu, memory, disk, region, metadata, env, network, auto_sleep,
+    idle_timeout_seconds, budget_monthly_cap_micros, budget_credit_micros, default_port,
+    mount_path, agent_api, parent_id, created_at, updated_at, started_at, stopped_at, slept_at,
+    last_activity_at, meter_started_at, metered_through, meter_carry_micros, runtime, runtime_ref,
+    ip, storage_path, instance_token, disk_used_bytes
+) VALUES (
+    'oldinst001', 'ws_old', 'instance oldinst001', 'warren-agent@1', 'warren-agent', 1,
+    'warren/agent:dev', 'vm', 'running', 'because', 4, 8, 6, 'local', '{\"plan\":\"pro\"}',
+    '{\"APP_ENV\":\"production\"}', 'deny-all', 1, 900, 1000000, 250000, 3737, '/home/agent', 1,
+    'parent0001', 100, 101, 102, 103, 104, 105, 106, 107, 0.375, 'firecracker', 'vm-oldinst001',
+    '172.30.0.7', '/var/lib/warren/instances/oldinst001', 'tok3n', 123456
+);
+
+INSERT INTO ledger (id, workspace_id, instance_id, kind, micros, minutes, at, note)
+VALUES ('entry00001', 'ws_old', 'oldinst001', 'topup', 5000000, 0, 100, '');
+";
+
+/// Column names of `table` in schema order.
+async fn columns(store: &SqliteStore, table: &'static str) -> Vec<String> {
+    store
+        .run(move |c| {
+            query_many(c, &format!("PRAGMA table_info({table})"), [], |r| {
+                r.get::<_, String>(1)
+            })
+        })
+        .await
+        .expect("table_info")
+}
+
+#[tokio::test]
+async fn version_1_database_upgrades_to_version_2_and_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("warren.db");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(V1_SCHEMA)
+        .expect("old schema");
+
+    let store = SqliteStore::open(&path).expect("open upgrades the schema");
+    let versions: Vec<i64> = store
+        .run(|c| {
+            query_many(
+                c,
+                "SELECT version FROM migrations ORDER BY version",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(versions, vec![1, 2], "version 1 kept, version 2 recorded");
+
+    let ledger_tables: i64 = store
+        .run(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('ledger', 'ledger_workspace')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(map_err)
+        })
+        .await
+        .unwrap();
+    assert_eq!(ledger_tables, 0, "ledger table and its index are gone");
+    assert_eq!(
+        columns(&store, "workspaces").await,
+        vec!["id", "name", "created_at"]
+    );
+    let mut inst_cols = columns(&store, "instances").await;
+    inst_cols.sort_unstable();
+    let mut expected_cols: Vec<String> = instances::COLS.iter().map(|c| c.to_string()).collect();
+    expected_cols.sort_unstable();
+    assert_eq!(
+        inst_cols, expected_cols,
+        "instances columns equal the store's column list"
+    );
+
+    // Rows written by the old schema read back without their billing fields.
+    let old_ws = ws("ws_old", 100);
+    assert_eq!(store.get_workspace("ws_old").await.unwrap(), old_ws);
+    let old_inst = inst("oldinst001", "ws_old", InstanceStatus::Running, 100);
+    assert_eq!(store.get_instance("oldinst001").await.unwrap(), old_inst);
+    assert_eq!(store.count_awake_instances("ws_old").await.unwrap(), 1);
+
+    // Updates and inserts work against the upgraded tables.
+    let mut renamed = old_ws.clone();
+    renamed.name = "renamed".into();
+    store.update_workspace(&renamed).await.unwrap();
+    assert_eq!(store.get_workspace("ws_old").await.unwrap(), renamed);
+    let mut slept = old_inst.clone();
+    slept.status = InstanceStatus::Sleeping;
+    slept.slept_at = 999;
+    store.update_instance(&slept).await.unwrap();
+    assert_eq!(store.get_instance("oldinst001").await.unwrap(), slept);
+    assert_eq!(store.count_awake_instances("ws_old").await.unwrap(), 0);
+
+    let new_ws = ws("ws_new", 200);
+    store.create_workspace(&new_ws).await.unwrap();
+    assert_eq!(store.get_workspace("ws_new").await.unwrap(), new_ws);
+    let new_inst = inst("newinst001", "ws_new", InstanceStatus::Running, 300);
+    store.create_instance(&new_inst).await.unwrap();
+    assert_eq!(store.get_instance("newinst001").await.unwrap(), new_inst);
+    assert_eq!(
+        store.list_workspaces().await.unwrap(),
+        vec![new_ws, renamed],
+        "newest first"
+    );
+
+    // Re-opening applies nothing further.
+    drop(store);
+    let again = SqliteStore::open(&path).expect("reopen");
+    assert_eq!(
+        again.run(|c| migrations::current_version(c)).await.unwrap(),
+        2
+    );
+}
+
 #[tokio::test]
 async fn workspace_round_trip() {
     let (_dir, store) = open();
@@ -233,9 +503,6 @@ async fn workspace_round_trip() {
 
     let mut a2 = a.clone();
     a2.name = "renamed".into();
-    a2.wallet_micros = 42;
-    a2.top_up_total_micros = 7;
-    a2.free_credit_granted = false;
     store.update_workspace(&a2).await.unwrap();
     assert_eq!(store.get_workspace("ws_a").await.unwrap(), a2);
 
@@ -612,7 +879,7 @@ async fn instance_round_trip_with_internal_fields() {
 
     let mut a2 = a.clone();
     a2.status = InstanceStatus::Stopped;
-    a2.status_reason = "insufficient_balance".into();
+    a2.status_reason = "stopped by operator".into();
     a2.kind = InstanceType::Default;
     a2.network = NetworkMode::AllowAll;
     a2.shape = Shape {
@@ -626,20 +893,8 @@ async fn instance_round_trip_with_internal_fields() {
     a2.runtime_ref = "container-xyz".into();
     a2.disk_used_bytes = 1 << 40;
     a2.auto_sleep = false;
-    a2.budget = Budget::default();
     store.update_instance(&a2).await.unwrap();
     assert_eq!(store.get_instance("aaaaaaaaaa").await.unwrap(), a2);
-
-    // The meter position belongs to the biller: a full-row write leaves it alone.
-    let mut stale = a2.clone();
-    stale.metered_through = 12_345;
-    stale.meter_carry_micros = 0.999_999;
-    store.update_instance(&stale).await.unwrap();
-    assert_eq!(
-        store.get_instance("aaaaaaaaaa").await.unwrap(),
-        a2,
-        "update_instance does not write metered_through or meter_carry_micros"
-    );
 
     let ghost = inst("gggggggggg", "ws_a", InstanceStatus::Running, 1);
     assert_eq!(
@@ -655,83 +910,6 @@ async fn instance_round_trip_with_internal_fields() {
     };
     store.create_instance(&bare).await.unwrap();
     assert_eq!(store.get_instance("dddddddddd").await.unwrap(), bare);
-}
-
-#[tokio::test]
-async fn set_meter_writes_only_the_meter_and_honours_the_cas() {
-    let (_dir, store) = open();
-    let a = inst("aaaaaaaaaa", "ws_a", InstanceStatus::Running, 100);
-    store.create_instance(&a).await.unwrap();
-    assert_eq!(a.metered_through, 107, "create_instance persists the meter");
-    assert_eq!(store.get_instance("aaaaaaaaaa").await.unwrap(), a);
-
-    // Unconditional write: only the two meter columns change.
-    assert!(
-        store
-            .set_meter("aaaaaaaaaa", 1_000, 0.25, None)
-            .await
-            .unwrap()
-    );
-    let mut expected = a.clone();
-    expected.metered_through = 1_000;
-    expected.meter_carry_micros = 0.25;
-    assert_eq!(store.get_instance("aaaaaaaaaa").await.unwrap(), expected);
-
-    // CAS miss: nothing changes and the miss is reported, not an error.
-    assert!(
-        !store
-            .set_meter("aaaaaaaaaa", 2_000, 0.5, Some(999))
-            .await
-            .unwrap()
-    );
-    assert_eq!(store.get_instance("aaaaaaaaaa").await.unwrap(), expected);
-
-    // CAS hit, including a write that leaves the values as they are.
-    assert!(
-        store
-            .set_meter("aaaaaaaaaa", 2_000, 0.5, Some(1_000))
-            .await
-            .unwrap()
-    );
-    assert!(
-        store
-            .set_meter("aaaaaaaaaa", 2_000, 0.5, Some(2_000))
-            .await
-            .unwrap(),
-        "a no-op CAS hit still counts as a hit"
-    );
-    expected.metered_through = 2_000;
-    expected.meter_carry_micros = 0.5;
-    assert_eq!(store.get_instance("aaaaaaaaaa").await.unwrap(), expected);
-
-    // The lifecycle writing the whole row with a stale snapshot cannot rewind it.
-    let mut lifecycle_copy = a.clone();
-    lifecycle_copy.status = InstanceStatus::Stopping;
-    lifecycle_copy.ip = "10.9.9.9".into();
-    store.update_instance(&lifecycle_copy).await.unwrap();
-    let after = store.get_instance("aaaaaaaaaa").await.unwrap();
-    assert_eq!(after.status, InstanceStatus::Stopping);
-    assert_eq!(after.ip, "10.9.9.9");
-    assert_eq!(after.metered_through, 2_000);
-    assert_eq!(after.meter_carry_micros, 0.5);
-
-    // Unknown id: not_found whether or not a CAS value is given.
-    assert_eq!(
-        store
-            .set_meter("zzzzzzzzzz", 1, 0.0, None)
-            .await
-            .unwrap_err()
-            .code,
-        CODE_NOT_FOUND
-    );
-    assert_eq!(
-        store
-            .set_meter("zzzzzzzzzz", 1, 0.0, Some(1))
-            .await
-            .unwrap_err()
-            .code,
-        CODE_NOT_FOUND
-    );
 }
 
 #[tokio::test]
@@ -857,93 +1035,6 @@ async fn count_instances_using_template_ignores_deleted_rows() {
             .unwrap(),
         0
     );
-}
-
-#[tokio::test]
-async fn ledger_moves_the_wallet_atomically() {
-    let (_dir, store) = open();
-    let mut w = ws("ws_a", 1);
-    w.wallet_micros = 0;
-    store.create_workspace(&w).await.unwrap();
-
-    let mut topup = entry("ws_a", LedgerKind::Topup, 5_000_000, 100);
-    store.apply_ledger(&mut topup).await.unwrap();
-    assert_eq!(topup.id.len(), 32, "id assigned when empty");
-    assert!(topup.id.bytes().all(|b| b.is_ascii_hexdigit()));
-    let w = store.get_workspace("ws_a").await.unwrap();
-    assert_eq!(
-        (w.wallet_micros, w.top_up_total_micros),
-        (5_000_000, 5_000_000)
-    );
-
-    let mut charge = entry("ws_a", LedgerKind::Compute, -1_234, 200);
-    charge.id = "fixed-id".into();
-    store.apply_ledger(&mut charge).await.unwrap();
-    assert_eq!(charge.id, "fixed-id", "given ids are kept");
-    let mut credit = entry("ws_a", LedgerKind::Credit, 1_000, 300);
-    store.apply_ledger(&mut credit).await.unwrap();
-    let w = store.get_workspace("ws_a").await.unwrap();
-    assert_eq!(
-        (w.wallet_micros, w.top_up_total_micros),
-        (5_000_000 - 1_234 + 1_000, 5_000_000)
-    );
-
-    let listed = store.list_ledger("ws_a", 0).await.unwrap();
-    assert_eq!(
-        listed,
-        vec![credit.clone(), charge.clone(), topup.clone()],
-        "newest first, 0 = no limit"
-    );
-    assert_eq!(
-        store.list_ledger("ws_a", 2).await.unwrap(),
-        vec![credit, charge.clone()]
-    );
-    assert!(store.list_ledger("ws_b", 10).await.unwrap().is_empty());
-
-    // Unknown workspace: nothing is written.
-    let mut orphan = entry("ws_none", LedgerKind::Topup, 1, 400);
-    assert_eq!(
-        store.apply_ledger(&mut orphan).await.unwrap_err().code,
-        CODE_NOT_FOUND
-    );
-    assert!(store.list_ledger("ws_none", 0).await.unwrap().is_empty());
-
-    // Duplicate id: the wallet update made earlier in the transaction is rolled back.
-    let before = store.get_workspace("ws_a").await.unwrap();
-    let mut dup = entry("ws_a", LedgerKind::Topup, 999_999, 500);
-    dup.id = charge.id.clone();
-    assert_eq!(
-        store.apply_ledger(&mut dup).await.unwrap_err().code,
-        CODE_CONFLICT
-    );
-    assert_eq!(
-        store.get_workspace("ws_a").await.unwrap(),
-        before,
-        "rolled back"
-    );
-    assert_eq!(store.list_ledger("ws_a", 0).await.unwrap().len(), 3);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_ledger_writes_serialize_on_the_connection() {
-    let (_dir, store) = open();
-    let mut w = ws("ws_a", 1);
-    w.wallet_micros = 0;
-    store.create_workspace(&w).await.unwrap();
-    let mut tasks = Vec::new();
-    for i in 0..64 {
-        let store = Arc::clone(&store);
-        tasks.push(tokio::spawn(async move {
-            let mut e = entry("ws_a", LedgerKind::Topup, 1, i);
-            store.apply_ledger(&mut e).await
-        }));
-    }
-    for t in tasks {
-        t.await.unwrap().unwrap();
-    }
-    let w = store.get_workspace("ws_a").await.unwrap();
-    assert_eq!((w.wallet_micros, w.top_up_total_micros), (64, 64));
-    assert_eq!(store.list_ledger("ws_a", 0).await.unwrap().len(), 64);
 }
 
 #[tokio::test]

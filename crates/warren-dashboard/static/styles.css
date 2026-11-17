@@ -155,8 +155,6 @@ label.check { display: flex; align-items: center; gap: 8px; }
   background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn);
 }
 .badge.st-failed { background: color-mix(in srgb, var(--danger) 18%, transparent); color: var(--danger); }
-.badge.kind-topup, .badge.kind-credit { color: var(--ok); }
-.badge.kind-compute, .badge.kind-disk { color: var(--muted); }
 .busy .badge.st-provisioning, .busy .badge.st-starting, .busy .badge.st-restarting, .busy .badge.st-updating,
 .busy .badge.st-stopping, .busy .badge.st-waking, .busy .badge.st-deleting { animation: pulse 1.6s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: 0.55; } }
@@ -214,14 +212,10 @@ label.check { display: flex; align-items: center; gap: 8px; }
 .spark-area { fill: var(--accent); opacity: 0.15; }
 .spark-dot { fill: var(--accent); }
 
-/* Tables and billing */
+/* Tables */
 .table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .table th, .table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
 .table th { color: var(--muted); font-weight: 600; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 12px 0; }
-.tile { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; }
-.tile-label { color: var(--muted); font-size: 12px; }
-.tile-value { font-size: 20px; font-variant-numeric: tabular-nums; }
 
 /* Toast */
 .toast {

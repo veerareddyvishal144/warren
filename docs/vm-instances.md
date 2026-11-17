@@ -1,13 +1,12 @@
 # VM instances (experimental)
 
-Type `vm` runs an instance as a Firecracker microVM with its own Linux kernel instead of a gVisor container. The API is identical; what changes is isolation, price and host requirements. This type is experimental: it needs root on the host, it is tested on one machine, and it is off unless you enable it.
+Type `vm` runs an instance as a Firecracker microVM with its own Linux kernel instead of a gVisor container. The API is identical; what changes is isolation and host requirements. This type is experimental: it needs root on the host, it is tested on one machine, and it is off unless you enable it.
 
 ## What differs from `default`
 
 | | `default` | `vm` |
 |---|---|---|
 | Boundary | gVisor user-space kernel on the shared host kernel | A hardware-virtualised microVM with its own guest kernel |
-| Compute price | 1x | 2.5x (`rates.vm_multiplier`); disk unchanged: 2/4/4 is $11.36 a month instead of $4.76 |
 | Disk | up to the shape's maximum (12 / 20 / 40 / 80 GB) | up to 100 GB on every shape |
 | `runtime` field | `docker` | `firecracker` |
 | Exec | `docker exec` | the gateway's `POST /v1/exec` inside the guest, authenticated with the per-instance token |

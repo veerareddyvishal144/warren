@@ -1,5 +1,5 @@
 //! In-memory fakes for the traits the lifecycle consumes: `Store`, `Runtime`,
-//! `Biller`, `TemplateService` and `Clock`. Test-only.
+//! `TemplateService` and `Clock`. Test-only.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -14,9 +14,9 @@ use std::{
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use warren_core::{
-    ApiKey, Backup, Biller, Clock, Cron, Error, ExecRequest, ExecResult, Instance, InstanceType,
-    LedgerEntry, LedgerKind, LogsOptions, MetricPoint, Money, Rates, RegisterTemplateRequest,
-    Result, RunInfo, Runtime, Shape, Stats, Store, Template, TemplateService, Workspace, errors,
+    ApiKey, Backup, Clock, Cron, Error, ExecRequest, ExecResult, Instance, LogsOptions,
+    MetricPoint, RegisterTemplateRequest, Result, RunInfo, Runtime, Shape, Stats, Store, Template,
+    TemplateService, Workspace, errors,
 };
 
 // ---------------------------------------------------------------- clock
@@ -47,7 +47,6 @@ struct State {
     instances: BTreeMap<String, Instance>,
     templates: Vec<Template>,
     keys: Vec<ApiKey>,
-    ledger: Vec<LedgerEntry>,
     metrics: Vec<(String, MetricPoint)>,
     backups: Vec<Backup>,
     crons: Vec<Cron>,
@@ -59,8 +58,9 @@ pub struct FakeStore {
     state: Mutex<State>,
     /// Number of `update_instance` calls.
     pub updates: AtomicUsize,
-    /// Number of `set_meter` calls.
-    pub meter_sets: AtomicUsize,
+    /// Delay inside `count_awake_instances`, in milliseconds, to widen the
+    /// window between a quota check and the write that consumes the slot.
+    pub count_delay_ms: AtomicU64,
     /// Make `update_instance` fail.
     pub fail_update: AtomicBool,
 }
@@ -291,37 +291,11 @@ impl Store for FakeStore {
         }
         self.updates.fetch_add(1, Ordering::SeqCst);
         let mut st = self.state.lock();
-        let Some(current) = st.instances.get(&inst.id) else {
+        if !st.instances.contains_key(&inst.id) {
             return Err(Error::not_found("instance"));
-        };
-        // Like the real store, the meter columns belong to `set_meter`.
-        let mut row = inst.clone();
-        row.metered_through = current.metered_through;
-        row.meter_carry_micros = current.meter_carry_micros;
-        st.instances.insert(inst.id.clone(), row);
-        Ok(())
-    }
-    async fn set_meter(
-        &self,
-        id: &str,
-        metered_through: i64,
-        carry_micros: f64,
-        expected_from: Option<i64>,
-    ) -> Result<bool> {
-        self.meter_sets.fetch_add(1, Ordering::SeqCst);
-        let mut st = self.state.lock();
-        let row = st
-            .instances
-            .get_mut(id)
-            .ok_or_else(|| Error::not_found("instance"))?;
-        if let Some(expected) = expected_from
-            && row.metered_through != expected
-        {
-            return Ok(false);
         }
-        row.metered_through = metered_through;
-        row.meter_carry_micros = carry_micros;
-        Ok(true)
+        st.instances.insert(inst.id.clone(), inst.clone());
+        Ok(())
     }
     async fn delete_instance(&self, id: &str) -> Result<()> {
         self.state
@@ -332,13 +306,18 @@ impl Store for FakeStore {
             .ok_or_else(|| Error::not_found("instance"))
     }
     async fn count_awake_instances(&self, workspace_id: &str) -> Result<u32> {
-        Ok(self
+        let awake = self
             .state
             .lock()
             .instances
             .values()
             .filter(|i| i.workspace_id == workspace_id && i.status.awake())
-            .count() as u32)
+            .count() as u32;
+        let delay = self.count_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        Ok(awake)
     }
     async fn count_instances_using_template(&self, workspace_id: &str, name: &str) -> Result<u32> {
         Ok(self
@@ -348,34 +327,6 @@ impl Store for FakeStore {
             .values()
             .filter(|i| i.workspace_id == workspace_id && i.template_name == name)
             .count() as u32)
-    }
-
-    async fn apply_ledger(&self, entry: &mut LedgerEntry) -> Result<()> {
-        let mut st = self.state.lock();
-        let ws = st
-            .workspaces
-            .get_mut(&entry.workspace_id)
-            .ok_or_else(|| Error::not_found("workspace"))?;
-        ws.wallet_micros += entry.micros;
-        if entry.kind == LedgerKind::Topup {
-            ws.top_up_total_micros += entry.micros;
-        }
-        if entry.id.is_empty() {
-            entry.id = warren_core::ids::new_id();
-        }
-        st.ledger.push(entry.clone());
-        Ok(())
-    }
-    async fn list_ledger(&self, workspace_id: &str, limit: u32) -> Result<Vec<LedgerEntry>> {
-        Ok(self
-            .state
-            .lock()
-            .ledger
-            .iter()
-            .filter(|e| e.workspace_id == workspace_id)
-            .take(limit as usize)
-            .cloned()
-            .collect())
     }
 
     async fn insert_metric(&self, instance_id: &str, p: MetricPoint) -> Result<()> {
@@ -664,106 +615,6 @@ impl Runtime for FakeRuntime {
     async fn disk_usage(&self, inst: &Instance) -> Result<i64> {
         self.record("disk_usage", &inst.id);
         Ok(self.disk_usage.load(Ordering::SeqCst))
-    }
-}
-
-// ---------------------------------------------------------------- biller
-
-/// A `Biller` whose answers are toggled with atomics; records the shapes it saw.
-#[derive(Default)]
-pub struct FakeBiller {
-    pub refuse_create: AtomicBool,
-    pub refuse_wake: AtomicBool,
-    /// `assert_can_wake` refuses with `insufficient_balance` (the wallet check).
-    pub refuse_wake_balance: AtomicBool,
-    pub create_checks: Mutex<Vec<(Shape, InstanceType)>>,
-    pub wake_checks: AtomicUsize,
-    /// Admit at most this many awake instances (counted through the store
-    /// passed to `with_store`), like the real ladder; `0` disables the count.
-    pub awake_cap: AtomicUsize,
-    store: Mutex<Option<Arc<FakeStore>>>,
-    /// Delay inside `assert_can_create`, in milliseconds, to widen races.
-    pub create_delay_ms: AtomicU64,
-    /// Delay inside `assert_can_wake`, in milliseconds, to widen races.
-    pub wake_delay_ms: AtomicU64,
-}
-
-impl FakeBiller {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-    /// Count awake instances in `store` and refuse beyond `cap`.
-    pub fn cap_awake(&self, store: Arc<FakeStore>, cap: usize) {
-        *self.store.lock() = Some(store);
-        self.awake_cap.store(cap, Ordering::SeqCst);
-    }
-    async fn check_ladder(&self, ws: &Workspace) -> Result<()> {
-        let cap = self.awake_cap.load(Ordering::SeqCst);
-        let store = self.store.lock().clone();
-        if let (Some(store), true) = (store, cap > 0) {
-            let awake = store.count_awake_instances(&ws.id).await?;
-            if awake as usize >= cap {
-                return Err(Error::instance_limit(cap as u32, awake));
-            }
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl Biller for FakeBiller {
-    fn rates(&self) -> Rates {
-        Rates::default()
-    }
-    fn monthly_running_micros(&self, shape: Shape, t: InstanceType) -> Money {
-        Rates::default().monthly_running(shape, t)
-    }
-    fn monthly_disk_micros(&self, shape: Shape) -> Money {
-        Rates::default().monthly_disk(shape)
-    }
-    async fn assert_can_create(&self, ws: &Workspace, shape: Shape, t: InstanceType) -> Result<()> {
-        self.create_checks.lock().push((shape, t));
-        if self.refuse_create.load(Ordering::SeqCst) {
-            return Err(Error::insufficient_balance(1_000_000, 0));
-        }
-        self.check_ladder(ws).await?;
-        let delay = self.create_delay_ms.load(Ordering::SeqCst);
-        if delay > 0 {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-        }
-        Ok(())
-    }
-    async fn assert_can_wake(&self, ws: &Workspace) -> Result<()> {
-        self.wake_checks.fetch_add(1, Ordering::SeqCst);
-        if self.refuse_wake.load(Ordering::SeqCst) {
-            return Err(Error::instance_limit(3, 3));
-        }
-        if self.refuse_wake_balance.load(Ordering::SeqCst) {
-            return Err(Error::insufficient_balance(1_000_000, 0));
-        }
-        self.check_ladder(ws).await?;
-        let delay = self.wake_delay_ms.load(Ordering::SeqCst);
-        if delay > 0 {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-        }
-        Ok(())
-    }
-    fn awake_limit(&self, _ws: &Workspace) -> u32 {
-        3
-    }
-    async fn top_up(&self, _workspace_id: &str, _micros: Money, _note: &str) -> Result<Workspace> {
-        Err(Error::not_supported("not used in lifecycle tests"))
-    }
-    async fn grant_credit(
-        &self,
-        _workspace_id: &str,
-        _micros: Money,
-        _note: &str,
-    ) -> Result<Workspace> {
-        Err(Error::not_supported("not used in lifecycle tests"))
-    }
-    async fn tick(&self, _now: i64) -> Result<()> {
-        Ok(())
     }
 }
 

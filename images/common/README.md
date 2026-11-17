@@ -70,8 +70,6 @@ template and instance values:
 | `WARREN_WORKSPACE_ID` | Owning workspace (`ws_...`). |
 | `WARREN_HOME` | The persistent home, `/home/agent`; the gateway confines the files API to it and runs agents in it. |
 | `WARREN_GATEWAY_PORT` | Port the gateway listens on, `3737`. |
-| `WARREN_BUDGET_MONTHLY_CAP_MICROS` | Managed-service spend cap in micro-dollars (`0` = none). |
-| `WARREN_BUDGET_CREDIT_MICROS` | Managed-service credit in micro-dollars. |
 
 Precedence is template `env` < instance `env` < the platform variables above.
 Template-level variables select the agent behaviour:
@@ -103,7 +101,7 @@ install python3-dev` inside an instance adds them. Global `npm install -g` as
 project under the home works without it.
 
 The base image must stay under 700 MB; `scripts/build-images.sh` prints the
-size of every image it builds and warns when the budget is exceeded.
+size of every image it builds and warns when the limit is exceeded.
 
 ## Building
 

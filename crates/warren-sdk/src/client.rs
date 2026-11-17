@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 use warren_core::json::List;
 use warren_core::{
     ApiKey, Backup, CreateInstanceRequest, Cron, DEFAULT_EXEC_TIMEOUT_SEC, ExecRequest, ExecResult,
-    ForkRequest, Instance, InstanceStatus, LedgerEntry, MetricPoint, Money, PatchInstanceRequest,
+    ForkRequest, Instance, InstanceStatus, MetricPoint, PatchInstanceRequest,
     RegisterTemplateRequest, ShapeRequest, Template,
 };
 
@@ -182,7 +182,7 @@ impl Client {
         .await
     }
 
-    // ----- workspace, keys, billing -----------------------------------------------
+    // ----- workspace, keys --------------------------------------------------------
 
     /// `GET /v1/workspace`.
     pub async fn workspace(&self) -> Result<WorkspaceResponse, SdkError> {
@@ -213,35 +213,6 @@ impl Client {
     /// `DELETE /v1/api-keys/{id}`.
     pub async fn delete_api_key(&self, id: &str) -> Result<DeletedKey, SdkError> {
         self.delete(&format!("/api-keys/{}", encode(id))).await
-    }
-
-    /// `GET /v1/billing`.
-    pub async fn billing(&self) -> Result<BillingResponse, SdkError> {
-        self.get("/billing", &[]).await
-    }
-
-    /// `POST /v1/billing/top-up`. Only `provider: "dev"` exists in this build
-    /// and only when the daemon runs with `--dev`.
-    pub async fn top_up(
-        &self,
-        micros: Money,
-        provider: Option<&str>,
-    ) -> Result<TopUpResponse, SdkError> {
-        let mut body = Map::new();
-        body.insert("amount_micros".into(), json!(micros));
-        if let Some(p) = provider.filter(|p| !p.is_empty()) {
-            body.insert("provider".into(), Value::String(p.to_string()));
-        }
-        self.post("/billing/top-up", &Value::Object(body)).await
-    }
-
-    /// `GET /v1/billing/ledger?limit=`. `limit` 0 lets the server choose.
-    pub async fn ledger(&self, limit: u32) -> Result<Vec<LedgerEntry>, SdkError> {
-        let mut q = Vec::new();
-        if limit > 0 {
-            q.push(("limit", limit.to_string()));
-        }
-        self.list("/billing/ledger", &q).await
     }
 
     // ----- templates ----------------------------------------------------------------

@@ -1,7 +1,7 @@
 //! The Sandbox API under `/v1`.
 //!
 //! A thin layer over the core traits: authenticate the caller, validate the
-//! request, call `Lifecycle` / `Biller` / `TemplateService` / `Store`, write
+//! request, call `Lifecycle` / `TemplateService` / `Store`, write
 //! JSON. Every route of `docs/API.md` is built by [`router`]; the edge mounts
 //! the returned router on the API host (paths keep their `/v1` prefix).
 //!
@@ -22,9 +22,7 @@
 use std::sync::Arc;
 
 use axum::Router;
-use warren_core::{
-    Authenticator, Biller, Clock, Config, Lifecycle, Signer, Store, TemplateService,
-};
+use warren_core::{Authenticator, Clock, Config, Lifecycle, Signer, Store, TemplateService};
 
 mod auth;
 mod extract;
@@ -42,7 +40,7 @@ pub use extract::{JsonBody, Query};
 pub use ratelimit::{ClientIp, RateLimiter};
 pub use requests::{
     CreateBackupRequest, CreateCronRequest, CreateKeyRequest, PatchCronRequest, RestoreRequest,
-    SignupRequest, TopUpRequest, UpdateInstanceRequest,
+    SignupRequest, UpdateInstanceRequest,
 };
 pub use schedule::{MAX_PROMPT_BYTES, next_run_at, parse_schedule, parse_timezone};
 
@@ -53,7 +51,6 @@ pub const SIGNUPS_PER_HOUR: u32 = 10;
 pub struct Deps {
     pub store: Arc<dyn Store>,
     pub lifecycle: Arc<dyn Lifecycle>,
-    pub biller: Arc<dyn Biller>,
     pub templates: Arc<dyn TemplateService>,
     pub auth: Arc<dyn Authenticator>,
     pub signer: Arc<dyn Signer>,

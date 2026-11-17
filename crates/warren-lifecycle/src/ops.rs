@@ -1,5 +1,5 @@
-//! Every state transition: the `Lifecycle` and `InstanceStopper` implementations
-//! and the locked primitives they share (boot, stop, sleep, delete, provision).
+//! Every state transition: the `Lifecycle` implementation and the locked
+//! primitives it shares (boot, stop, sleep, delete, provision).
 //!
 //! Public trait methods that change state run their body on a detached task
 //! (see [`Manager::detached`]) that owns the per-instance lock, so a client
@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use tokio::sync::OwnedMutexGuard;
 use warren_core::{
     Backup, CreateInstanceRequest, DEFAULT_EXEC_TIMEOUT_SEC, DEFAULT_IDLE_TIMEOUT_SEC, Error,
-    ExecRequest, ExecResult, ForkRequest, Instance, InstanceStatus, InstanceStopper, InstanceType,
-    Lifecycle, LogsOptions, MAX_BACKUP_BYTES_PER_WORKSPACE, MAX_BACKUPS_PER_INSTANCE, MetricPoint,
+    ExecRequest, ExecResult, ForkRequest, Instance, InstanceStatus, InstanceType, Lifecycle,
+    LogsOptions, MAX_BACKUP_BYTES_PER_WORKSPACE, MAX_BACKUPS_PER_INSTANCE, MetricPoint,
     NetworkMode, PatchInstanceRequest, Result, Runtime, STOP_GRACE_SECS, ShapeRequest, Template,
     Workspace, errors::is_requires_restart, ids, shapes,
 };
@@ -21,8 +21,8 @@ use warren_core::{
 use crate::{
     manager::{Manager, conflict_for},
     validate::{
-        resolve_region, validate_budget, validate_env, validate_idle_timeout, validate_metadata,
-        validate_name, validate_note,
+        resolve_region, validate_env, validate_idle_timeout, validate_metadata, validate_name,
+        validate_note,
     },
 };
 
@@ -78,10 +78,10 @@ impl Manager {
         self.start_runtime(rt, inst).await
     }
 
-    /// Admit the instance to the workspace's awake set and boot it. The
-    /// biller's wake check and the transition into `via` (which is what the
-    /// awake count sees) happen under the workspace lock, so concurrent
-    /// create/start/wake/fork requests cannot together exceed the ladder.
+    /// Admit the instance to the workspace's awake set and boot it. The quota
+    /// check and the transition into `via` (which is what the awake count
+    /// sees) happen under the workspace lock, so concurrent
+    /// create/start/wake/fork requests cannot together exceed the quota.
     pub(crate) async fn boot_admitted(
         &self,
         inst: &mut Instance,
@@ -90,8 +90,7 @@ impl Manager {
         let rt = self.runtime_for(inst)?;
         {
             let _ws = self.ws_lock(&inst.workspace_id).await;
-            let ws = self.deps.store.get_workspace(&inst.workspace_id).await?;
-            self.deps.biller.assert_can_wake(&ws).await?;
+            self.check_awake_quota(&inst.workspace_id).await?;
             self.transition(inst, via, "").await?;
         }
         self.start_runtime(rt, inst).await
@@ -161,9 +160,8 @@ impl Manager {
         self.save(inst).await
     }
 
-    /// Wake a sleeping instance once the biller allows one more awake instance
-    /// and the wallet can carry it. Biller refusals (`instance_limit`,
-    /// `insufficient_balance`) pass through unchanged.
+    /// Wake a sleeping instance once the workspace quota allows one more awake
+    /// instance. The `instance_limit` refusal passes through unchanged.
     pub(crate) async fn wake_locked(&self, inst: &mut Instance) -> Result<()> {
         self.boot_admitted(inst, InstanceStatus::Waking).await
     }
@@ -407,15 +405,6 @@ impl Manager {
             self.overlay(&mut inst);
             return Ok(inst);
         }
-        // Growing costs more per month: the same one-day-of-balance rule as a
-        // create applies to the new shape.
-        let biller = &self.deps.biller;
-        if biller.monthly_running_micros(shape, inst.kind)
-            > biller.monthly_running_micros(inst.shape, inst.kind)
-        {
-            let ws = self.deps.store.get_workspace(workspace_id).await?;
-            biller.assert_can_create(&ws, shape, inst.kind).await?;
-        }
         match rt.resize(&mut inst, shape).await {
             Ok(()) => {}
             Err(e) if is_requires_restart(&e) => {
@@ -526,13 +515,10 @@ impl Manager {
         };
         let shape = shapes::normalize(req.shape.as_ref(), Some(&base), src.kind)?;
 
-        // The workspace lock spans the biller's check and the insert of the
+        // The workspace lock spans the quota check and the insert of the
         // child, which is what consumes the awake slot.
         let ws_guard = self.ws_lock(&ws.id).await;
-        self.deps
-            .biller
-            .assert_can_create(ws, shape, src.kind)
-            .await?;
+        self.check_awake_quota(&ws.id).await?;
 
         let was_running = src.status == InstanceStatus::Running;
         if was_running {
@@ -559,7 +545,6 @@ impl Manager {
             network: src.network,
             auto_sleep: req.auto_sleep.unwrap_or(src.auto_sleep),
             idle_timeout_seconds: req.idle_timeout_seconds.unwrap_or(src.idle_timeout_seconds),
-            budget: src.budget,
             default_port: src.default_port,
             mount_path: src.mount_path.clone(),
             agent_api: src.agent_api,
@@ -626,18 +611,6 @@ impl Manager {
         Ok(inst)
     }
 
-    async fn stop_for_billing_locked(&self, instance_id: &str, reason: &str) -> Result<()> {
-        let mut inst = self.deps.store.get_instance(instance_id).await?;
-        match inst.status {
-            InstanceStatus::Running | InstanceStatus::Sleeping => {
-                tracing::warn!(instance = instance_id, reason, "stopping for billing");
-                self.stop_locked(&mut inst, reason).await
-            }
-            InstanceStatus::Stopped | InstanceStatus::Failed => Ok(()),
-            _ => Err(conflict_for(&inst)),
-        }
-    }
-
     /// The wake step of `ensure_awake`: under the lock, wake the instance if it
     /// is still sleeping and return the row as it is afterwards.
     async fn wake_if_sleeping_locked(&self, id: &str) -> Result<Instance> {
@@ -661,8 +634,6 @@ impl Lifecycle for Manager {
         validate_env(&env)?;
         let idle = req.idle_timeout_seconds.unwrap_or(DEFAULT_IDLE_TIMEOUT_SEC);
         validate_idle_timeout(idle, self.deps.config.min_idle_timeout_sec)?;
-        let budget = req.budget.unwrap_or_default();
-        validate_budget(&budget)?;
         let region = resolve_region(req.region.as_deref(), &self.deps.config.region)?;
         let kind = req.kind.unwrap_or_default();
         if kind == InstanceType::Performance {
@@ -708,7 +679,6 @@ impl Lifecycle for Manager {
             network: req.network.unwrap_or_default(),
             auto_sleep: req.auto_sleep.unwrap_or(false),
             idle_timeout_seconds: idle,
-            budget,
             default_port: tpl.default_port,
             mount_path: tpl.mount_path.clone(),
             agent_api: tpl.agent,
@@ -719,11 +689,11 @@ impl Lifecycle for Manager {
             instance_token: ids::new_instance_token(),
             ..Default::default()
         };
-        // The workspace lock spans the biller's check and the insert that
+        // The workspace lock spans the quota check and the insert that
         // consumes the awake slot; the instance lock is taken before the row
         // exists so nothing interleaves with provisioning.
         let ws_guard = self.ws_lock(&ws.id).await;
-        self.deps.biller.assert_can_create(ws, shape, kind).await?;
+        self.check_awake_quota(&ws.id).await?;
         let guard = self.lock(&inst.id).await;
         self.deps.store.create_instance(&inst).await?;
         drop(ws_guard);
@@ -787,10 +757,6 @@ impl Lifecycle for Manager {
             if let Some(idle) = req.idle_timeout_seconds {
                 validate_idle_timeout(idle, me.deps.config.min_idle_timeout_sec)?;
                 inst.idle_timeout_seconds = idle;
-            }
-            if let Some(budget) = req.budget {
-                validate_budget(&budget)?;
-                inst.budget = budget;
             }
             if let Some(network) = req.network.filter(|n| *n != inst.network) {
                 if !settled(inst.status) {
@@ -1045,8 +1011,8 @@ impl Lifecycle for Manager {
                 }
                 InstanceStatus::Sleeping => {
                     // The wake runs detached so a client that gives up waiting
-                    // cannot leave the instance `Waking` forever. Biller
-                    // refusals pass through unchanged.
+                    // cannot leave the instance `Waking` forever. A quota
+                    // refusal passes through unchanged.
                     let key = id.to_string();
                     inst = self
                         .detached(id, move |me, _g| async move {
@@ -1087,17 +1053,5 @@ impl Lifecycle for Manager {
             return Err(Error::bad_gateway("instance has no address"));
         }
         Ok((inst.ip, inst.instance_token))
-    }
-}
-
-#[async_trait]
-impl InstanceStopper for Manager {
-    async fn stop_for_billing(&self, instance_id: &str, reason: &str) -> Result<()> {
-        let (id, reason) = (instance_id.to_string(), reason.to_string());
-        let key = id.clone();
-        self.detached(&key, move |me, _g| async move {
-            me.stop_for_billing_locked(&id, &reason).await
-        })
-        .await
     }
 }

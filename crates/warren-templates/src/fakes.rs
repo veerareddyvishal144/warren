@@ -12,8 +12,8 @@ use std::{
 
 use async_trait::async_trait;
 use warren_core::{
-    ApiKey, Backup, Clock, Cron, Error, ExecRequest, ExecResult, Instance, LedgerEntry,
-    LogsOptions, MetricPoint, Result, RunInfo, Runtime, Shape, Stats, Store, Template, Workspace,
+    ApiKey, Backup, Clock, Cron, Error, ExecRequest, ExecResult, Instance, LogsOptions,
+    MetricPoint, Result, RunInfo, Runtime, Shape, Stats, Store, Template, Workspace,
 };
 
 /// (workspace_id, name); system templates use an empty workspace id.
@@ -215,13 +215,6 @@ impl Store for FakeStore {
             .get(&key(workspace_id, name))
             .copied()
             .unwrap_or(0))
-    }
-
-    async fn apply_ledger(&self, _entry: &mut LedgerEntry) -> Result<()> {
-        unused()
-    }
-    async fn list_ledger(&self, _workspace_id: &str, _limit: u32) -> Result<Vec<LedgerEntry>> {
-        unused()
     }
 
     async fn insert_metric(&self, _instance_id: &str, _p: MetricPoint) -> Result<()> {

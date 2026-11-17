@@ -1,7 +1,7 @@
 # Warren TypeScript client
 
 `warren.ts` is a one-file, dependency-free client for the Warren **Sandbox
-API** (instances, templates, billing, backups, crons) and the **Agent API**
+API** (instances, templates, backups, crons) and the **Agent API**
 served inside every instance (chat with streaming, sessions, files, exec). It
 is built on `fetch` and `ReadableStream`, so it runs unchanged in Node 20+,
 Deno, Bun and browsers.
@@ -37,7 +37,7 @@ console.log(await agent.listFiles("notes"));
 ```
 
 No key yet? `await new Warren(apiUrl).signup({ name: "me" })` returns a
-workspace, the plaintext `api_key` (shown once) and the free credit.
+workspace, the plaintext `api_key` (shown once) and its `key_id`.
 
 ## Authentication
 
@@ -63,8 +63,8 @@ try {
 }
 ```
 
-`code` is one of `invalid_request`, `invalid_api_key`, `insufficient_balance`,
-`forbidden`, `not_found`, `conflict`, `instance_limit_reached`,
+`code` is one of `invalid_request`, `invalid_api_key`, `forbidden`,
+`not_found`, `conflict`, `instance_limit_reached`,
 `not_supported`, `try_again`, `timeout`, `bad_gateway`, `internal`. `status`
 is the HTTP status, or 0 when the request never completed (network failure,
 timeout, client-side validation). Aborts through your own `AbortSignal` are
@@ -88,9 +88,8 @@ an optional trailing `{ signal, timeoutMs }`.
 |---|---|
 | `health()`, `version()` | `GET /v1/health`, `GET /v1/version` |
 | `signup({ name })` | `POST /v1/signup` |
-| `workspace()` | `GET /v1/workspace` |
+| `workspace()` | `GET /v1/workspace` (adds `awake_limit`, `null` = unlimited, and `awake_count`) |
 | `listApiKeys()`, `createApiKey({ name, expires_at })`, `deleteApiKey(id)` | `/v1/api-keys` |
-| `billing()`, `topUp({ amount_micros, provider })`, `ledger(limit)` | `/v1/billing`, `/v1/billing/top-up`, `/v1/billing/ledger` |
 | `listTemplates()`, `getTemplate(name)`, `registerTemplate(req)`, `deleteTemplate(name)` | `/v1/templates` |
 | `createInstance(req)`, `listInstances()`, `getInstance(id)`, `patchInstance(id, req)`, `deleteInstance(id)` | `/v1/instances[/{id}]` |
 | `stopInstance`, `startInstance`, `sleepInstance`, `restartInstance` | `POST /v1/instances/{id}/{stop,start,sleep,restart}` |
@@ -104,11 +103,10 @@ an optional trailing `{ signal, timeoutMs }`.
 
 List endpoints resolve with plain arrays (the `{"data": [...]}` envelope is
 unwrapped). Request and response shapes are exported as interfaces:
-`Instance`, `Template`, `Workspace`, `WorkspaceInfo`, `ApiKey`, `LedgerEntry`,
-`Billing`, `Backup`, `Cron`, `MetricPoint`, `ExecRequest`, `ExecResult`,
+`Instance`, `Template`, `Workspace`, `WorkspaceInfo`, `ApiKey`, `Backup`,
+`Cron`, `MetricPoint`, `ExecRequest`, `ExecResult`,
 `CreateInstanceRequest`, `PatchInstanceRequest`, `ForkRequest`,
-`RegisterTemplateRequest`, `SignedUrl`, ... Money is in integer micros
-(`5_000_000` = $5); timestamps are unix seconds.
+`RegisterTemplateRequest`, `SignedUrl`, ... Timestamps are unix seconds.
 
 ## Agent API (`class Agent`)
 

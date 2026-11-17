@@ -117,7 +117,7 @@ ENV WARREN_AGENT_DRIVER=command WARREN_AGENT_COMMAND='my-agent --prompt {prompt}
 
 The daemon decides by template scope, not by inspecting the image: every workspace template, including one derived from `warren/base` that carries a gateway of its own, starts with the injected gateway as the entrypoint and the image's own entrypoint as its child.
 
-Platform variables injected into every instance, which always win over template and instance env: `WARREN_INSTANCE_ID`, `WARREN_INSTANCE_TOKEN`, `WARREN_WORKSPACE_ID`, `WARREN_HOME`, `WARREN_GATEWAY_PORT`, `WARREN_BUDGET_MONTHLY_CAP_MICROS`, `WARREN_BUDGET_CREDIT_MICROS`.
+Platform variables injected into every instance, which always win over template and instance env: `WARREN_INSTANCE_ID`, `WARREN_INSTANCE_TOKEN`, `WARREN_WORKSPACE_ID`, `WARREN_HOME`, `WARREN_GATEWAY_PORT`.
 
 ## Building the built-in images
 
@@ -127,4 +127,4 @@ WARREN_IMAGE_TAG=v1 scripts/build-images.sh base agent
 WARREN_DOCKER_BUILD_ARGS="--pull --no-cache" scripts/build-images.sh    # refresh base layers and "latest" downloads
 ```
 
-The script builds `warren-gateway` in release mode, stages it at `images/.build/warren-gateway`, runs `docker build` with `images/` as the context and prints the sizes; `warren/base` has a 700 MB budget. Start the daemon with the same tag (`--image-tag v1` or `WARREN_IMAGE_TAG=v1`).
+The script builds `warren-gateway` in release mode, stages it at `images/.build/warren-gateway`, runs `docker build` with `images/` as the context and prints the sizes; `warren/base` must stay under 700 MB. Start the daemon with the same tag (`--image-tag v1` or `WARREN_IMAGE_TAG=v1`).

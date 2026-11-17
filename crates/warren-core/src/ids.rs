@@ -48,7 +48,7 @@ pub fn new_instance_id() -> String {
     )
 }
 
-/// 32 hex characters for ledger entries, backups, crons and keys.
+/// 32 hex characters for backups, crons and keys.
 pub fn new_id() -> String {
     hex::encode(random_bytes(16))
 }

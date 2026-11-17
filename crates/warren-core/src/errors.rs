@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Money, dollars};
-
 /// Stable error codes. Branch on the code, show the message.
 pub const CODE_INVALID_REQUEST: &str = "invalid_request";
 pub const CODE_INVALID_API_KEY: &str = "invalid_api_key";
@@ -9,7 +7,6 @@ pub const CODE_FORBIDDEN: &str = "forbidden";
 pub const CODE_NOT_FOUND: &str = "not_found";
 pub const CODE_CONFLICT: &str = "conflict";
 pub const CODE_INSTANCE_LIMIT_REACHED: &str = "instance_limit_reached";
-pub const CODE_INSUFFICIENT_BALANCE: &str = "insufficient_balance";
 pub const CODE_TRY_AGAIN: &str = "try_again";
 pub const CODE_NOT_SUPPORTED: &str = "not_supported";
 pub const CODE_TIMEOUT: &str = "timeout";
@@ -80,23 +77,13 @@ impl Error {
     pub fn bad_gateway(message: impl Into<String>) -> Self {
         Self::new(CODE_BAD_GATEWAY, 502, message)
     }
-    pub fn insufficient_balance(required: Money, balance: Money) -> Self {
-        Self::new(
-            CODE_INSUFFICIENT_BALANCE,
-            402,
-            format!(
-                "Wallet balance {:.6} is below the {:.6} required.",
-                dollars(balance),
-                dollars(required)
-            ),
-        )
-        .with_details(serde_json::json!({ "required_micros": required, "balance_micros": balance }))
-    }
     pub fn instance_limit(limit: u32, awake: u32) -> Self {
         Self::new(
             CODE_INSTANCE_LIMIT_REACHED,
             409,
-            format!("This workspace may run {limit} instances at once and {awake} are awake."),
+            format!(
+                "This workspace may keep {limit} instances awake at once and {awake} are awake."
+            ),
         )
         .with_details(serde_json::json!({ "limit": limit, "awake": awake }))
     }

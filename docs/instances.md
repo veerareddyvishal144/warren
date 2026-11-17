@@ -1,6 +1,6 @@
 # Instances
 
-Everything about the persistent computers: states, every action with a copy-pasteable call, how sleep works in this build, shapes and prices, and the data that survives what.
+Everything about the persistent computers: states, every action with a copy-pasteable call, how sleep works in this build, shapes, and the data that survives what.
 
 Setup used by every example on this page:
 
@@ -22,15 +22,14 @@ ID=ab12cd34ef
   "resources": { "cpu": 2, "memory": 4, "disk": 4 }, "region": "local",
   "metadata": { "plan": "pro" }, "env": { "APP_ENV": "production" },
   "network": "allow-all", "auto_sleep": true, "idle_timeout_seconds": 900,
-  "budget": { "monthly_cap_micros": 0, "credit_micros": 0 },
   "url": "http://ab12cd34ef.warren.localhost:7337", "default_port": 3737, "mount_path": "/home/agent", "agent_api": true,
   "parent_id": "", "created_at": 1763000000, "updated_at": 1763000100, "started_at": 1763000050,
-  "stopped_at": 0, "slept_at": 0, "last_activity_at": 1763000100, "meter_started_at": 1763000050,
+  "stopped_at": 0, "slept_at": 0, "last_activity_at": 1763000100,
   "runtime": "docker", "disk_used_bytes": 123456
 }
 ```
 
-Timestamps are unix seconds; zero-valued ones are omitted. `url` is derived from the base domain. `runtime` is `docker` or `firecracker`. `parent_id` is set on forks. `status_reason` explains `failed` and billing stops (`insufficient_balance`).
+Timestamps are unix seconds; zero-valued ones are omitted. `url` is derived from the base domain. `runtime` is `docker` or `firecracker`. `parent_id` is set on forks. `status_reason` explains `failed`.
 
 ## Lifecycle
 
@@ -50,18 +49,18 @@ Timestamps are unix seconds; zero-valued ones are omitted. `url` is derived from
                  any state -------> deleting ----> deleted
 ```
 
-| Status | Meaning | Bills | Counts as awake |
+| Status | Meaning | Holds | Counts as awake |
 |---|---|---|---|
-| `provisioning` | Disk and runtime object being created, image pulled, first start | nothing until first `running` | yes |
-| `running` | The gateway answered its health check | full rate | yes |
-| `stopping`, `starting`, `restarting`, `updating` | Transitions you asked for | full rate | yes |
+| `provisioning` | Disk and runtime object being created, image pulled, first start | CPU, memory, disk | yes |
+| `running` | The gateway answered its health check | CPU, memory, disk | yes |
+| `stopping`, `starting`, `restarting`, `updating` | Transitions you asked for | CPU, memory, disk | yes |
 | `stopped` | Container gone, disk kept; never wakes on request | disk only | no |
 | `sleeping` | Container gone, disk kept; wakes on request | disk only | no |
-| `waking` | A request or exec is bringing it back | disk only | yes |
-| `failed` | The runtime could not start or run it; see `status_reason` | nothing | no |
-| `deleting`, `deleted` | Being destroyed, then gone | final minutes settled | no |
+| `waking` | A request or exec is bringing it back | CPU, memory, disk | yes |
+| `failed` | The runtime could not start or run it; see `status_reason` | disk only | no |
+| `deleting`, `deleted` | Being destroyed, then gone | nothing | no |
 
-Every action returns immediately with the transitional status; poll `GET /v1/instances/{id}` for the final one. Lists are newest first.
+Every action returns immediately with the transitional status; poll `GET /v1/instances/{id}` for the final one. Lists are newest first. "Counts as awake" is what the optional awake quota counts ([quotas.md](quotas.md)).
 
 ## Create
 
@@ -75,12 +74,11 @@ curl -s -X POST $WARREN_API/instances -H "$AUTH" -H "$JSON" -d '{
   "metadata": { "customer": "acme", "plan": "pro" },
   "network": "allow-all",
   "auto_sleep": true,
-  "idle_timeout_seconds": 1800,
-  "budget": { "monthly_cap_micros": 20000000, "credit_micros": 0 }
+  "idle_timeout_seconds": 1800
 }'
 ```
 
-All fields are optional. Validation, in order: the template must resolve (`name` or `name@rev`); the type must be allowed by the template and have a runtime (`performance` and `vm` without Firecracker answer `400 not_supported`); the shape is normalised (see below); `idle_timeout_seconds` must be within `[300, 86400]` (`[5, 86400]` in dev mode); env keys match `[A-Z_][A-Z0-9_]*`, at most 64 entries, values at most 4 KiB; at most 32 metadata entries; names at most 100 characters. Then billing: the wallet must hold one day of the running rate (`402 insufficient_balance`) and the awake limit must allow one more (`409 instance_limit_reached`). The response is `201` with `status: provisioning`. Nothing is charged until the instance first reaches `running`.
+All fields are optional. Validation, in order: the template must resolve (`name` or `name@rev`); the type must be allowed by the template and have a runtime (`performance` and `vm` without Firecracker answer `400 not_supported`); the shape is normalised (see below); `idle_timeout_seconds` must be within `[300, 86400]` (`[5, 86400]` in dev mode); env keys match `[A-Z_][A-Z0-9_]*`, at most 64 entries, values at most 4 KiB; at most 32 metadata entries; names at most 100 characters. Then the awake quota, when the daemon has one: `409 instance_limit_reached` if the workspace is already at `--max-awake-instances`. The response is `201` with `status: provisioning`.
 
 Template default env (for example `WARREN_AGENT_DRIVER=openai` on `warren-agent`) is merged under the instance env; the platform variables (`WARREN_INSTANCE_ID`, `WARREN_HOME`, ...) always win.
 
@@ -95,12 +93,11 @@ curl -s -X PATCH $WARREN_API/instances/$ID -H "$AUTH" -H "$JSON" -d '{
   "idle_timeout_seconds": 3600,
   "metadata": { "customer": "acme" },
   "env": { "GIT_AUTHOR_NAME": "bot" },
-  "network": "deny-all",
-  "budget": { "monthly_cap_micros": 0, "credit_micros": 0 }
+  "network": "deny-all"
 }'
 ```
 
-Absent fields are unchanged; `metadata` and `env` replace the whole map. Auto-sleep, idle timeout, name, metadata, network and budget change live. `env` changes apply at the next start (restart, wake or start). Unknown fields are rejected with `400 invalid_request`.
+Absent fields are unchanged; `metadata` and `env` replace the whole map. Auto-sleep, idle timeout, name, metadata and network change live. `env` changes apply at the next start (restart, wake or start). Unknown fields are rejected with `400 invalid_request`.
 
 ## Stop, start, restart
 
@@ -110,7 +107,7 @@ curl -s -X POST $WARREN_API/instances/$ID/start -H "$AUTH"     # {"id":"ab12cd34
 curl -s -X POST $WARREN_API/instances/$ID/restart -H "$AUTH"   # {"id":"ab12cd34ef","status":"restarting"}
 ```
 
-A stopped instance bills disk only and never wakes on request: its URLs answer `409 conflict`, exec answers `409`. `start` works from `stopped` and `sleeping` and enforces the awake limit. Processes get 10 seconds to exit on stop before they are killed.
+A stopped instance keeps its disk and never wakes on request: its URLs answer `409 conflict`, exec answers `409`. `start` works from `stopped` and `sleeping` and enforces the awake quota. Processes get 10 seconds to exit on stop before they are killed.
 
 ## Sleep and wake: the semantics in this build
 
@@ -118,8 +115,8 @@ A stopped instance bills disk only and never wakes on request: its URLs answer `
 curl -s -X POST $WARREN_API/instances/$ID/sleep -H "$AUTH"     # {"id":"ab12cd34ef","status":"sleeping"}
 ```
 
-- **Sleep stops the container and keeps the disk.** Processes and memory are gone; files under the mount path are intact. The instance reports `sleeping` and bills disk only.
-- **Anything that reaches the instance wakes it**: a request to any of its URLs (default port or `<id>-<port>`), an exec through the Sandbox API, a cron firing. The edge holds the request while the lifecycle starts the container and waits for the gateway's health endpoint, then forwards it. Expect a few seconds; harness clients should allow a generous timeout on the first request. A wake enforces the awake limit like a start.
+- **Sleep stops the container and keeps the disk.** Processes and memory are gone; files under the mount path are intact. The instance reports `sleeping` and holds no CPU or memory.
+- **Anything that reaches the instance wakes it**: a request to any of its URLs (default port or `<id>-<port>`), an exec through the Sandbox API, a cron firing. The edge holds the request while the lifecycle starts the container and waits for the gateway's health endpoint, then forwards it. Expect a few seconds; harness clients should allow a generous timeout on the first request. A wake enforces the awake quota like a start.
 - **Auto-sleep** (`auto_sleep: true`) sleeps the instance once `idle_timeout_seconds` pass without activity. Activity is any proxied request or response through the edge and any exec; `last_activity_at` on the object shows the last one. The minimum timeout is 300 seconds (5 in dev mode), the maximum 86,400, the default 900. Default `auto_sleep` is `false`: an instance you create runs until you stop, sleep or delete it.
 - **Manual sleep** works regardless of `auto_sleep`.
 - **Memory checkpoints** (gVisor checkpoint/restore, Firecracker snapshots) are the roadmap item that will make wake resume processes; the API will not change.
@@ -138,18 +135,18 @@ curl -s "$WARREN_API/instances/$ID/metrics?hours=1" -H "$AUTH"               # {
 
 Metrics are sampled every minute while running. Exec details are in [exec.md](exec.md).
 
-## Shapes and prices
+## Shapes
 
-Shapes are four CPU/RAM pairs; disk is any whole number of GB in the shape's range. With the default rates ($0.80 per vCPU-month, $0.70 per GB RAM-month, $0.09 per GB disk-month):
+Shapes are four CPU/RAM pairs; disk is any whole number of GB in the shape's range:
 
-| Shape | Default disk | Disk range (`default`) | Running, `default` | Sleeping or stopped | Running, `vm` (compute x 2.5) |
-|---|---|---|---|---|---|
-| 2 vCPU / 4 GB | 4 GB | 2 - 12 GB | **$4.76 / month** ($0.0065 / hour) | $0.36 / month | $11.36 / month |
-| 4 vCPU / 8 GB | 6 GB | 2 - 20 GB | **$9.34 / month** ($0.0128 / hour) | $0.54 / month | $22.54 / month |
-| 4 vCPU / 16 GB | 12 GB | 2 - 40 GB | **$15.48 / month** ($0.0212 / hour) | $1.08 / month | $37.08 / month |
-| 4 vCPU / 32 GB | 24 GB | 2 - 80 GB | **$27.76 / month** ($0.0380 / hour) | $2.16 / month | $66.16 / month |
+| Shape | Default disk | Disk range, `default` | Disk range, `vm` |
+|---|---|---|---|
+| 2 vCPU / 4 GB | 4 GB | 2 - 12 GB | 2 - 100 GB |
+| 4 vCPU / 8 GB | 6 GB | 2 - 20 GB | 2 - 100 GB |
+| 4 vCPU / 16 GB | 12 GB | 2 - 40 GB | 2 - 100 GB |
+| 4 vCPU / 32 GB | 24 GB | 2 - 80 GB | 2 - 100 GB |
 
-Prices with a different disk size follow the formula `cpu x 0.80 + memory x 0.70 + disk x 0.09` (compute part x 2.5 on `vm`), and the `vm` type allows up to 100 GB of disk on every shape. Per-minute charges are monthly / 43,800. The operator's actual rates are in `GET /v1/billing` under `rates`.
+CPU and memory limits are enforced per container (or per microVM) from the shape. Disk is a sizing number: the bind-mounted home has no filesystem quota in this build, so watch `disk_used_bytes`.
 
 Normalisation rules (`warren_core::shapes::normalize`): a missing `resources` gives the template's default shape; a CPU count above 4 is clamped to 4 while keeping the requested memory (so `{"cpu": 16, "memory": 32}` becomes 4/32 with 24 GB of disk); an unsupported pair such as 2/8 is `400 invalid_request`; changing the pair without naming a disk picks that pair's default disk; a disk outside the range is `400`.
 
@@ -161,7 +158,7 @@ curl -s -X POST $WARREN_API/instances/$ID/resize -H "$AUTH" -H "$JSON" -d '{"cpu
 curl -s -X POST $WARREN_API/instances/$ID/resize -H "$AUTH" -H "$JSON" -d '{"disk":20}'
 ```
 
-Name at least one of `cpu`, `memory`, `disk`. Disk may only grow. The runtime applies CPU and memory live when it can; otherwise the instance is stopped, resized and started (`status` goes through `updating`). Billing follows the new shape from the next metered minute.
+Name at least one of `cpu`, `memory`, `disk`. Disk may only grow. The runtime applies CPU and memory live when it can; otherwise the instance is stopped, resized and started (`status` goes through `updating`).
 
 ## Update (change template or revision)
 
@@ -181,7 +178,7 @@ curl -s -X POST $WARREN_API/instances/$ID/fork -H "$AUTH" -H "$JSON" -d '{
 }'
 ```
 
-`201` with a new instance: a copy of the disk, the same template, revision, type and env, a new id and URL, `parent_id` pointing at the source. The source must be stopped or sleeping; a running source is slept first and woken after the copy, so expect a short interruption. The fork is billed as a new instance (one-day rule and awake limit apply).
+`201` with a new instance: a copy of the disk, the same template, revision, type and env, a new id and URL, `parent_id` pointing at the source. The source must be stopped or sleeping; a running source is slept first and woken after the copy, so expect a short interruption. The fork is a new awake instance, so the awake quota applies.
 
 ## Backups and restore
 
@@ -200,7 +197,7 @@ Backups are taken without stopping the instance and stored as `<data>/backups/<i
 curl -s -X DELETE $WARREN_API/instances/$ID -H "$AUTH"      # {"id":"ab12cd34ef","status":"deleting"}
 ```
 
-The runtime object and the disk are destroyed, the backups removed, the final minutes settled on the ledger, and the instance disappears from the list.
+The runtime object and the disk are destroyed, the backups removed, and the instance disappears from the list.
 
 ## Network modes
 
@@ -224,8 +221,7 @@ The runtime object and the disk are destroyed, the backups removed, the final mi
 |---|---|---|
 | `invalid_request` | 400 | Bad shape, bad env key, idle timeout out of range, unknown JSON field |
 | `not_supported` | 400 | `type: "performance"`, `type: "vm"` without the Firecracker runtime, crons on a non-agent template |
-| `insufficient_balance` | 402 | Less than one day of the running rate in the wallet at create or fork; `details` has `required_micros` and `balance_micros` |
 | `not_found` | 404 | Unknown id, or an instance of another workspace |
 | `conflict` | 409 | Action not valid in the current state (exec or URL on a stopped instance, fork of a provisioning one) |
-| `instance_limit_reached` | 409 | Awake limit hit at create, start, wake or fork; `details` has `limit` and `awake` |
+| `instance_limit_reached` | 409 | Awake quota hit at create, start, wake or fork; `details` has `limit` and `awake` |
 | `try_again` | 503 | Transient: the instance is mid-transition; retry after a moment |

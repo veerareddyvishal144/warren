@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use warren_core::{
-    Budget, Error, MAX_ENV_ENTRIES, MAX_ENV_VALUE_BYTES, MAX_IDLE_TIMEOUT_SEC,
-    MAX_METADATA_ENTRIES, Result, ids,
+    Error, MAX_ENV_ENTRIES, MAX_ENV_VALUE_BYTES, MAX_IDLE_TIMEOUT_SEC, MAX_METADATA_ENTRIES,
+    Result, ids,
 };
 
 /// Longest instance name, in characters.
@@ -23,8 +23,6 @@ pub const RESERVED_ENV_KEYS: &[&str] = &[
     warren_core::ENV_WORKSPACE_ID,
     warren_core::ENV_HOME,
     warren_core::ENV_GATEWAY_PORT,
-    warren_core::ENV_BUDGET_MONTHLY,
-    warren_core::ENV_BUDGET_CREDIT,
 ];
 
 /// An instance name is at most [`MAX_NAME_CHARS`] characters.
@@ -97,14 +95,6 @@ pub fn validate_idle_timeout(seconds: u32, min: u32) -> Result<()> {
         return Err(Error::invalid(format!(
             "idle_timeout_seconds must be between {min} and {MAX_IDLE_TIMEOUT_SEC}"
         )));
-    }
-    Ok(())
-}
-
-/// Budgets are never negative.
-pub fn validate_budget(budget: &Budget) -> Result<()> {
-    if budget.monthly_cap_micros < 0 || budget.credit_micros < 0 {
-        return Err(Error::invalid("budget amounts must not be negative"));
     }
     Ok(())
 }

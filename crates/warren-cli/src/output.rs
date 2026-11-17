@@ -5,7 +5,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::util::{format_bytes, format_money, format_timestamp, truncate};
+use crate::util::{format_bytes, format_timestamp, truncate};
 
 /// Pretty JSON (no trailing newline).
 pub fn to_json_pretty(v: &Value) -> String {
@@ -116,7 +116,6 @@ pub enum Kind {
     Keys,
     Backups,
     Crons,
-    Ledger,
     Metrics,
     Files,
     Sessions,
@@ -132,7 +131,6 @@ impl Kind {
             Kind::Keys => "API keys",
             Kind::Backups => "backups",
             Kind::Crons => "crons",
-            Kind::Ledger => "ledger entries",
             Kind::Metrics => "metric samples",
             Kind::Files => "entries",
             Kind::Sessions => "sessions",
@@ -168,7 +166,6 @@ impl Kind {
                 "LAST STATUS",
                 "PROMPT",
             ],
-            Kind::Ledger => &["AT", "KIND", "AMOUNT", "MINUTES", "INSTANCE", "NOTE"],
             Kind::Metrics => &["AT", "CPU %", "MEMORY", "DISK"],
             Kind::Files => &["TYPE", "SIZE", "MODIFIED", "NAME"],
             Kind::Sessions => &["ID", "NAME", "MESSAGES", "CREATED", "UPDATED"],
@@ -223,18 +220,6 @@ impl Kind {
                 when(v, "last_run_at"),
                 text(v, "last_status"),
                 truncate(&text(v, "prompt"), 40),
-            ],
-            Kind::Ledger => vec![
-                when(v, "at"),
-                text(v, "kind"),
-                money(v, "micros"),
-                v.get("minutes")
-                    .and_then(Value::as_f64)
-                    .filter(|m| *m != 0.0)
-                    .map(|m| format!("{m:.2}"))
-                    .unwrap_or_default(),
-                text(v, "instance_id").if_dash(String::new),
-                text(v, "note").if_dash(String::new),
             ],
             Kind::Metrics => vec![
                 when(v, "at"),
@@ -300,7 +285,6 @@ pub const INSTANCE_KEYS: &[&str] = &[
     "workspace_id",
     "env",
     "metadata",
-    "budget",
     "disk_used_bytes",
 ];
 /// Preferred key order for a template object.
@@ -319,15 +303,7 @@ pub const TEMPLATE_KEYS: &[&str] = &[
     "env",
 ];
 /// Preferred key order for a workspace object.
-pub const WORKSPACE_KEYS: &[&str] = &[
-    "id",
-    "name",
-    "wallet_micros",
-    "top_up_total_micros",
-    "awake_count",
-    "awake_limit",
-    "free_credit_granted",
-];
+pub const WORKSPACE_KEYS: &[&str] = &["id", "name", "awake_count", "awake_limit", "created_at"];
 
 /// Key/value listing of one object: `preferred` keys first (in that order), the
 /// rest alphabetically; nested objects are flattened with dots, arrays printed
@@ -384,11 +360,14 @@ fn flatten(map: &Map<String, Value>, prefix: &str, out: &mut Vec<(String, String
     }
 }
 
-/// Numbers in `*_micros`, `*_bytes`/`size` and `*_at`/`at` fields get a human hint.
+/// Numbers in `*_bytes`/`size` and `*_at`/`at` fields get a human hint; a null
+/// `awake_limit` reads `unlimited`.
 fn decorate(key: &str, v: &Value) -> String {
     let leaf = key.rsplit('.').next().unwrap_or(key);
+    if v.is_null() && leaf == "awake_limit" {
+        return "unlimited".to_string();
+    }
     match v.as_i64() {
-        Some(n) if leaf.ends_with("_micros") => format!("{n} ({})", format_money(n)),
         Some(n) if leaf.ends_with("_bytes") || leaf == "size" => {
             format!("{n} ({})", format_bytes(n))
         }
@@ -429,13 +408,6 @@ fn bytes(v: &Value, key: &str) -> String {
     v.get(key)
         .and_then(Value::as_i64)
         .map(format_bytes)
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn money(v: &Value, key: &str) -> String {
-    v.get(key)
-        .and_then(Value::as_i64)
-        .map(format_money)
         .unwrap_or_else(|| "-".to_string())
 }
 
@@ -507,8 +479,6 @@ mod tests {
             json!({"id": "k1", "name": "ci", "prefix": "sk_live_abcdef", "created_at": 1763000000});
         let out = render_list(Kind::Keys, &[key]);
         assert!(out.contains("never"));
-        let ledger = json!({"at": 1763000000, "kind": "topup", "micros": 5000000, "minutes": 0.0, "note": "dev"});
-        assert!(render_list(Kind::Ledger, &[ledger]).contains("topup  $5.00"));
         let metric = json!({"at": 1763000000, "cpu_percent": 12.345, "memory_bytes": 1048576, "disk_bytes": 2048});
         assert!(render_list(Kind::Metrics, &[metric]).contains("12.3   1.0 MB  2.0 KB"));
         let file = json!({"name": "notes.txt", "type": "file", "size": 10, "modified_at": 1763000000000i64});
@@ -526,11 +496,12 @@ mod tests {
 
     #[test]
     fn object_rendering_flattens_and_decorates() {
-        let v = json!({"wallet_micros": 5000000, "id": "ws_x", "nested": {"a": 1, "b": {"c": true}}, "list": [1, 2], "empty": {}, "created_at": 1763000000, "size_bytes": 2048});
-        let out = render_object(&v, &["id", "wallet_micros"]);
+        let v = json!({"template_name": "warren-base", "id": "ws_x", "nested": {"a": 1, "b": {"c": true}}, "list": [1, 2], "empty": {}, "created_at": 1763000000, "size_bytes": 2048, "awake_limit": null});
+        let out = render_object(&v, &["id", "template_name"]);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "id:             ws_x");
-        assert_eq!(lines[1], "wallet_micros:  5000000 ($5.00)");
+        assert_eq!(lines[1], "template_name:  warren-base");
+        assert!(lines.contains(&"awake_limit:    unlimited"));
         assert!(lines.contains(&"nested.b.c:     true"));
         assert!(lines.contains(&"list:           [1,2]"));
         assert!(lines.contains(&"empty:          {}"));

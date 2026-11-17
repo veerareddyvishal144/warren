@@ -57,7 +57,7 @@ fn lookup(cpu: u32, memory: u32) -> Option<&'static Spec> {
 
 /// Fill defaults and validate a requested shape. A missing request yields the
 /// template's default shape. CPU above `MAX_CPU` is clamped while keeping the
-/// requested memory, as the price list describes. Disk must be a whole number of
+/// requested memory. Disk must be a whole number of
 /// GB within the shape's range (up to 100 GB on vm and performance types).
 pub fn normalize(
     req: Option<&ShapeRequest>,

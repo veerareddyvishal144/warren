@@ -14,10 +14,9 @@ use std::{
 };
 
 use warren_core::{
-    ApiKey, Backup, Biller, Clock, Config, CreateInstanceRequest, Cron, DEFAULT_IDLE_TIMEOUT_SEC,
-    Error, ExecRequest, ExecResult, ForkRequest, Instance, InstanceStatus, InstanceType,
-    LedgerEntry, LedgerKind, Lifecycle, LogsOptions, MICROS_PER_DOLLAR, MINUTES_PER_MONTH,
-    MetricPoint, Money, PatchInstanceRequest, Rates, RegisterTemplateRequest, Result, Shape,
+    ApiKey, Backup, Clock, Config, CreateInstanceRequest, Cron, DEFAULT_IDLE_TIMEOUT_SEC, Error,
+    ExecRequest, ExecResult, ForkRequest, Instance, InstanceStatus, InstanceType, Lifecycle,
+    LogsOptions, MetricPoint, PatchInstanceRequest, RegisterTemplateRequest, Result, Shape,
     ShapeRequest, Store, Template, TemplateScope, TemplateService, Workspace, ids, shapes,
 };
 
@@ -64,7 +63,6 @@ pub struct Tables {
     /// Every revision of every template; system templates have an empty workspace id.
     pub templates: Vec<Template>,
     pub instances: BTreeMap<String, Instance>,
-    pub ledger: Vec<LedgerEntry>,
     pub metrics: Vec<(String, MetricPoint)>,
     pub backups: Vec<Backup>,
     pub crons: Vec<Cron>,
@@ -232,27 +230,6 @@ impl Store for MemStore {
                 .count() as u32)
         }
 
-        fn apply_ledger<'a, 'b>(&'a self, entry: &'b mut LedgerEntry) -> Result<()> {
-            let mut t = self.lock();
-            let ws = t.workspaces.get_mut(&entry.workspace_id).ok_or_else(|| Error::not_found("workspace"))?;
-            ws.wallet_micros += entry.micros;
-            if entry.kind == LedgerKind::Topup {
-                ws.top_up_total_micros += entry.micros;
-            }
-            if entry.id.is_empty() {
-                entry.id = ids::new_id();
-            }
-            t.ledger.push(entry.clone());
-            Ok(())
-        }
-        fn list_ledger<'a, 'b>(&'a self, workspace_id: &'b str, limit: u32) -> Result<Vec<LedgerEntry>> {
-            let t = self.lock();
-            let mut out: Vec<LedgerEntry> = t.ledger.iter().rev().filter(|e| e.workspace_id == workspace_id).cloned().collect();
-            out.sort_by_key(|e| std::cmp::Reverse(e.at));
-            out.truncate(limit as usize);
-            Ok(out)
-        }
-
         fn insert_metric<'a, 'b>(&'a self, instance_id: &'b str, p: MetricPoint) -> Result<()> {
             self.lock().metrics.push((instance_id.to_string(), p));
             Ok(())
@@ -415,109 +392,12 @@ impl TemplateService for FakeTemplates {
     }
 }
 
-/// `Biller` with the documented rules: one day of balance to create, the
-/// awake-limit ladder, dev top-up bounds.
-pub struct FakeBiller {
-    store: std::sync::Arc<MemStore>,
-    clock: std::sync::Arc<FixedClock>,
-    rates: Rates,
-}
-
-impl FakeBiller {
-    pub fn new(store: std::sync::Arc<MemStore>, clock: std::sync::Arc<FixedClock>) -> Self {
-        FakeBiller {
-            store,
-            clock,
-            rates: Rates::default(),
-        }
-    }
-
-    async fn check_awake(&self, ws: &Workspace) -> Result<()> {
-        let awake = self.store.count_awake_instances(&ws.id).await?;
-        let limit = self.awake_limit(ws);
-        if awake >= limit {
-            Err(Error::instance_limit(limit, awake))
-        } else {
-            Ok(())
-        }
-    }
-
-    async fn apply(
-        &self,
-        workspace_id: &str,
-        kind: LedgerKind,
-        micros: Money,
-        note: &str,
-    ) -> Result<Workspace> {
-        let mut entry = LedgerEntry {
-            id: String::new(),
-            workspace_id: workspace_id.to_string(),
-            instance_id: String::new(),
-            kind,
-            micros,
-            minutes: 0.0,
-            at: self.clock.now_unix(),
-            note: note.to_string(),
-        };
-        self.store.apply_ledger(&mut entry).await?;
-        self.store.get_workspace(workspace_id).await
-    }
-}
-
-impl Biller for FakeBiller {
-    fn rates(&self) -> Rates {
-        self.rates
-    }
-    fn monthly_running_micros(&self, shape: Shape, t: InstanceType) -> Money {
-        self.rates.monthly_running(shape, t)
-    }
-    fn monthly_disk_micros(&self, shape: Shape) -> Money {
-        self.rates.monthly_disk(shape)
-    }
-    fn awake_limit(&self, ws: &Workspace) -> u32 {
-        let d = ws.top_up_total_micros / MICROS_PER_DOLLAR;
-        match ws.top_up_total_micros {
-            0 => 3,
-            _ if d >= 1000 => 1000,
-            _ if d >= 250 => 200,
-            _ if d >= 50 => 50,
-            _ => 10,
-        }
-    }
-    boxed! {
-        fn assert_can_create<'a, 'b>(&'a self, ws: &'b Workspace, shape: Shape, t: InstanceType) -> Result<()> {
-            let per_minute = self.monthly_running_micros(shape, t) as f64 / MINUTES_PER_MONTH;
-            let day = (per_minute * 1440.0).ceil() as Money;
-            if ws.wallet_micros < day {
-                return Err(Error::insufficient_balance(day, ws.wallet_micros));
-            }
-            self.check_awake(ws).await
-        }
-        fn assert_can_wake<'a, 'b>(&'a self, ws: &'b Workspace) -> Result<()> {
-            self.check_awake(ws).await
-        }
-        fn top_up<'a, 'b, 'c>(&'a self, workspace_id: &'b str, micros: Money, note: &'c str) -> Result<Workspace> {
-            if !(5 * MICROS_PER_DOLLAR..=10_000 * MICROS_PER_DOLLAR).contains(&micros) {
-                return Err(Error::invalid("amount_micros must be between 5000000 and 10000000000"));
-            }
-            self.apply(workspace_id, LedgerKind::Topup, micros, note).await
-        }
-        fn grant_credit<'a, 'b, 'c>(&'a self, workspace_id: &'b str, micros: Money, note: &'c str) -> Result<Workspace> {
-            self.apply(workspace_id, LedgerKind::Credit, micros, note).await
-        }
-        fn tick<'a>(&'a self, _now: i64) -> Result<()> {
-            Ok(())
-        }
-    }
-}
-
 /// `Lifecycle` that records state in the store without touching a runtime.
 /// `fail_next` injects one error into the next call; `calls` records the
 /// methods invoked.
 pub struct FakeLifecycle {
     store: std::sync::Arc<MemStore>,
     templates: std::sync::Arc<FakeTemplates>,
-    biller: std::sync::Arc<FakeBiller>,
     config: Config,
     clock: std::sync::Arc<FixedClock>,
     pub fail_next: Mutex<Option<Error>>,
@@ -528,14 +408,12 @@ impl FakeLifecycle {
     pub fn new(
         store: std::sync::Arc<MemStore>,
         templates: std::sync::Arc<FakeTemplates>,
-        biller: std::sync::Arc<FakeBiller>,
         config: Config,
         clock: std::sync::Arc<FixedClock>,
     ) -> Self {
         FakeLifecycle {
             store,
             templates,
-            biller,
             config,
             clock,
             fail_next: Mutex::new(None),
@@ -557,6 +435,18 @@ impl FakeLifecycle {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// The documented quota: `Config::max_awake_instances` awake instances per
+    /// workspace, unlimited when unset.
+    async fn check_awake_limit(&self, workspace_id: &str) -> Result<()> {
+        if let Some(limit) = self.config.max_awake_instances {
+            let awake = self.store.count_awake_instances(workspace_id).await?;
+            if awake >= limit {
+                return Err(Error::instance_limit(limit, awake));
+            }
+        }
+        Ok(())
     }
 
     async fn transition(
@@ -589,7 +479,7 @@ impl Lifecycle for FakeLifecycle {
                 return Err(Error::not_supported(format!("type {kind} is not available for template {}", tpl.name)));
             }
             let shape = shapes::normalize(req.shape.as_ref(), Some(&tpl), kind)?;
-            self.biller.assert_can_create(ws, shape, kind).await?;
+            self.check_awake_limit(&ws.id).await?;
             let now = self.clock.now_unix();
             let inst = Instance {
                 id: ids::new_instance_id(),
@@ -608,7 +498,6 @@ impl Lifecycle for FakeLifecycle {
                 network: req.network.unwrap_or_default(),
                 auto_sleep: req.auto_sleep.unwrap_or(false),
                 idle_timeout_seconds: req.idle_timeout_seconds.unwrap_or(DEFAULT_IDLE_TIMEOUT_SEC),
-                budget: req.budget.unwrap_or_default(),
                 default_port: tpl.default_port,
                 mount_path: tpl.mount_path.clone(),
                 agent_api: tpl.agent,
@@ -649,9 +538,6 @@ impl Lifecycle for FakeLifecycle {
             }
             if let Some(n) = req.network {
                 inst.network = n;
-            }
-            if let Some(b) = req.budget {
-                inst.budget = b;
             }
             inst.updated_at = self.clock.now_unix();
             self.store.update_instance(&inst).await?;
@@ -724,9 +610,6 @@ impl Lifecycle for FakeLifecycle {
                 stopped_at: 0,
                 slept_at: 0,
                 last_activity_at: 0,
-                meter_started_at: 0,
-                metered_through: 0,
-                meter_carry_micros: 0.0,
                 runtime_ref: String::new(),
                 ip: String::new(),
                 instance_token: ids::new_instance_token(),

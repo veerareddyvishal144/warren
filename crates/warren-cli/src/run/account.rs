@@ -1,10 +1,9 @@
-//! signup, login, whoami, health, keys and billing.
+//! signup, login, whoami, health and keys.
 
 use serde_json::Value;
-use warren_cli::cli::{BillingCmd, KeysCmd};
+use warren_cli::cli::KeysCmd;
 use warren_cli::config::FileConfig;
 use warren_cli::output::{Kind, WORKSPACE_KEYS, items_of, render_list, render_object};
-use warren_cli::util::format_money;
 use warren_cli::{EXIT_OK, Failure};
 
 use super::Ctx;
@@ -32,9 +31,6 @@ pub async fn signup(ctx: &Ctx, name: Option<&str>) -> Result<i32, Failure> {
             ws.get("name").and_then(Value::as_str).unwrap_or("-")
         );
         println!("api_key:    {key}");
-        if let Some(w) = v.get("wallet_micros").and_then(Value::as_i64) {
-            println!("wallet:     {}", format_money(w));
-        }
         println!("api_url:    {}", ctx.settings.api_url);
     }
     match saved {
@@ -143,53 +139,6 @@ pub async fn keys(ctx: &Ctx, cmd: KeysCmd) -> Result<i32, Failure> {
                     v.get("id").and_then(Value::as_str).unwrap_or(&id)
                 )
             })
-        }
-    }
-}
-
-/// `warren billing ...`
-pub async fn billing(ctx: &Ctx, cmd: BillingCmd) -> Result<i32, Failure> {
-    let api = ctx.api()?;
-    match cmd {
-        BillingCmd::Show => {
-            let v = api.billing().await?;
-            ctx.emit(&v, || {
-                render_object(
-                    &v,
-                    &[
-                        "wallet_micros",
-                        "top_up_total_micros",
-                        "awake_count",
-                        "awake_limit",
-                        "free_credit_granted",
-                        "rates",
-                    ],
-                )
-            })
-        }
-        BillingCmd::Topup { usd } => {
-            let v = api.top_up(usd).await?;
-            ctx.emit(&v, || {
-                let wallet = v
-                    .pointer("/workspace/wallet_micros")
-                    .and_then(Value::as_i64);
-                let added = v
-                    .pointer("/entry/micros")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(usd);
-                match wallet {
-                    Some(w) => format!(
-                        "added {}; wallet is now {}\n",
-                        format_money(added),
-                        format_money(w)
-                    ),
-                    None => format!("added {}\n", format_money(added)),
-                }
-            })
-        }
-        BillingCmd::Ledger { limit } => {
-            let v = api.ledger(limit).await?;
-            ctx.emit(&v, || render_list(Kind::Ledger, &items_of(&v)))
         }
     }
 }

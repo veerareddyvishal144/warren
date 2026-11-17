@@ -1,4 +1,4 @@
-//! warrend: Sandbox API, edge proxy, lifecycle, metering and cron in one process.
+//! warrend: Sandbox API, edge proxy, lifecycle and cron in one process.
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
@@ -6,8 +6,8 @@ use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 use warren_core::{
-    Config, HmacSigner, InstanceType, KeyAuthenticator, MICROS_PER_DOLLAR, MIN_IDLE_TIMEOUT_SEC,
-    Money, RealClock, Runtime, Runtimes, TemplateService,
+    Config, HmacSigner, InstanceType, KeyAuthenticator, MIN_IDLE_TIMEOUT_SEC, RealClock, Runtime,
+    Runtimes, TemplateService,
 };
 
 /// Warren daemon.
@@ -35,7 +35,8 @@ struct Args {
     /// Region label reported on instances.
     #[arg(long, env = "WARREN_REGION", default_value = "local")]
     region: String,
-    /// Development mode: dev top-ups, 5 s minimum idle timeout, host.docker.internal.
+    /// Development mode: 5 s minimum idle timeout, host.docker.internal, no signup
+    /// rate limit for loopback clients.
     #[arg(long, env = "WARREN_DEV", default_value_t = false)]
     dev: bool,
     /// Whether `POST /v1/signup` is open; when off it answers 404 and workspaces
@@ -46,9 +47,9 @@ struct Args {
     /// off for a hosted service.
     #[arg(long, env = "WARREN_ALLOW_PRIVATE_EGRESS", default_value_t = false)]
     allow_private_egress: bool,
-    /// Free credit granted to each new workspace, in micros.
-    #[arg(long, env = "WARREN_FREE_CREDIT_MICROS", default_value_t = 5 * MICROS_PER_DOLLAR)]
-    free_credit_micros: Money,
+    /// Instances one workspace may keep awake at once; unlimited when unset.
+    #[arg(long, env = "WARREN_MAX_AWAKE_INSTANCES", value_name = "N")]
+    max_awake_instances: Option<u32>,
     /// Minimum idle timeout in seconds (overrides the dev default when set).
     #[arg(long, env = "WARREN_MIN_IDLE_SECONDS")]
     min_idle_seconds: Option<u32>,
@@ -70,9 +71,6 @@ struct Args {
     /// HMAC secret for signed URLs; generated into the data dir when unset.
     #[arg(long, env = "WARREN_SECRET")]
     secret: Option<String>,
-    /// Meter interval, e.g. 60s.
-    #[arg(long, env = "WARREN_METER_INTERVAL", default_value = "60s")]
-    meter_interval: humantime::Duration,
     /// Tag of the built-in template images.
     #[arg(long, env = "WARREN_IMAGE_TAG", default_value = "dev")]
     image_tag: String,
@@ -95,7 +93,7 @@ impl Args {
             dev_mode: dev,
             signup_enabled: self.signup_enabled,
             allow_private_egress: self.allow_private_egress,
-            free_credit_micros: self.free_credit_micros,
+            max_awake_instances: self.max_awake_instances,
             min_idle_timeout_sec: self.min_idle_seconds.unwrap_or(if dev {
                 5
             } else {
@@ -106,10 +104,8 @@ impl Args {
             kernel_image: self.kernel,
             gateway_bin: Config::resolve_gateway_bin(self.gateway_bin),
             secret: self.secret.unwrap_or_default(),
-            meter_interval: Duration::from(self.meter_interval),
             image_tag: self.image_tag,
             version: env!("CARGO_PKG_VERSION").to_string(),
-            ..Config::default()
         }
     }
 }
@@ -160,17 +156,14 @@ async fn main() -> anyhow::Result<()> {
         .ensure_system_templates()
         .await
         .context("system templates")?;
-    let biller = warren_billing::Biller::new(store.clone(), cfg.clone(), clock.clone());
     let lifecycle = warren_lifecycle::Manager::new(warren_lifecycle::Deps {
         store: store.clone(),
         runtimes: runtimes.clone(),
-        biller: biller.clone(),
         templates: templates.clone(),
         config: cfg.clone(),
         clock: clock.clone(),
     })
     .context("lifecycle")?;
-    biller.set_stopper(lifecycle.clone());
     let scheduler =
         warren_cron::Scheduler::new(store.clone(), lifecycle.clone(), cfg.clone(), clock.clone());
     let auth = Arc::new(KeyAuthenticator::new(store.clone(), clock.clone()));
@@ -179,7 +172,6 @@ async fn main() -> anyhow::Result<()> {
     let api = warren_api::router(warren_api::Deps {
         store: store.clone(),
         lifecycle: lifecycle.clone(),
-        biller: biller.clone(),
         templates: templates.clone(),
         auth: auth.clone(),
         signer: signer.clone(),
@@ -206,11 +198,6 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("lifecycle: {e}"))
         }
-    });
-    tasks.spawn({
-        let b = biller.clone();
-        let s = shutdown.clone();
-        async move { b.run(s).await.map_err(|e| anyhow::anyhow!("biller: {e}")) }
     });
     tasks.spawn({
         let s = shutdown.clone();

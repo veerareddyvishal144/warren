@@ -161,12 +161,6 @@ impl Store for FakeStore {
     ) -> Result<u32> {
         unsupported("count_instances_using_template")
     }
-    async fn apply_ledger(&self, _entry: &mut LedgerEntry) -> Result<()> {
-        unsupported("apply_ledger")
-    }
-    async fn list_ledger(&self, _workspace_id: &str, _limit: u32) -> Result<Vec<LedgerEntry>> {
-        unsupported("list_ledger")
-    }
     async fn insert_metric(&self, _instance_id: &str, _p: MetricPoint) -> Result<()> {
         unsupported("insert_metric")
     }

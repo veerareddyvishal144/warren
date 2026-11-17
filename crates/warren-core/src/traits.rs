@@ -73,39 +73,6 @@ pub trait Store: Send + Sync {
     async fn count_awake_instances(&self, workspace_id: &str) -> Result<u32>;
     async fn count_instances_using_template(&self, workspace_id: &str, name: &str) -> Result<u32>;
 
-    /// Write the meter position of an instance (`metered_through`,
-    /// `meter_carry_micros`) without touching any other column. With
-    /// `expected_from` set, the write happens only when the stored
-    /// `metered_through` still equals it (compare-and-swap) and the result reports
-    /// whether it did. `update_instance` never writes these two columns, so the
-    /// biller and the lifecycle cannot overwrite each other's rows.
-    ///
-    /// The default implementation is a non-atomic read-modify-write for in-memory
-    /// fakes; real stores override it with a single conditional UPDATE.
-    async fn set_meter(
-        &self,
-        id: &str,
-        metered_through: i64,
-        carry_micros: f64,
-        expected_from: Option<i64>,
-    ) -> Result<bool> {
-        let mut inst = self.get_instance(id).await?;
-        if let Some(expected) = expected_from
-            && inst.metered_through != expected
-        {
-            return Ok(false);
-        }
-        inst.metered_through = metered_through;
-        inst.meter_carry_micros = carry_micros;
-        self.update_instance(&inst).await?;
-        Ok(true)
-    }
-
-    /// Insert the entry and move the wallet by `entry.micros` in one transaction;
-    /// for `Topup` also add to `top_up_total_micros`. Assigns `entry.id` when empty.
-    async fn apply_ledger(&self, entry: &mut LedgerEntry) -> Result<()>;
-    async fn list_ledger(&self, workspace_id: &str, limit: u32) -> Result<Vec<LedgerEntry>>;
-
     async fn insert_metric(&self, instance_id: &str, p: MetricPoint) -> Result<()>;
     async fn list_metrics(&self, instance_id: &str, since: i64) -> Result<Vec<MetricPoint>>;
     async fn prune_metrics(&self, before: i64) -> Result<()>;
@@ -183,8 +150,6 @@ pub struct CreateInstanceRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget: Option<Budget>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_sleep: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout_seconds: Option<u32>,
@@ -209,8 +174,6 @@ pub struct PatchInstanceRequest {
     pub idle_timeout_seconds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget: Option<Budget>,
 }
 
 /// Body of `POST /v1/instances/{id}/fork`.
@@ -247,7 +210,7 @@ pub struct RegisterTemplateRequest {
     pub env: BTreeMap<String, String>,
 }
 
-/// Orchestrates instances: validation, placement, billing checks, runtime calls,
+/// Orchestrates instances: validation, placement, quota checks, runtime calls,
 /// state transitions and background loops. The only component that calls
 /// `Runtime` and the only one that moves `Instance::status`.
 #[async_trait]
@@ -295,36 +258,6 @@ pub trait Lifecycle: Send + Sync {
     async fn gateway_credentials(&self, id: &str) -> Result<(String, String)> {
         Ok((self.endpoint(id).await?, String::new()))
     }
-}
-
-/// Lets the biller stop an instance whose wallet is exhausted without depending
-/// on the lifecycle crate.
-#[async_trait]
-pub trait InstanceStopper: Send + Sync {
-    async fn stop_for_billing(&self, instance_id: &str, reason: &str) -> Result<()>;
-}
-
-/// Prices instances and meters wallets.
-#[async_trait]
-pub trait Biller: Send + Sync {
-    fn rates(&self) -> Rates;
-    fn monthly_running_micros(&self, shape: Shape, t: InstanceType) -> Money;
-    fn monthly_disk_micros(&self, shape: Shape) -> Money;
-    /// One day of running rate must be in the wallet; the awake limit must allow it.
-    async fn assert_can_create(&self, ws: &Workspace, shape: Shape, t: InstanceType) -> Result<()>;
-    /// The awake limit must allow one more awake instance.
-    async fn assert_can_wake(&self, ws: &Workspace) -> Result<()>;
-    fn awake_limit(&self, ws: &Workspace) -> u32;
-    async fn top_up(&self, workspace_id: &str, micros: Money, note: &str) -> Result<Workspace>;
-    async fn grant_credit(
-        &self,
-        workspace_id: &str,
-        micros: Money,
-        note: &str,
-    ) -> Result<Workspace>;
-    /// Charge every instance for the minutes elapsed since its `metered_through`,
-    /// write ledger entries, stop instances whose wallet is exhausted.
-    async fn tick(&self, now: i64) -> Result<()>;
 }
 
 /// Resolves names and pins, lists the catalog, registers workspace images.

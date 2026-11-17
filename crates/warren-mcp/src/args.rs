@@ -79,7 +79,7 @@ pub struct CreateInstanceArgs {
     pub disk: Option<u32>,
     /// Human-readable name shown in listings.
     pub name: Option<String>,
-    /// Put the instance to sleep after `idle_timeout_seconds` without requests (disk-only billing; any request wakes it). Default false.
+    /// Put the instance to sleep after `idle_timeout_seconds` without requests (frees its CPU and memory; any request wakes it). Default false.
     pub auto_sleep: Option<bool>,
     /// Idle timeout for auto_sleep in seconds, 300..86400. Default 900.
     pub idle_timeout_seconds: Option<u32>,
@@ -310,7 +310,7 @@ mod tests {
         assert_eq!(req.auto_sleep, Some(true));
         assert_eq!(req.idle_timeout_seconds, Some(600));
         assert_eq!(req.env.unwrap()["OPENAI_API_KEY"], "x");
-        assert!(req.metadata.is_none() && req.budget.is_none() && req.network.is_none());
+        assert!(req.metadata.is_none() && req.network.is_none());
 
         let empty: CreateInstanceArgs = serde_json::from_value(json!({})).unwrap();
         let req = empty.into_request().unwrap();

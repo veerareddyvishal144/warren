@@ -1,13 +1,13 @@
 //! Request validation that needs no I/O. Whatever depends on templates,
-//! runtimes or balances is validated again by the lifecycle; the checks here
+//! runtimes or quotas is validated again by the lifecycle; the checks here
 //! answer early and with precise messages.
 
 use std::collections::BTreeMap;
 
 use warren_core::{
-    Budget, Config, CreateInstanceRequest, Error, ExecRequest, ForkRequest, InstanceType,
-    MAX_ENV_ENTRIES, MAX_ENV_VALUE_BYTES, MAX_IDLE_TIMEOUT_SEC, MAX_METADATA_ENTRIES,
-    PatchInstanceRequest, RegisterTemplateRequest, Result, ShapeRequest, ids,
+    Config, CreateInstanceRequest, Error, ExecRequest, ForkRequest, InstanceType, MAX_ENV_ENTRIES,
+    MAX_ENV_VALUE_BYTES, MAX_IDLE_TIMEOUT_SEC, MAX_METADATA_ENTRIES, PatchInstanceRequest,
+    RegisterTemplateRequest, Result, ShapeRequest, ids,
 };
 
 /// Longest accepted name (workspace, key, instance, cron) in characters.
@@ -98,14 +98,6 @@ pub fn idle_timeout(cfg: &Config, seconds: u32) -> Result<()> {
     Ok(())
 }
 
-/// Caps are never negative.
-pub fn budget(b: &Budget) -> Result<()> {
-    if b.monthly_cap_micros < 0 || b.credit_micros < 0 {
-        return Err(Error::invalid("budget amounts must not be negative"));
-    }
-    Ok(())
-}
-
 /// "name" or "name@revision" with a well-formed name and a positive revision.
 pub fn template_ref(value: &str) -> Result<()> {
     let (name, rev) = match value.split_once('@') {
@@ -174,9 +166,6 @@ pub fn create_instance(cfg: &Config, req: &CreateInstanceRequest) -> Result<()> 
     if let Some(e) = &req.env {
         env(e)?;
     }
-    if let Some(b) = &req.budget {
-        budget(b)?;
-    }
     if let Some(t) = req.idle_timeout_seconds {
         idle_timeout(cfg, t)?;
     }
@@ -196,9 +185,6 @@ pub fn patch_instance(cfg: &Config, req: &PatchInstanceRequest) -> Result<()> {
     }
     if let Some(e) = &req.env {
         env(e)?;
-    }
-    if let Some(b) = &req.budget {
-        budget(b)?;
     }
     if let Some(t) = req.idle_timeout_seconds {
         idle_timeout(cfg, t)?;

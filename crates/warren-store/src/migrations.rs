@@ -17,11 +17,18 @@ pub(crate) struct Migration {
 }
 
 /// Every migration in ascending version order.
-pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial",
-    sql: V1_INITIAL,
-}];
+pub(crate) const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial",
+        sql: V1_INITIAL,
+    },
+    Migration {
+        version: 2,
+        name: "drop_billing",
+        sql: V2_DROP_BILLING,
+    },
+];
 
 const BOOTSTRAP: &str = "CREATE TABLE IF NOT EXISTS migrations (
     version    INTEGER PRIMARY KEY,
@@ -186,6 +193,22 @@ CREATE INDEX crons_instance ON crons (instance_id, created_at);
 CREATE INDEX crons_due      ON crons (enabled, next_run_at);
 "
 );
+
+/// Warren is self-hosted and has no monetary model: the ledger and every
+/// wallet, budget and meter column go. `ALTER TABLE ... DROP COLUMN` needs
+/// SQLite 3.35 or newer (the bundled library is far newer) and refuses a column
+/// an index references; none of these is indexed, and `ledger_workspace` goes
+/// with its table.
+const V2_DROP_BILLING: &str = "DROP TABLE ledger;
+ALTER TABLE workspaces DROP COLUMN wallet_micros;
+ALTER TABLE workspaces DROP COLUMN top_up_total_micros;
+ALTER TABLE workspaces DROP COLUMN free_credit_granted;
+ALTER TABLE instances DROP COLUMN budget_monthly_cap_micros;
+ALTER TABLE instances DROP COLUMN budget_credit_micros;
+ALTER TABLE instances DROP COLUMN meter_started_at;
+ALTER TABLE instances DROP COLUMN metered_through;
+ALTER TABLE instances DROP COLUMN meter_carry_micros;
+";
 
 /// Highest schema version recorded in the database (0 when fresh).
 pub(crate) fn current_version(conn: &Connection) -> Result<u32> {

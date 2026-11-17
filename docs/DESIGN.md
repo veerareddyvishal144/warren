@@ -1,6 +1,6 @@
 # Warren design
 
-Warren gives every agent or end user a persistent Linux computer with an agent harness installed, reachable over HTTPS at a URL derived from its id, that sleeps when idle and bills disk only. One Rust binary (`warrend`) runs the whole single-node platform: Sandbox API, edge proxy, lifecycle, metering and cron. A second binary (`warren-gateway`) runs inside every instance.
+Warren gives every agent or end user a persistent Linux computer with an agent harness installed, reachable over HTTPS at a URL derived from its id, that sleeps when idle and keeps only its disk. One Rust binary (`warrend`) runs the whole single-node platform: Sandbox API, edge proxy, lifecycle and cron. A second binary (`warren-gateway`) runs inside every instance.
 
 ## Crates
 
@@ -8,24 +8,23 @@ Warren is a Cargo workspace. Every crate depends on `warren-core` and nothing el
 
 | Crate | Responsibility |
 |---|---|
-| `warren-core` | Shared types, async traits (`Store`, `Runtime`, `Lifecycle`, `Biller`, `TemplateService`, `Signer`, `Authenticator`), errors, shapes, rates, config, ids, the signed-URL signer, the API-key authenticator and JSON conventions. Depends only on external crates. |
+| `warren-core` | Shared types, async traits (`Store`, `Runtime`, `Lifecycle`, `TemplateService`, `Signer`, `Authenticator`), errors, shapes, config, ids, the signed-URL signer, the API-key authenticator and JSON conventions. Depends only on external crates. |
 | `warren-store` | SQLite persistence with `rusqlite` (bundled). Migrations embedded. WAL mode, busy timeout, one writer behind a mutex, reads on a blocking pool. |
 | `warren-runtime-docker` | Default-type instances as Docker containers through `bollard`; runtime `runsc` when the daemon offers it (`--runtime auto`), else `runc`. Two bridge networks: `warren-net` (egress) and `warren-internal` (`internal: true`, deny-all). Bind-mounts `<DataDir>/instances/<id>/home` at the template's `mount_path`. |
 | `warren-runtime-firecracker` | VM-type instances: export the template image to a directory, `mkfs.ext4 -d` into a sized rootfs, boot the configured kernel with the Firecracker binary, tap device on bridge `warren-fc0` (172.30.0.0/24) with NAT, guest IP via kernel `ip=`; the gateway runs as PID 1 (`--init`). Needs root and `/dev/kvm`. |
 | `warren-templates` | Built-in catalog seeding, workspace templates, pins (`name@rev`), image pulls through the runtime. |
-| `warren-billing` | Rates, per-minute metering with fractional carry, wallet ledger, one-day-of-balance rule, awake limits ladder, exhausted-wallet stop. |
-| `warren-lifecycle` | The only mover of `Instance.status`. Create/start/stop/sleep/wake/restart/resize/update/fork/delete, exec/logs/metrics, backups, idle sleeper, reconciler at startup and a repair pass every five minutes (adopt running containers, repair stranded transitional rows, stop runtimes of failed rows), metrics sampler, disk usage refresh. Per-instance async mutex. |
+| `warren-lifecycle` | The only mover of `Instance.status`. Create/start/stop/sleep/wake/restart/resize/update/fork/delete, exec/logs/metrics, backups, the awake quota, idle sleeper, reconciler at startup and a repair pass every five minutes (adopt running containers, repair stranded transitional rows, stop runtimes of failed rows), metrics sampler, disk usage refresh. Per-instance async mutex. |
 | `warren-edge` | Host-header dispatch, instance auth (key, signed URL, cookie), wake-on-request, reverse proxy on hyper with WebSocket upgrade passthrough, CORS. |
-| `warren-api` | `/v1` axum routes. Thin: validate, call Lifecycle/Biller/Templates/Store, write JSON. |
+| `warren-api` | `/v1` axum routes. Thin: validate, call Lifecycle/Templates/Store, write JSON. |
 | `warren-cron` | Polls due crons every 30 s, wakes the instance, posts the prompt to the gateway, records the result, computes the next run from the cron expression and timezone. |
-| `warren-dashboard` | Embedded single-page UI (vanilla JS, `include_str!`): key login, instances, create, lifecycle buttons, terminal via signed URL, exec console, chat, wallet and ledger, dev top-up. |
+| `warren-dashboard` | Embedded single-page UI (vanilla JS, `include_str!`): key login, instances, create, lifecycle buttons, terminal via signed URL, exec console, chat, workspace quota. |
 | `warrend` | The daemon binary: config from flags and `WARREN_*` env, wiring, graceful shutdown. |
 | `warren-gateway` | In-instance binary (axum): Agent API, files API, exec, health, supervises `ttyd` on 7681, acts as init in microVMs. Drivers: echo, openai, command. |
 | `warren-sdk` | Rust client for both APIs, used by the CLI, the MCP server and the e2e tests. |
 | `warren-cli` | `warren` command over the SDK (clap). |
 | `warren-mcp` | MCP server exposing instances as tools (`rmcp`). |
 | `warren-e2e` | Integration tests that run the real daemon against Docker; `cargo test -p warren-e2e -- --ignored`. |
-| `sdk/python`, `sdk/typescript` | One-file clients for customers who do not write Rust. |
+| `sdk/python`, `sdk/typescript` | One-file clients for users who do not write Rust. |
 
 ## Storage layout
 
@@ -38,19 +37,17 @@ Warren is a Cargo workspace. Every crate depends on `warren-core` and nothing el
   backups/<id>/<backupId>.tar.gz
 ```
 
-## Metering rules
+## The awake quota
 
-- Monthly running price = `cpu * VCPUMonthMicros + memory * RAMGBMonthMicros + disk * DiskGBMonthMicros`, compute part multiplied by the type multiplier (`vm` 2.5x). Disk-only price = `disk * DiskGBMonthMicros`.
-- Per minute = monthly / 43,800. The biller charges whole minutes elapsed since `MeteredThrough`, carrying fractional micros in `MeterCarryMicros`.
-- Running and transitional states (`running starting restarting updating stopping`) bill the full rate; `sleeping stopped waking` bill disk; `provisioning` is free until `MeterStartedAt` is set the first time the instance reaches `running`.
-- Create requires `wallet >= one day of running rate`; start and wake require `wallet > 0` (plus awake room). When the wallet reaches zero the biller stops every compute-billing instance in that workspace with `status_reason: "insufficient_balance"`; sleeping instances keep billing disk and stay asleep, since the wake check now refuses them. They stay stopped until a top-up and an explicit start.
-- `MeteredThrough` and `MeterCarryMicros` are written only through `Store::set_meter`, never by `update_instance`, so the lifecycle's full-row writes and the biller's meter writes cannot overwrite each other. The biller computes each step from its listing snapshot and writes the meter first as a compare-and-swap on the snapshot's `MeteredThrough`; when the lifecycle moved the meter in between (start and wake reset it) the tick skips that instance without charging and the next tick meters from the new position. The ledger entry is written only after the meter moved; if it fails the meter is moved back (again CAS) so the retry charges the span once.
-- Ledger entries are written per instance per tick with `kind: compute|disk`, negative micros, and the minutes charged. Top-ups are positive `topup` entries and raise `TopUpTotalMicros`; the free credit is a `credit` entry.
-- Known limitation: the ledger grows by one row per billing instance per tick for as long as the instance exists (1,440 rows per instance per day at the default `--meter-interval 60s`). The row is the audit unit (minutes and micros per step), so nothing coalesces them; the only knob is the interval, which cuts rows linearly (`--meter-interval 300s` writes a fifth as many rows, each covering five minutes) at the cost of coarser wallet updates and exhausted-wallet stops.
+- `Config.max_awake_instances: Option<u32>` comes from `--max-awake-instances` (`WARREN_MAX_AWAKE_INSTANCES`). `None` means no limit and the API reports `awake_limit: null`.
+- Awake states are `provisioning`, `running`, `starting`, `restarting`, `updating`, `stopping` and `waking`. `sleeping`, `stopped`, `failed`, `deleting` and `deleted` never count.
+- The lifecycle checks the quota on create, start, wake (edge request, exec, cron firing) and fork. A refused request answers `409 instance_limit_reached` with `details: { "limit", "awake" }` (`Error::instance_limit`).
+- The quota is per workspace and the same for every workspace on the daemon. Per-workspace CPU, RAM or disk totals are not enforced; the host's capacity and the per-container limits from each instance's shape are the only other bounds.
+- `GET /v1/workspace` adds `awake_limit` and `awake_count` to the workspace object, both computed at request time.
 
 ## Sleep and wake in this build
 
-Sleep stops the container and keeps the disk. The instance reports `sleeping`, bills disk only, and any request to any of its URLs or an exec wakes it: the edge holds the request, lifecycle starts the container, waits for the gateway health endpoint, then forwards. Processes and memory from before the sleep are gone; files persist. Memory checkpoints (gVisor checkpoint/restore, Firecracker snapshots) are the next step and must not change the API.
+Sleep stops the container and keeps the disk. The instance reports `sleeping`, holds no CPU or memory, and any request to any of its URLs or an exec wakes it: the edge holds the request, lifecycle checks the awake quota, starts the container, waits for the gateway health endpoint, then forwards. Processes and memory from before the sleep are gone; files persist. Memory checkpoints (gVisor checkpoint/restore, Firecracker snapshots) are the next step and must not change the API.
 
 ## Security model
 
@@ -65,6 +62,6 @@ Sleep stops the container and keeps the disk. The instance reports `sleeping`, b
 
 ## Testing strategy
 
-- Unit tests per crate with in-memory fakes for the `Store`, `Runtime` and `Biller` traits.
-- `warren-e2e` runs the real daemon against Docker with the built images and walks the whole API: signup, templates, create, exec, edge auth, signed URL, agent chat (echo driver), streaming, files, stop/start, sleep/wake, fork, backup/restore, resize, update, ledger, limits, delete.
+- Unit tests per crate with in-memory fakes for the `Store` and `Runtime` traits.
+- `warren-e2e` runs the real daemon against Docker with the built images and walks the whole API: signup, templates, create, exec, edge auth, signed URL, agent chat (echo driver), streaming, files, stop/start, sleep/wake, fork, backup/restore, resize, update, the awake quota, delete.
 - Tests named `vm_*` add the vm-type scenario when root and `/dev/kvm` are available (`cargo test -p warren-e2e -- --ignored vm_`).

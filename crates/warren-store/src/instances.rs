@@ -5,7 +5,7 @@
 use std::sync::LazyLock;
 
 use rusqlite::{Connection, Row, ToSql, TransactionBehavior, named_params, params};
-use warren_core::{Budget, Instance, InstanceStatus, InstanceType, NetworkMode, Result, Shape};
+use warren_core::{Instance, InstanceStatus, InstanceType, NetworkMode, Result, Shape};
 
 use crate::{
     errors::{insert_err, map_err},
@@ -15,7 +15,9 @@ use crate::{
     },
 };
 
-const COLS: &[&str] = &[
+/// Every stored column, in schema order. The single source for `SELECT`,
+/// `INSERT` and `UPDATE`; `read` and `write` below must name exactly these.
+pub(crate) const COLS: &[&str] = &[
     "id",
     "workspace_id",
     "name",
@@ -35,8 +37,6 @@ const COLS: &[&str] = &[
     "network",
     "auto_sleep",
     "idle_timeout_seconds",
-    "budget_monthly_cap_micros",
-    "budget_credit_micros",
     "default_port",
     "mount_path",
     "agent_api",
@@ -47,9 +47,6 @@ const COLS: &[&str] = &[
     "stopped_at",
     "slept_at",
     "last_activity_at",
-    "meter_started_at",
-    "metered_through",
-    "meter_carry_micros",
     "runtime",
     "runtime_ref",
     "ip",
@@ -58,33 +55,11 @@ const COLS: &[&str] = &[
     "disk_used_bytes",
 ];
 
-/// The meter position, owned by the biller. `INSERT` writes it, `UPDATE`
-/// (`update_instance`) never does; only [`set_meter`] changes it afterwards, so
-/// a lifecycle full-row write can never rewind the meter and a biller write can
-/// never revert a status or ip.
-const METER_COLS: &[&str] = &["metered_through", "meter_carry_micros"];
-
 static SELECT: LazyLock<String> =
     LazyLock::new(|| format!("SELECT {} FROM instances", COLS.join(", ")));
 static INSERT: LazyLock<String> = LazyLock::new(|| insert_sql("instances", COLS, false));
-static UPDATE: LazyLock<String> = LazyLock::new(|| {
-    let skip: Vec<&str> = std::iter::once("id")
-        .chain(METER_COLS.iter().copied())
-        .collect();
-    update_sql("instances", COLS, &skip, "id = :id")
-});
-/// `UPDATE instances SET metered_through = :metered_through, meter_carry_micros = :meter_carry_micros WHERE id = :id`.
-static SET_METER: LazyLock<String> =
-    LazyLock::new(|| update_sql("instances", METER_COLS, &[], "id = :id"));
-/// [`SET_METER`] with the compare-and-swap condition on the stored position.
-static SET_METER_CAS: LazyLock<String> = LazyLock::new(|| {
-    update_sql(
-        "instances",
-        METER_COLS,
-        &[],
-        "id = :id AND metered_through = :expected_from",
-    )
-});
+static UPDATE: LazyLock<String> =
+    LazyLock::new(|| update_sql("instances", COLS, &["id"], "id = :id"));
 
 /// The `IN (...)` list of statuses that count as awake, derived from the core
 /// definition so the two can never drift apart.
@@ -120,10 +95,6 @@ fn read(row: &Row<'_>) -> rusqlite::Result<Instance> {
         network: col_parse(row, "network", NetworkMode::parse)?,
         auto_sleep: row.get("auto_sleep")?,
         idle_timeout_seconds: row.get("idle_timeout_seconds")?,
-        budget: Budget {
-            monthly_cap_micros: row.get("budget_monthly_cap_micros")?,
-            credit_micros: row.get("budget_credit_micros")?,
-        },
         url: String::new(),
         default_port: row.get("default_port")?,
         mount_path: row.get("mount_path")?,
@@ -135,9 +106,6 @@ fn read(row: &Row<'_>) -> rusqlite::Result<Instance> {
         stopped_at: row.get("stopped_at")?,
         slept_at: row.get("slept_at")?,
         last_activity_at: row.get("last_activity_at")?,
-        meter_started_at: row.get("meter_started_at")?,
-        metered_through: row.get("metered_through")?,
-        meter_carry_micros: row.get("meter_carry_micros")?,
         runtime: row.get("runtime")?,
         runtime_ref: row.get("runtime_ref")?,
         ip: row.get("ip")?,
@@ -147,8 +115,8 @@ fn read(row: &Row<'_>) -> rusqlite::Result<Instance> {
     })
 }
 
-/// Bind every column of `inst` by name and run `sql` with it. Columns the
-/// statement does not mention (the meter columns in [`UPDATE`]) are left unbound.
+/// Bind every column of `inst` by name and run `sql` with it. A parameter the
+/// statement does not mention is skipped rather than reported.
 fn write(conn: &Connection, sql: &str, inst: &Instance) -> rusqlite::Result<usize> {
     let metadata = to_json(&inst.metadata)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.to_string().into()))?;
@@ -177,8 +145,6 @@ fn write(conn: &Connection, sql: &str, inst: &Instance) -> rusqlite::Result<usiz
         ":network": network,
         ":auto_sleep": inst.auto_sleep,
         ":idle_timeout_seconds": inst.idle_timeout_seconds,
-        ":budget_monthly_cap_micros": inst.budget.monthly_cap_micros,
-        ":budget_credit_micros": inst.budget.credit_micros,
         ":default_port": inst.default_port,
         ":mount_path": inst.mount_path,
         ":agent_api": inst.agent_api,
@@ -189,9 +155,6 @@ fn write(conn: &Connection, sql: &str, inst: &Instance) -> rusqlite::Result<usiz
         ":stopped_at": inst.stopped_at,
         ":slept_at": inst.slept_at,
         ":last_activity_at": inst.last_activity_at,
-        ":meter_started_at": inst.meter_started_at,
-        ":metered_through": inst.metered_through,
-        ":meter_carry_micros": inst.meter_carry_micros,
         ":runtime": inst.runtime,
         ":runtime_ref": inst.runtime_ref,
         ":ip": inst.ip,
@@ -258,59 +221,12 @@ pub(crate) fn list_all(conn: &Connection) -> Result<Vec<Instance>> {
     )
 }
 
-/// Write every column except the meter position (see [`METER_COLS`]).
+/// Write every column of the row.
 pub(crate) fn update(conn: &Connection, inst: &Instance) -> Result<()> {
     match write(conn, &UPDATE, inst).map_err(map_err)? {
         0 => Err(warren_core::Error::not_found("instance")),
         _ => Ok(()),
     }
-}
-
-/// Write the meter position alone, in one statement. With `expected_from` the
-/// write is conditional on the stored `metered_through` still being that value
-/// and `Ok(false)` reports a miss; `not_found` when no row has this id at all.
-pub(crate) fn set_meter(
-    conn: &Connection,
-    id: &str,
-    metered_through: i64,
-    carry_micros: f64,
-    expected_from: Option<i64>,
-) -> Result<bool> {
-    let changed = match expected_from {
-        Some(expected_from) => exec(
-            conn,
-            &SET_METER_CAS,
-            named_params! {
-                ":metered_through": metered_through,
-                ":meter_carry_micros": carry_micros,
-                ":id": id,
-                ":expected_from": expected_from,
-            },
-        ),
-        None => exec(
-            conn,
-            &SET_METER,
-            named_params! {
-                ":metered_through": metered_through,
-                ":meter_carry_micros": carry_micros,
-                ":id": id,
-            },
-        ),
-    }
-    .map_err(map_err)?;
-    if changed > 0 {
-        return Ok(true);
-    }
-    // The connection is serialized, so this cannot race the UPDATE above.
-    if count(
-        conn,
-        "SELECT COUNT(*) FROM instances WHERE id = ?1",
-        params![id],
-    )? == 0
-    {
-        return Err(warren_core::Error::not_found("instance"));
-    }
-    Ok(false)
 }
 
 /// Remove the instance together with its crons and metric samples. Backup rows

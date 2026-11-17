@@ -429,6 +429,25 @@ mod tests {
         );
     }
 
+    /// Warren is self-hosted: no billing concept may survive in the served
+    /// assets.
+    #[test]
+    fn assets_carry_no_billing_concepts() {
+        for (name, text) in [
+            ("index.html", INDEX_HTML),
+            ("app.js", APP_JS),
+            ("styles.css", STYLES_CSS),
+        ] {
+            let lower = text.to_ascii_lowercase();
+            for needle in [
+                "billing", "wallet", "ledger", "top-up", "topup", "top_up", "credit", "price",
+                "budget", "micros",
+            ] {
+                assert!(!lower.contains(needle), "{name} still mentions `{needle}`");
+            }
+        }
+    }
+
     /// The reverse: every `for=` on a label points at a real control.
     #[test]
     fn labels_point_at_controls() {

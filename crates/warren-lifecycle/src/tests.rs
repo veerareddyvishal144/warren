@@ -9,15 +9,15 @@ use std::{
 
 use tokio_util::sync::CancellationToken;
 use warren_core::{
-    Backup, Budget, Config, CreateInstanceRequest, Cron, ExecRequest, ForkRequest, GATEWAY_PORT,
-    Instance, InstanceStatus, InstanceStopper, InstanceType, Lifecycle, LogsOptions,
-    MAX_BACKUP_BYTES_PER_WORKSPACE, MAX_BACKUPS_PER_INSTANCE, MetricPoint, NetworkMode,
-    PatchInstanceRequest, Runtime, Shape, ShapeRequest, Store, Template, Workspace, errors, ids,
+    Backup, Config, CreateInstanceRequest, Cron, ExecRequest, ForkRequest, GATEWAY_PORT, Instance,
+    InstanceStatus, InstanceType, Lifecycle, LogsOptions, MAX_BACKUP_BYTES_PER_WORKSPACE,
+    MAX_BACKUPS_PER_INSTANCE, MetricPoint, NetworkMode, PatchInstanceRequest, Runtime, Shape,
+    ShapeRequest, Store, Template, Workspace, errors, ids,
 };
 
 use crate::{
     Deps, Manager,
-    fakes::{FakeBiller, FakeClock, FakeRuntime, FakeStore, FakeTemplates},
+    fakes::{FakeClock, FakeRuntime, FakeStore, FakeTemplates},
 };
 
 const NOW: i64 = 1_800_000_000;
@@ -31,7 +31,6 @@ const BASE_SHAPE: Shape = Shape {
 struct Env {
     store: Arc<FakeStore>,
     runtime: Arc<FakeRuntime>,
-    biller: Arc<FakeBiller>,
     templates: Arc<FakeTemplates>,
     clock: Arc<FakeClock>,
     mgr: Arc<Manager>,
@@ -47,7 +46,6 @@ impl Env {
     fn with_config(tweak: impl FnOnce(&mut Config)) -> Env {
         let store = FakeStore::new();
         let runtime = FakeRuntime::new();
-        let biller = FakeBiller::new();
         let clock = FakeClock::new(NOW);
         let mut cfg = Config {
             data_dir: std::env::temp_dir().join(format!("warren-lifecycle-test-{}", ids::new_id())),
@@ -61,14 +59,11 @@ impl Env {
             id: WS.into(),
             name: "test".into(),
             created_at: NOW,
-            wallet_micros: 5_000_000,
-            ..Default::default()
         };
         store.put_workspace(ws.clone());
         let mgr = Manager::new(Deps {
             store: store.clone(),
             runtimes: Arc::new(runtimes),
-            biller: biller.clone(),
             templates: templates.clone(),
             config: cfg.clone(),
             clock: clock.clone(),
@@ -77,7 +72,6 @@ impl Env {
         Env {
             store,
             runtime,
-            biller,
             templates,
             clock,
             mgr,
@@ -186,7 +180,6 @@ async fn create_applies_defaults_and_reaches_running() {
         format!("http://{}.warren.localhost:7337", inst.id)
     );
     assert_eq!((inst.created_at, inst.updated_at), (NOW, NOW));
-    assert_eq!(inst.meter_started_at, 0);
 
     let running = env.wait_for(&inst.id, InstanceStatus::Running).await;
     assert_eq!(running.ip, "10.0.0.1");
@@ -198,8 +191,6 @@ async fn create_applies_defaults_and_reaches_running() {
     assert!(!running.storage_path.is_empty());
     assert_eq!(running.started_at, NOW);
     assert_eq!(running.last_activity_at, NOW);
-    assert_eq!(running.meter_started_at, NOW);
-    assert_eq!(running.metered_through, NOW);
     assert_eq!(running.status_reason, "");
     assert_eq!(env.runtime.ops_for(&inst.id), ["create", "start"]);
     assert!(
@@ -207,10 +198,6 @@ async fn create_applies_defaults_and_reaches_running() {
             .calls
             .lock()
             .contains(&"ensure_image:warren/base:dev".to_string())
-    );
-    assert_eq!(
-        env.biller.create_checks.lock().as_slice(),
-        &[(BASE_SHAPE, InstanceType::Default)]
     );
 
     let got = env.mgr.get(WS, &inst.id).await.unwrap();
@@ -246,10 +233,6 @@ async fn create_honours_every_option() {
         name: Some("Production agent".into()),
         metadata: Some(env_of(&[("plan", "pro")])),
         env: Some(env_of(&[("APP_ENV", "production")])),
-        budget: Some(Budget {
-            monthly_cap_micros: 5,
-            credit_micros: 7,
-        }),
         auto_sleep: Some(true),
         idle_timeout_seconds: Some(600),
         network: Some(NetworkMode::DenyAll),
@@ -272,13 +255,6 @@ async fn create_honours_every_option() {
         inst.env.get("APP_ENV").map(String::as_str),
         Some("production")
     );
-    assert_eq!(
-        inst.budget,
-        Budget {
-            monthly_cap_micros: 5,
-            credit_micros: 7
-        }
-    );
     assert!(inst.auto_sleep);
     assert_eq!(inst.idle_timeout_seconds, 600);
     assert_eq!(inst.network, NetworkMode::DenyAll);
@@ -296,7 +272,6 @@ async fn provisioning_failure_marks_failed_with_reason() {
         "{}",
         failed.status_reason
     );
-    assert_eq!(failed.meter_started_at, 0);
     assert!(!env.runtime.is_running(&inst.id));
 
     env.runtime.fail_start.store(false, Ordering::SeqCst);
@@ -401,17 +376,6 @@ async fn create_validation_errors() {
             },
             errors::CODE_INVALID_REQUEST,
         ),
-        (
-            "negative budget",
-            CreateInstanceRequest {
-                budget: Some(Budget {
-                    monthly_cap_micros: -1,
-                    credit_micros: 0,
-                }),
-                ..Default::default()
-            },
-            errors::CODE_INVALID_REQUEST,
-        ),
     ];
     for (what, req, code) in cases {
         let err = env.mgr.create(&env.ws, &req).await.expect_err(what);
@@ -439,15 +403,6 @@ async fn create_validation_errors() {
         .await
         .unwrap_err();
     assert_eq!(err.code, errors::CODE_INVALID_REQUEST);
-
-    env.biller.refuse_create.store(true, Ordering::SeqCst);
-    let err = env
-        .mgr
-        .create(&env.ws, &CreateInstanceRequest::default())
-        .await
-        .unwrap_err();
-    assert_eq!(err.code, errors::CODE_INSUFFICIENT_BALANCE);
-    env.biller.refuse_create.store(false, Ordering::SeqCst);
 
     assert!(
         env.mgr.list(WS).await.unwrap().is_empty(),
@@ -549,14 +504,7 @@ async fn stop_start_sleep_wake_cycle() {
     let started = env.mgr.start(WS, &id).await.unwrap();
     assert_eq!(started.status, InstanceStatus::Running);
     assert_eq!(started.started_at, NOW + 200);
-    assert_eq!(
-        started.metered_through,
-        NOW + 200,
-        "meter restarts when a non-billing instance starts"
-    );
-    assert_eq!(started.meter_started_at, NOW, "first running time is kept");
     assert_eq!(started.ip, "10.0.0.2");
-    assert_eq!(env.biller.wake_checks.load(Ordering::SeqCst), 1);
     assert!(env.runtime.is_running(&id));
     assert_eq!(
         env.mgr.start(WS, &id).await.unwrap().status,
@@ -579,7 +527,6 @@ async fn stop_start_sleep_wake_cycle() {
     let woken = env.mgr.ensure_awake(&id).await.unwrap();
     assert_eq!(woken.status, InstanceStatus::Running);
     assert_eq!(woken.ip, "10.0.0.3");
-    assert_eq!(env.biller.wake_checks.load(Ordering::SeqCst), 2);
     assert_eq!(
         env.runtime.ops_for(&id),
         ["create", "start", "stop", "start", "stop", "start"]
@@ -605,23 +552,68 @@ async fn stop_start_sleep_wake_cycle() {
 
 #[tokio::test]
 async fn start_respects_awake_limit() {
-    let env = Env::new();
+    let env = Env::with_config(|c| c.max_awake_instances = Some(3));
     let inst = env.create_running().await;
     env.mgr.stop(WS, &inst.id).await.unwrap();
-    env.biller.refuse_wake.store(true, Ordering::SeqCst);
+    // Three other instances fill the quota; the stopped one cannot come back.
+    let fillers: Vec<Instance> = (0..3).map(|_| env.seed(InstanceStatus::Running)).collect();
     let err = env.mgr.start(WS, &inst.id).await.unwrap_err();
     assert_eq!(err.code, errors::CODE_INSTANCE_LIMIT_REACHED);
+    assert_eq!(
+        err.details,
+        Some(serde_json::json!({ "limit": 3, "awake": 3 }))
+    );
     assert_eq!(env.store.instance(&inst.id).status, InstanceStatus::Stopped);
+    assert_eq!(
+        env.runtime.ops_for(&inst.id),
+        ["create", "start", "stop"],
+        "a refused start touches no runtime"
+    );
 
-    env.biller.refuse_wake.store(false, Ordering::SeqCst);
+    // One slot frees up: the start goes through.
+    env.store.put_instance(Instance {
+        status: InstanceStatus::Stopped,
+        ..fillers[0].clone()
+    });
     env.mgr.start(WS, &inst.id).await.unwrap();
     env.mgr.sleep(WS, &inst.id).await.unwrap();
-    env.biller.refuse_wake.store(true, Ordering::SeqCst);
+
+    // Full again: neither a wake on request nor an exec may wake it.
+    env.store.put_instance(fillers[0].clone());
     let err = env.mgr.ensure_awake(&inst.id).await.unwrap_err();
+    assert_eq!(err.code, errors::CODE_INSTANCE_LIMIT_REACHED);
+    let err = env
+        .mgr
+        .exec(
+            WS,
+            &inst.id,
+            &ExecRequest {
+                command: "true".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
     assert_eq!(err.code, errors::CODE_INSTANCE_LIMIT_REACHED);
     assert_eq!(
         env.store.instance(&inst.id).status,
-        InstanceStatus::Sleeping
+        InstanceStatus::Sleeping,
+        "a refused wake leaves the instance sleeping"
+    );
+    assert!(!env.runtime.is_running(&inst.id));
+
+    // Failed instances do not count, and a restart of a running instance
+    // needs no new slot.
+    env.store.put_instance(Instance {
+        status: InstanceStatus::Failed,
+        ..fillers[1].clone()
+    });
+    let woken = env.mgr.ensure_awake(&inst.id).await.unwrap();
+    assert_eq!(woken.status, InstanceStatus::Running);
+    assert_eq!(env.store.count_awake_instances(WS).await.unwrap(), 3);
+    assert_eq!(
+        env.mgr.restart(WS, &inst.id).await.unwrap().status,
+        InstanceStatus::Running
     );
 }
 
@@ -727,10 +719,6 @@ async fn restart_cycles_the_runtime() {
     assert_eq!(restarted.status, InstanceStatus::Running);
     assert_eq!(restarted.started_at, NOW + 10);
     assert_eq!(
-        restarted.metered_through, NOW,
-        "restarting keeps billing compute"
-    );
-    assert_eq!(
         env.runtime.ops_for(&inst.id),
         ["create", "start", "stop", "start"]
     );
@@ -800,10 +788,6 @@ async fn patch_fields_and_network_change() {
                 env: Some(env_of(&[("NEW", "1")])),
                 auto_sleep: Some(true),
                 idle_timeout_seconds: Some(1200),
-                budget: Some(Budget {
-                    monthly_cap_micros: 10,
-                    credit_micros: 0,
-                }),
                 network: None,
             },
         )
@@ -814,7 +798,6 @@ async fn patch_fields_and_network_change() {
     assert_eq!(patched.env, env_of(&[("NEW", "1")]));
     assert!(patched.auto_sleep);
     assert_eq!(patched.idle_timeout_seconds, 1200);
-    assert_eq!(patched.budget.monthly_cap_micros, 10);
     assert_eq!(patched.updated_at, NOW + 5);
     assert_eq!(patched.status, InstanceStatus::Running);
     assert_eq!(
@@ -1163,15 +1146,11 @@ async fn update_swaps_the_template() {
 
 #[tokio::test]
 async fn fork_copies_storage_and_wakes_the_source() {
-    let env = Env::new();
+    let env = Env::with_config(|c| c.max_awake_instances = Some(3));
     let src = env
         .create(CreateInstanceRequest {
             env: Some(env_of(&[("KEY", "v")])),
             network: Some(NetworkMode::DenyAll),
-            budget: Some(Budget {
-                monthly_cap_micros: 3,
-                credit_micros: 0,
-            }),
             metadata: Some(env_of(&[("team", "a")])),
             ..Default::default()
         })
@@ -1197,7 +1176,6 @@ async fn fork_copies_storage_and_wakes_the_source() {
     assert_eq!(dst.name, "copy");
     assert_eq!(dst.env, src.env);
     assert_eq!(dst.network, NetworkMode::DenyAll);
-    assert_eq!(dst.budget, src.budget);
     assert_eq!(dst.metadata, src.metadata);
     assert_eq!(dst.shape, src.shape);
     assert_eq!(dst.kind, src.kind);
@@ -1211,7 +1189,6 @@ async fn fork_copies_storage_and_wakes_the_source() {
         dst.storage_path
     );
     assert_eq!(dst.created_at, NOW + 10);
-    assert_eq!(dst.meter_started_at, NOW + 10);
     assert_eq!(
         env.runtime.ops_for(&dst.id),
         ["clone_storage", "create", "start"]
@@ -1224,7 +1201,6 @@ async fn fork_copies_storage_and_wakes_the_source() {
     let src_after = env.store.instance(&src.id);
     assert_eq!(src_after.status, InstanceStatus::Running);
     assert_eq!(src_after.status_reason, "");
-    assert_eq!(env.biller.create_checks.lock().len(), 2);
     assert!(env.runtime.is_running(&dst.id) && env.runtime.is_running(&src.id));
 
     // A stopped source stays stopped; the fork can take its own shape.
@@ -1256,15 +1232,22 @@ async fn fork_copies_storage_and_wakes_the_source() {
     assert_eq!(dst2.name, src.name);
     assert_eq!(env.store.instance(&src.id).status, InstanceStatus::Stopped);
 
-    // Billing refusal happens before anything is touched.
-    env.biller.refuse_create.store(true, Ordering::SeqCst);
+    // A full quota refuses the fork before anything is touched.
+    env.seed(InstanceStatus::Running);
+    assert_eq!(env.store.count_awake_instances(WS).await.unwrap(), 3);
     let err = env
         .mgr
         .fork(&env.ws, &src.id, &ForkRequest::default())
         .await
         .unwrap_err();
-    assert_eq!(err.code, errors::CODE_INSUFFICIENT_BALANCE);
-    assert_eq!(env.mgr.list(WS).await.unwrap().len(), 3);
+    assert_eq!(err.code, errors::CODE_INSTANCE_LIMIT_REACHED);
+    assert_eq!(env.mgr.list(WS).await.unwrap().len(), 4);
+    assert_eq!(env.store.instance(&src.id).status, InstanceStatus::Stopped);
+    assert_eq!(
+        env.runtime.ops_for(&src.id),
+        ["create", "start", "stop", "start", "stop"],
+        "a refused fork touches no runtime"
+    );
 }
 
 #[tokio::test]
@@ -1785,46 +1768,6 @@ async fn reconcile_fixes_states_left_by_a_crash() {
 }
 
 #[tokio::test]
-async fn stop_for_billing_sets_the_reason() {
-    let env = Env::new();
-    let inst = env.create_running().await;
-    env.mgr
-        .stop_for_billing(&inst.id, "insufficient_balance")
-        .await
-        .unwrap();
-    let after = env.store.instance(&inst.id);
-    assert_eq!(after.status, InstanceStatus::Stopped);
-    assert_eq!(after.status_reason, "insufficient_balance");
-    assert!(!env.runtime.is_running(&inst.id));
-    env.mgr
-        .stop_for_billing(&inst.id, "insufficient_balance")
-        .await
-        .unwrap();
-    assert_eq!(
-        env.mgr.ensure_awake(&inst.id).await.unwrap_err().code,
-        errors::CODE_CONFLICT
-    );
-    assert!(
-        env.mgr
-            .stop_for_billing("unknown999", "x")
-            .await
-            .unwrap_err()
-            .is_not_found()
-    );
-
-    let sleeping = env.create_running().await;
-    env.mgr.sleep(WS, &sleeping.id).await.unwrap();
-    env.mgr
-        .stop_for_billing(&sleeping.id, "insufficient_balance")
-        .await
-        .unwrap();
-    assert_eq!(
-        env.store.instance(&sleeping.id).status,
-        InstanceStatus::Stopped
-    );
-}
-
-#[tokio::test]
 async fn run_reconciles_then_loops_until_cancelled() {
     let env = Env::new();
     let inst = env
@@ -1939,7 +1882,6 @@ async fn manager_new_validates_deps() {
     let err = Manager::new(Deps {
         store: env.store.clone(),
         runtimes: Arc::new(HashMap::new()),
-        biller: env.biller.clone(),
         templates: env.templates.clone(),
         config: Config::default(),
         clock: env.clock.clone(),
@@ -1983,35 +1925,33 @@ async fn cancelled_callers_do_not_strand_transitional_states() {
     env.wait_for(&id, InstanceStatus::Running).await;
     env.runtime.start_delay_ms.store(0, Ordering::SeqCst);
 
-    // And for a restart and the biller's stop.
+    // And for a restart.
     env.runtime.stop_delay_ms.store(80, Ordering::SeqCst);
     let dropped = tokio::time::timeout(Duration::from_millis(10), env.mgr.restart(WS, &id)).await;
     assert!(dropped.is_err());
-    env.wait_for(&id, InstanceStatus::Running).await;
-    let dropped = tokio::time::timeout(
-        Duration::from_millis(10),
-        env.mgr.stop_for_billing(&id, "insufficient_balance"),
-    )
-    .await;
-    assert!(dropped.is_err());
-    let after = env.wait_for(&id, InstanceStatus::Stopped).await;
-    assert_eq!(after.status_reason, "insufficient_balance");
+    let running = env.wait_for(&id, InstanceStatus::Running).await;
+    assert!(env.runtime.is_running(&id));
+    assert!(!running.ip.is_empty());
+    env.runtime.stop_delay_ms.store(0, Ordering::SeqCst);
 }
 
-// ------------------------------------------------------------------ awake ladder
+// ------------------------------------------------------------------ awake quota
 
 #[tokio::test]
 async fn concurrent_creates_and_starts_respect_the_awake_limit() {
-    let env = Env::new();
-    env.biller.cap_awake(env.store.clone(), 3);
-    // A pause after the ladder check widens the window between check and insert.
-    env.biller.create_delay_ms.store(15, Ordering::SeqCst);
+    let env = Env::with_config(|c| c.max_awake_instances = Some(3));
+    // A pause inside the count widens the window between check and insert.
+    env.store.count_delay_ms.store(15, Ordering::SeqCst);
     let req = CreateInstanceRequest::default();
     let results = futures::future::join_all((0..8).map(|_| env.mgr.create(&env.ws, &req))).await;
     let ok: Vec<&Instance> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
     assert_eq!(ok.len(), 3, "exactly the limit is admitted");
     for err in results.iter().filter_map(|r| r.as_ref().err()) {
         assert_eq!(err.code, errors::CODE_INSTANCE_LIMIT_REACHED);
+        assert_eq!(
+            err.details,
+            Some(serde_json::json!({ "limit": 3, "awake": 3 }))
+        );
     }
     for inst in &ok {
         env.wait_for(&inst.id, InstanceStatus::Running).await;
@@ -2025,13 +1965,29 @@ async fn concurrent_creates_and_starts_respect_the_awake_limit() {
     let mut ids: Vec<String> = ok.iter().map(|i| i.id.clone()).collect();
     ids.push(env.seed(InstanceStatus::Stopped).id);
     ids.push(env.seed(InstanceStatus::Stopped).id);
-    env.biller.wake_delay_ms.store(15, Ordering::SeqCst);
     let results = futures::future::join_all(ids.iter().map(|id| env.mgr.start(WS, id))).await;
     assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 3);
     for err in results.iter().filter_map(|r| r.as_ref().err()) {
         assert_eq!(err.code, errors::CODE_INSTANCE_LIMIT_REACHED);
     }
     assert_eq!(env.store.count_awake_instances(WS).await.unwrap(), 3);
+    for id in &ids {
+        let status = env.store.instance(id).status;
+        assert!(
+            matches!(status, InstanceStatus::Running | InstanceStatus::Stopped),
+            "{id} is {status}"
+        );
+    }
+
+    // No configured limit means any number may be awake.
+    let unlimited = Env::new();
+    let results =
+        futures::future::join_all((0..8).map(|_| unlimited.mgr.create(&unlimited.ws, &req))).await;
+    assert!(results.iter().all(|r| r.is_ok()));
+    for inst in results.iter().flatten() {
+        unlimited.wait_for(&inst.id, InstanceStatus::Running).await;
+    }
+    assert_eq!(unlimited.store.count_awake_instances(WS).await.unwrap(), 8);
 }
 
 // ------------------------------------------------------------------ reconcile and repair
@@ -2190,36 +2146,15 @@ async fn failed_stop_force_destroys_the_runtime() {
     env.runtime.fail_destroy.store(false, Ordering::SeqCst);
 }
 
-// ------------------------------------------------------------------ resize balance
+// ------------------------------------------------------------------ resize and the quota
 
 #[tokio::test]
-async fn resize_up_requires_a_day_of_balance() {
-    let env = Env::new();
+async fn resize_up_needs_no_free_slot() {
+    let env = Env::with_config(|c| c.max_awake_instances = Some(1));
     let inst = env.create_running().await;
-    env.biller.create_checks.lock().clear();
-    env.biller.refuse_create.store(true, Ordering::SeqCst);
-    let bigger = ShapeRequest {
-        cpu: Some(4),
-        memory: Some(8),
-        disk: None,
-    };
-    let err = env.mgr.resize(WS, &inst.id, &bigger).await.unwrap_err();
-    assert_eq!(err.code, errors::CODE_INSUFFICIENT_BALANCE);
-    assert_eq!(
-        env.biller.create_checks.lock().as_slice(),
-        &[(
-            Shape {
-                cpu: 4,
-                memory: 8,
-                disk: 6
-            },
-            InstanceType::Default
-        )]
-    );
-    assert_eq!(env.runtime.resize_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(env.store.instance(&inst.id).shape, BASE_SHAPE);
+    assert_eq!(env.store.count_awake_instances(WS).await.unwrap(), 1);
 
-    // The same shape is a no-op and asks the biller nothing.
+    // The same shape is a no-op.
     env.mgr
         .resize(
             WS,
@@ -2232,11 +2167,25 @@ async fn resize_up_requires_a_day_of_balance() {
         )
         .await
         .unwrap();
-    assert_eq!(env.biller.create_checks.lock().len(), 1);
+    assert_eq!(env.runtime.resize_calls.load(Ordering::SeqCst), 0);
 
-    env.biller.refuse_create.store(false, Ordering::SeqCst);
+    // Growing an awake instance at the quota is allowed: it holds its slot.
+    let bigger = ShapeRequest {
+        cpu: Some(4),
+        memory: Some(8),
+        disk: None,
+    };
     let grown = env.mgr.resize(WS, &inst.id, &bigger).await.unwrap();
-    assert_eq!(grown.shape.cpu, 4);
+    assert_eq!(
+        grown.shape,
+        Shape {
+            cpu: 4,
+            memory: 8,
+            disk: 6
+        }
+    );
+    assert_eq!(grown.status, InstanceStatus::Running);
+    assert_eq!(env.runtime.resize_calls.load(Ordering::SeqCst), 1);
 }
 
 // ------------------------------------------------------------------ backup caps
@@ -2310,10 +2259,10 @@ async fn backups_are_capped_per_instance_and_per_workspace() {
     );
 }
 
-// ------------------------------------------------------------------ credentials and wallet
+// ------------------------------------------------------------------ credentials
 
 #[tokio::test]
-async fn gateway_credentials_and_wallet_refusal_on_wake() {
+async fn gateway_credentials_need_a_running_instance() {
     let env = Env::new();
     let inst = env.create_running().await;
     let (ip, token) = env.mgr.gateway_credentials(&inst.id).await.unwrap();
@@ -2337,59 +2286,9 @@ async fn gateway_credentials_and_wallet_refusal_on_wake() {
         errors::CODE_CONFLICT
     );
 
-    env.biller.refuse_wake_balance.store(true, Ordering::SeqCst);
-    let err = env.mgr.ensure_awake(&inst.id).await.unwrap_err();
-    assert_eq!(err.code, errors::CODE_INSUFFICIENT_BALANCE);
-    let err = env
-        .mgr
-        .exec(
-            WS,
-            &inst.id,
-            &ExecRequest {
-                command: "true".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(err.code, errors::CODE_INSUFFICIENT_BALANCE);
-    assert_eq!(
-        env.store.instance(&inst.id).status,
-        InstanceStatus::Sleeping,
-        "a refused wake leaves the instance sleeping"
-    );
-    assert!(!env.runtime.is_running(&inst.id));
-    env.biller
-        .refuse_wake_balance
-        .store(false, Ordering::SeqCst);
     let woken = env.mgr.ensure_awake(&inst.id).await.unwrap();
     assert_eq!(woken.status, InstanceStatus::Running);
-}
-
-// ------------------------------------------------------------------ meter ownership
-
-#[tokio::test]
-async fn entering_compute_billing_writes_the_meter_through_set_meter() {
-    let env = Env::new();
-    let inst = env.create_running().await;
-    assert_eq!(env.store.instance(&inst.id).metered_through, NOW);
-    assert!(env.store.meter_sets.load(Ordering::SeqCst) >= 1);
-
-    env.mgr.stop(WS, &inst.id).await.unwrap();
-    // The biller advanced the meter while the instance was stopped.
-    env.store
-        .set_meter(&inst.id, NOW + 60, 12.5, None)
-        .await
-        .unwrap();
-    env.clock.advance(120);
-    let before = env.store.meter_sets.load(Ordering::SeqCst);
-    env.mgr.start(WS, &inst.id).await.unwrap();
-    let after = env.store.instance(&inst.id);
-    assert_eq!(
-        after.metered_through,
-        NOW + 120,
-        "compute billing starts now"
-    );
-    assert_eq!(after.meter_carry_micros, 12.5, "the carry is kept");
-    assert!(env.store.meter_sets.load(Ordering::SeqCst) > before);
+    let (ip, token) = env.mgr.gateway_credentials(&inst.id).await.unwrap();
+    assert_eq!(ip, woken.ip);
+    assert_eq!(token, inst.instance_token);
 }

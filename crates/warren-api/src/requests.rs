@@ -4,7 +4,6 @@
 //! live in `warren_core`. Unknown fields are rejected everywhere.
 
 use serde::{Deserialize, Serialize};
-use warren_core::Money;
 
 /// `POST /v1/signup`
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -25,16 +24,6 @@ pub struct CreateKeyRequest {
     /// Unix seconds; absent or 0 means the key never expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
-}
-
-/// `POST /v1/billing/top-up`
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TopUpRequest {
-    pub amount_micros: Money,
-    /// Only "dev" exists in this build; it is the default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
 }
 
 /// `POST /v1/instances/{id}/update`

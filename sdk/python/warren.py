@@ -17,11 +17,10 @@ Quick start::
             print(data["delta"], end="", flush=True)
 
 Every failed call raises :class:`WarrenError` carrying the stable error ``code``
-(``not_found``, ``conflict``, ``insufficient_balance``, ...), the server's
+(``not_found``, ``conflict``, ``instance_limit_reached``, ...), the server's
 ``message``, the HTTP ``status`` (0 when the request never completed) and the
-optional ``details`` object. Money is in integer micros (USD x 1,000,000) and
-timestamps are unix seconds on the Sandbox API, unix milliseconds on the Agent
-API, exactly as on the wire.
+optional ``details`` object. Timestamps are unix seconds on the Sandbox API,
+unix milliseconds on the Agent API, exactly as on the wire.
 
 The Sandbox API is authenticated with ``Authorization: Bearer <key>``; requests
 to an instance URL carry the same key in the ``x-warren-key`` header.
@@ -90,23 +89,14 @@ class Shape(TypedDict, total=False):
     disk: int
 
 
-class Budget(TypedDict, total=False):
-    """Managed-service spend caps recorded on an instance."""
-
-    monthly_cap_micros: int
-    credit_micros: int
-
-
 class Workspace(TypedDict, total=False):
-    """A tenant: one wallet, many instances, many API keys."""
+    """A tenant: many instances, many API keys. ``GET /v1/workspace`` adds
+    ``awake_limit`` (``None`` means unlimited) and ``awake_count``."""
 
     id: str
     name: str
     created_at: int
-    wallet_micros: int
-    top_up_total_micros: int
-    free_credit_granted: bool
-    awake_limit: int
+    awake_limit: Optional[int]
     awake_count: int
 
 
@@ -162,7 +152,6 @@ class Instance(TypedDict, total=False):
     network: str
     auto_sleep: bool
     idle_timeout_seconds: int
-    budget: Budget
     url: str
     default_port: int
     mount_path: str
@@ -174,22 +163,8 @@ class Instance(TypedDict, total=False):
     stopped_at: int
     slept_at: int
     last_activity_at: int
-    meter_started_at: int
     runtime: str
     disk_used_bytes: int
-
-
-class LedgerEntry(TypedDict, total=False):
-    """One movement on a wallet; charges are negative, top-ups positive."""
-
-    id: str
-    workspace_id: str
-    instance_id: str
-    kind: str
-    micros: int
-    minutes: float
-    at: int
-    note: str
 
 
 class Backup(TypedDict, total=False):
@@ -311,7 +286,7 @@ class WarrenError(Exception):
     """Raised for every failed call.
 
     :param code: stable error code (``invalid_request``, ``invalid_api_key``,
-        ``insufficient_balance``, ``forbidden``, ``not_found``, ``conflict``,
+        ``forbidden``, ``not_found``, ``conflict``,
         ``instance_limit_reached``, ``not_supported``, ``try_again``,
         ``timeout``, ``bad_gateway``, ``internal``).
     :param message: human-readable explanation from the server or the client.
@@ -346,7 +321,6 @@ def _code_for_status(status: int) -> str:
     return {
         400: "invalid_request",
         401: "invalid_api_key",
-        402: "insufficient_balance",
         403: "forbidden",
         404: "not_found",
         408: "timeout",
@@ -686,17 +660,16 @@ class Warren(_Http):
         return self._request("GET", "/v1/version")["version"]
 
     def signup(self, name: Optional[str] = None) -> JSON:
-        """``POST /v1/signup`` -> ``{"workspace", "api_key", "key_id", "wallet_micros"}``.
+        """``POST /v1/signup`` -> ``{"workspace", "api_key", "key_id"}``.
 
-        Creates a workspace with the free credit; the plaintext key is shown
-        once. No auth required.
+        Creates a workspace; the plaintext key is shown once. No auth required.
         """
         return self._request("POST", "/v1/signup", json_body=_compact({"name": name}))
 
-    # -- workspace, keys, billing -----------------------------------------
+    # -- workspace, keys --------------------------------------------------
 
     def workspace(self) -> Workspace:
-        """``GET /v1/workspace`` -> workspace plus ``awake_limit`` and ``awake_count``."""
+        """``GET /v1/workspace`` -> workspace plus ``awake_limit`` (``None`` = unlimited) and ``awake_count``."""
         return self._request("GET", "/v1/workspace")
 
     def list_api_keys(self) -> List[ApiKey]:
@@ -710,24 +683,6 @@ class Warren(_Http):
     def delete_api_key(self, key_id: str) -> JSON:
         """``DELETE /v1/api-keys/{id}`` -> ``{"id", "deleted": true}``."""
         return self._request("DELETE", "/v1/api-keys/" + _seg(key_id))
-
-    def billing(self) -> JSON:
-        """``GET /v1/billing`` -> wallet, top-up total, awake limit and rates."""
-        return self._request("GET", "/v1/billing")
-
-    def top_up(self, amount_micros: int, provider: Optional[str] = "dev") -> JSON:
-        """``POST /v1/billing/top-up`` -> ``{"workspace", "entry"}``.
-
-        Only ``provider="dev"`` exists in this build and it needs a daemon
-        started with ``--dev``; the amount is 5,000,000..10,000,000,000 micros.
-        """
-        return self._request(
-            "POST", "/v1/billing/top-up", json_body=_compact({"amount_micros": amount_micros, "provider": provider})
-        )
-
-    def ledger(self, limit: Optional[int] = None) -> List[LedgerEntry]:
-        """``GET /v1/billing/ledger?limit=`` -> newest entries first."""
-        return _unwrap_list(self._request("GET", "/v1/billing/ledger", query={"limit": limit}))
 
     # -- templates --------------------------------------------------------
 
@@ -779,7 +734,6 @@ class Warren(_Http):
         name: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
         env: Optional[Dict[str, str]] = None,
-        budget: Optional[Budget] = None,
         auto_sleep: Optional[bool] = None,
         idle_timeout_seconds: Optional[int] = None,
         network: Optional[str] = None,
@@ -800,7 +754,6 @@ class Warren(_Http):
                 "name": name,
                 "metadata": metadata,
                 "env": env,
-                "budget": budget,
                 "auto_sleep": auto_sleep,
                 "idle_timeout_seconds": idle_timeout_seconds,
                 "network": network,
@@ -825,7 +778,6 @@ class Warren(_Http):
         auto_sleep: Optional[bool] = None,
         idle_timeout_seconds: Optional[int] = None,
         network: Optional[str] = None,
-        budget: Optional[Budget] = None,
     ) -> Instance:
         """``PATCH /v1/instances/{id}`` -> the instance. Absent fields stay;
         ``metadata`` and ``env`` replace the whole map; env applies at next start."""
@@ -837,7 +789,6 @@ class Warren(_Http):
                 "auto_sleep": auto_sleep,
                 "idle_timeout_seconds": idle_timeout_seconds,
                 "network": network,
-                "budget": budget,
             }
         )
         return self._request("PATCH", _inst(instance_id), json_body=body)
@@ -1310,9 +1261,10 @@ def _demo() -> int:
         health = w.health()
         print("daemon %s healthy=%s runtimes=%s" % (health.get("version"), health.get("healthy"), health.get("runtimes")))
         ws = w.workspace()
+        limit = ws.get("awake_limit")
         print(
-            "workspace %s (%s) wallet=$%.4f awake %s/%s"
-            % (ws.get("id"), ws.get("name"), ws.get("wallet_micros", 0) / 1e6, ws.get("awake_count"), ws.get("awake_limit"))
+            "workspace %s (%s) awake %s/%s"
+            % (ws.get("id"), ws.get("name"), ws.get("awake_count"), "unlimited" if limit is None else limit)
         )
         for inst in w.list_instances():
             print("  %s %-12s %-16s %s" % (inst.get("id"), inst.get("status"), inst.get("template"), inst.get("url")))

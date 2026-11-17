@@ -22,11 +22,10 @@ fn instance_json(id: &str, status: &str) -> serde_json::Value {
         "resources": { "cpu": 2, "memory": 4, "disk": 4 }, "region": "local",
         "metadata": { "plan": "pro" }, "env": { "APP_ENV": "production" },
         "network": "allow-all", "auto_sleep": true, "idle_timeout_seconds": 900,
-        "budget": { "monthly_cap_micros": 0, "credit_micros": 0 },
         "url": format!("http://{id}.warren.localhost:7337"), "default_port": 3737, "mount_path": "/home/agent",
         "agent_api": true, "parent_id": "", "created_at": 1763000000, "updated_at": 1763000100,
         "started_at": 1763000050, "stopped_at": 0, "slept_at": 0, "last_activity_at": 1763000100,
-        "meter_started_at": 1763000050, "runtime": "docker", "disk_used_bytes": 123456
+        "runtime": "docker", "disk_used_bytes": 123456
     })
 }
 
@@ -192,7 +191,6 @@ async fn sandbox_query_parameters_are_encoded() {
         ("GET", "/v1/instances/ab12cd34ef/metrics") => {
             Response::json(200, json!({ "data": [{ "at": 1, "cpu_percent": 1.5, "memory_bytes": 2, "disk_bytes": 3 }] }))
         }
-        ("GET", "/v1/billing/ledger") => Response::json(200, json!({ "data": [] })),
         _ => Response::not_found(),
     })
     .await;
@@ -222,9 +220,6 @@ async fn sandbox_query_parameters_are_encoded() {
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].cpu_percent, 1.5);
     assert_eq!(server.last_request().query, "hours=1");
-
-    assert!(client.ledger(100).await.unwrap().is_empty());
-    assert_eq!(server.last_request().query, "limit=100");
 }
 
 #[tokio::test]
@@ -256,14 +251,7 @@ async fn sandbox_lifecycle_and_misc_endpoints_decode() {
         ("DELETE", "/v1/templates/my-tpl") => Response::json(200, json!({ "name": "my-tpl", "deleted": true })),
         ("GET", "/v1/workspace") => Response::json(
             200,
-            json!({ "id": "ws_x", "name": "me", "created_at": 1, "wallet_micros": 5000000, "top_up_total_micros": 0,
-                "free_credit_granted": true, "awake_limit": 3, "awake_count": 1 }),
-        ),
-        ("GET", "/v1/billing") => Response::json(
-            200,
-            json!({ "wallet_micros": 5000000, "top_up_total_micros": 0, "awake_limit": 3, "awake_count": 0,
-                "rates": { "vcpu_month_micros": 800000, "ram_gb_month_micros": 700000, "disk_gb_month_micros": 90000,
-                "vm_multiplier": 2.5, "performance_multiplier": 4.0 }, "free_credit_granted": true }),
+            json!({ "id": "ws_x", "name": "me", "created_at": 1, "awake_limit": 3, "awake_count": 1 }),
         ),
         ("POST", "/v1/instances/ab12cd34ef/crons") => {
             assert_eq!(req.json(), json!({ "prompt": "summarise", "schedule": "0 9 * * *", "timezone": "Europe/Dublin" }));
@@ -326,9 +314,8 @@ async fn sandbox_lifecycle_and_misc_endpoints_decode() {
 
     let ws = client.workspace().await.unwrap();
     assert_eq!(ws.workspace.id, "ws_x");
-    assert_eq!(ws.awake_limit, 3);
-    let billing = client.billing().await.unwrap();
-    assert_eq!(billing.rates.vm_multiplier, 2.5);
+    assert_eq!(ws.awake_limit, Some(3));
+    assert_eq!(ws.awake_count, 1);
 
     let mut cron = crate::CronRequest::new("summarise", "0 9 * * *");
     cron.timezone = Some("Europe/Dublin".into());
@@ -347,8 +334,7 @@ async fn signup_sends_no_credentials() {
             assert_eq!(req.json(), json!({ "name": "me" }));
             Response::json(
                 201,
-                json!({ "workspace": { "id": "ws_x", "name": "me", "created_at": 1, "wallet_micros": 5000000,
-                    "top_up_total_micros": 0, "free_credit_granted": true }, "api_key": KEY, "key_id": "k1", "wallet_micros": 5000000 }),
+                json!({ "workspace": { "id": "ws_x", "name": "me", "created_at": 1 }, "api_key": KEY, "key_id": "k1" }),
             )
         }
         _ => Response::not_found(),
@@ -358,7 +344,7 @@ async fn signup_sends_no_credentials() {
     let signup = client.signup(Some("me")).await.unwrap();
     assert_eq!(signup.api_key, KEY);
     assert_eq!(signup.workspace.id, "ws_x");
-    assert_eq!(signup.wallet_micros, 5_000_000);
+    assert_eq!(signup.key_id, "k1");
     let req = server.last_request();
     assert_eq!(req.header("authorization"), None);
     assert_eq!(req.header("x-warren-key"), None);

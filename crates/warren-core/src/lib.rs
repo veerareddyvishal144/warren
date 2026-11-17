@@ -1,5 +1,5 @@
 //! The shared contract of Warren: domain types, async traits every subsystem
-//! implements, error codes, shapes, rates, configuration, ids, the signed-URL
+//! implements, error codes, shapes, configuration, ids, the signed-URL
 //! signer, the API-key authenticator and JSON conventions.
 //!
 //! Every other crate depends on this one; this one depends on nothing inside the
