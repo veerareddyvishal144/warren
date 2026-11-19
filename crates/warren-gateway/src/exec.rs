@@ -395,33 +395,14 @@ fn user_home(user: &str) -> Option<PathBuf> {
     lookup_passwd(user).map(|p| p.home)
 }
 
-/// The effective id (second field) of a `Uid:`/`Gid:` line in `/proc/self/status`.
-fn proc_status_effective(key: &str) -> Option<u32> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let rest = status.lines().find_map(|l| l.strip_prefix(key))?;
-    // real, effective, saved, filesystem
-    rest.split_whitespace().nth(1)?.parse().ok()
-}
-
-/// Effective uid of this process, read from `/proc/self/status` (the `nix`
-/// build in this workspace does not enable its `user` feature).
+/// Effective uid of this process.
 pub fn effective_uid() -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    proc_status_effective("Uid:").unwrap_or_else(|| {
-        std::fs::metadata("/proc/self")
-            .map(|m| m.uid())
-            .unwrap_or(u32::MAX)
-    })
+    nix::unistd::geteuid().as_raw()
 }
 
-/// Effective gid of this process, read like [`effective_uid`].
+/// Effective gid of this process.
 pub fn effective_gid() -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    proc_status_effective("Gid:").unwrap_or_else(|| {
-        std::fs::metadata("/proc/self")
-            .map(|m| m.gid())
-            .unwrap_or(u32::MAX)
-    })
+    nix::unistd::getegid().as_raw()
 }
 
 /// True when the effective uid is 0.

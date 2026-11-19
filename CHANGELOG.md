@@ -8,6 +8,10 @@ All notable changes to Warren are recorded here. The format follows [Keep a Chan
 
 - `warren-gateway` now builds on non-Linux hosts (macOS included): the PID 1 code in `init.rs` is compiled only on Linux and other targets get a stub, so `--init` and `POST /v1/shutdown` report `not_supported` there. Groundwork for macOS sandboxes.
 
+### Fixed
+
+- `warren-gateway` read its effective uid and gid from `/proc/self/status`, which does not exist on macOS, so `/v1/health` reported `home_owner` as 4294967295 there. It now uses `geteuid`/`getegid` (nix `user` feature).
+
 ## [0.1.0] - Unreleased
 
 The first release: a single-node platform in one Rust binary, free software you host yourself.
