@@ -4,9 +4,9 @@ Status: Phase 1 done on 2026-11-19. The `mac` instance type is implemented,
 unit-tested against a mock of Lume's API, and `scripts/mac/e2e.sh` passes
 end to end, twice in a row, on a MacBook Pro (Apple silicon, Lume 0.7.2,
 macOS 26.6.2 guests): create, health, exec, a background process surviving
-sleep and wake, fork, guest-to-guest isolation, `409 host_capacity_reached`
-and delete. Measured numbers are under "Running it"; what the script does
-not cover is noted under "Acceptance for Phase 1".
+sleep and wake, adoption of the running VM across a daemon restart, fork,
+guest-to-guest isolation, `409 host_capacity_reached` and delete. Measured
+numbers are under "Running it".
 
 A `mac` instance is a full macOS virtual machine on an Apple silicon host,
 with the same API, URLs, gateway, templates, sleep and cron as every other
@@ -50,7 +50,8 @@ with every process intact (the marker process keeps its pid); fork of a
 running instance in 30 to 37 s (the source is suspended for the copy, the
 copy boots, the source resumes); delete of two instances in about 20 s; a
 third awake instance answers `409 host_capacity_reached` at create time,
-before anything is cloned.
+before anything is cloned. A `warrend` restart with a running instance takes
+a few seconds and changes nothing inside the VM.
 Known limits in this phase: template updates that change the base VM are
 refused (`not_supported`); backups are APFS clones that share blocks with
 the VM until either side writes, so their reported size is small and real
@@ -341,9 +342,11 @@ On the MacBook used for Phase 0:
   running VMs are adopted, not duplicated.
 - From inside one guest, the other guest's gateway port is unreachable.
 
-Met on 2026-11-19 by consecutive runs of `scripts/mac/e2e.sh` (numbers
-under "Running it"), with one exception: the script does not restart the
-daemon, so adoption after a `warrend` restart is not exercised by it yet.
+All met on 2026-11-19 by consecutive runs of `scripts/mac/e2e.sh` (numbers
+under "Running it"). The script also stops and restarts `warrend` with a
+running instance: the VM keeps running in `lume serve`, the reconciler logs
+`adopted running instance`, the marker process keeps its pid and no second
+VM appears.
 
 ## Open decisions
 

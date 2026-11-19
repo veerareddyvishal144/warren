@@ -6,6 +6,7 @@
 #   health (runtime lume) -> signup -> create warren-macos/mac -> running
 #   -> health through the edge -> exec sw_vers -> marker process
 #   -> sleep (lume savedState true) -> wake (marker still alive, same pid)
+#   -> restart warrend (the VM keeps running, the reconciler adopts it, same marker pid, no second VM)
 #   -> fork -> VM-to-VM isolation (nc from one guest to the other fails)
 #   -> third create is 409 host_capacity_reached -> delete both -> gone from lume ls
 #
@@ -224,23 +225,48 @@ lume_vm_field() { lume get "$1" -f json 2>/dev/null | jq -r --arg k "$2" '(if ty
 
 CREATE_PAYLOAD='{"template":"warren-macos","type":"mac","auto_sleep":false}'
 
+# --- daemon helpers ----------------------------------------------------------------------
+# start_warrend: launch the daemon in the background, output appended to LOG; sets WARREND_PID.
+start_warrend() {
+    "$BIN" --runtime none --mac-base-vm "$BASE_VM" --dev \
+        --listen ":$PORT" --public-port "$PORT" --data-dir "$DATA" --base-domain "$BASE_DOMAIN" \
+        --gateway-bin "$GW" --log "${WARREN_LOG:-info}" >>"$LOG" 2>&1 &
+    WARREND_PID=$!
+}
+# wait_healthy STEP: poll GET /v1/health until it answers 200 with healthy=true; fails STEP after 120 s.
+wait_healthy() {
+    local step=$1 start=$SECONDS
+    while :; do
+        kill -0 "$WARREND_PID" 2>/dev/null || fail "$step" "warrend exited during startup"
+        api GET /v1/health
+        [ "$HTTP_CODE" = 200 ] && break
+        [ $((SECONDS - start)) -lt 120 ] || fail "$step" "no answer from GET /v1/health within 120 s"
+        sleep 1
+    done
+    [ "$(jget .healthy)" = true ] || fail "$step" "healthy is not true"
+}
+# stop_warrend STEP: SIGTERM the daemon and wait for it to exit; not exiting within 20 s fails STEP.
+stop_warrend() {
+    local step=$1 waited=0
+    kill -TERM "$WARREND_PID" 2>/dev/null || fail "$step" "warrend (pid $WARREND_PID) is not running"
+    while kill -0 "$WARREND_PID" 2>/dev/null; do
+        if [ "$waited" -ge 20 ]; then
+            kill -KILL "$WARREND_PID" 2>/dev/null
+            fail "$step" "warrend did not exit within 20 s of SIGTERM"
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
 # --- start warrend ------------------------------------------------------------------------
 log "starting warrend on :$PORT (base VM $BASE_VM, data $DATA, log $LOG)"
-"$BIN" --runtime none --mac-base-vm "$BASE_VM" --dev \
-    --listen ":$PORT" --public-port "$PORT" --data-dir "$DATA" --base-domain "$BASE_DOMAIN" \
-    --gateway-bin "$GW" --log "${WARREN_LOG:-info}" >"$LOG" 2>&1 &
-WARREND_PID=$!
+: >"$LOG"
+start_warrend
 
 STEP="health (runtime lume)"
 start=$SECONDS
-while :; do
-    kill -0 "$WARREND_PID" 2>/dev/null || fail "$STEP" "warrend exited during startup"
-    api GET /v1/health
-    [ "$HTTP_CODE" = 200 ] && break
-    [ $((SECONDS - start)) -lt 120 ] || fail "$STEP" "no answer from GET /v1/health within 120 s"
-    sleep 1
-done
-[ "$(jget .healthy)" = true ] || fail "$STEP" "healthy is not true"
+wait_healthy "$STEP"
 RUNTIMES="$(jget '.runtimes | join(",")')"
 case ",$RUNTIMES," in
     *,lume,*) ;;
@@ -324,6 +350,40 @@ PID_AFTER="$(jget .stdout | tr -d '[:space:]')"
 [ "$PID_AFTER" = "$PID_BEFORE" ] || fail "$STEP" "marker pid changed from $PID_BEFORE to $PID_AFTER (the VM rebooted instead of resuming)"
 pass "$STEP" "$T_WAKE"
 
+STEP="restart warrend -> instance adopted"
+# The daemon leaves VMs running when it exits (they live in the lume serve
+# process, which it never stops) and its reconciler adopts them on the next
+# start: same VM, same processes inside, no second clone.
+start=$SECONDS
+LOG_LINES_BEFORE="$(wc -l <"$LOG" | tr -d ' ')"
+stop_warrend "$STEP"
+VMS="$(instance_vm_names | tr '\n' ' ')"
+[ "$VMS" = "warren-$ID " ] || fail "$STEP" "after the daemon exit lume lists [$VMS], expected only warren-$ID"
+[ "$(lume_vm_field "warren-$ID" status)" = running ] || fail "$STEP" "VM warren-$ID is not running after the daemon exit"
+log "warrend exited and VM warren-$ID is still running; starting warrend again"
+start_warrend
+wait_healthy "$STEP"
+ADOPTED=0
+for _ in $(seq 1 30); do
+    if tail -n "+$((LOG_LINES_BEFORE + 1))" "$LOG" | grep -q "adopted running instance.*$ID"; then ADOPTED=1; break; fi
+    sleep 1
+done
+[ "$ADOPTED" = 1 ] || fail "$STEP" "no 'adopted running instance' line for $ID in $LOG within 30 s of the restart"
+api GET "/v1/instances/$ID"
+[ "$HTTP_CODE" = 200 ] || fail "$STEP" "GET instance after the restart: HTTP $HTTP_CODE"
+[ "$(jget .status)" = running ] || fail "$STEP" "instance is '$(jget .status)' after the restart ($(jget .status_reason))"
+edge "$ID" /v1/health
+[ "$HTTP_CODE" = 200 ] || fail "$STEP" "gateway health through the edge after the restart: HTTP $HTTP_CODE"
+run_exec "$ID" "pgrep -f '[s]leep 100000'"
+[ "$HTTP_CODE" = 200 ] || fail "$STEP" "exec after the restart failed (HTTP $HTTP_CODE)"
+PID_ADOPTED="$(jget .stdout | tr -d '[:space:]')"
+[ "$PID_ADOPTED" = "$PID_BEFORE" ] || fail "$STEP" "marker pid is '$PID_ADOPTED' after the restart, was $PID_BEFORE (the VM was rebooted or re-created)"
+VMS="$(instance_vm_names | tr '\n' ' ')"
+[ "$VMS" = "warren-$ID " ] || fail "$STEP" "after the restart lume lists [$VMS], expected only warren-$ID"
+T_RESTART=$((SECONDS - start))
+log "adopted: VM warren-$ID, marker pid $PID_ADOPTED unchanged"
+pass "$STEP" "$T_RESTART"
+
 STEP="fork -> running"
 start=$SECONDS
 api POST "/v1/instances/$ID/fork" '{"name":"mac-e2e-fork"}'
@@ -397,5 +457,5 @@ T_DELETE=$((SECONDS - start))
 pass "$STEP" "$T_DELETE"
 
 echo
-echo "timings: create->running ${T_CREATE}s, sleep ${T_SLEEP}s, wake ${T_WAKE}s, fork ${T_FORK}s, delete ${T_DELETE}s"
+echo "timings: create->running ${T_CREATE}s, sleep ${T_SLEEP}s, wake ${T_WAKE}s, daemon restart ${T_RESTART}s, fork ${T_FORK}s, delete ${T_DELETE}s"
 exit 0

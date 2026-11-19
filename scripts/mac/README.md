@@ -57,13 +57,15 @@ Builds `warrend`, `warren-gateway` and `warren` (`--skip-build` to reuse),
 starts `warrend --runtime none --mac-base-vm warren-macos-26 --dev` on port
 7337 with data under `./data-mac-e2e`, and walks the product against real VMs:
 health (runtime `lume`), signup, create a `warren-macos`/`mac` instance,
-health through the edge, exec (`sw_vers`), sleep (`savedState: true` in
-`lume get`), wake (the marker process is still alive), fork, VM-to-VM
-isolation (`nc` from one guest to the other fails), a third create answers
+health through the edge, exec (`sw_vers`), a `nohup` marker process, sleep
+(`savedState: true` in `lume get`), wake (the marker is still alive with the
+same pid), a `warrend` restart (the VM keeps running, the reconciler adopts
+it, the marker pid is unchanged, no second VM), fork, VM-to-VM isolation
+(`nc` from one guest to the other fails), a third create answers
 `409 host_capacity_reached`, delete both and check `lume ls`.
 
 It prints a table of PASS/FAIL per step with the create-to-running, sleep,
-wake and fork seconds, exits non-zero on any failure and then shows the last
+wake, restart, fork and delete seconds, exits non-zero on any failure and then shows the last
 40 lines of `data-mac-e2e/warrend.log`. Flags: `--base-vm`, `--port`,
 `--data-dir`, `--base-domain`, `--keep` (leave the instances and the daemon
 running), `--skip-build`, `--clean-leftovers` (delete stale `warren-*` VMs
