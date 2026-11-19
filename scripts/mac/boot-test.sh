@@ -23,9 +23,11 @@ nohup lume run "$VM" >"$LOG" 2>&1 &
 RUN_PID=$!
 echo "lume run started in the background (pid $RUN_PID, log $LOG)"
 
+# The first non-loopback IPv4 address in `lume get` (its output carries
+# formatting when piped, so match the address itself rather than the label).
 IP=""
 while [ -z "$IP" ]; do
-  IP=$(lume get "$VM" 2>/dev/null | awk '/^ip:/ && $2 ~ /^[0-9]/ {print $2}')
+  IP=$(lume get "$VM" 2>&1 | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -v '^127\.' | head -1)
   [ -z "$IP" ] && sleep 1
 done
 until ssh -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=accept-new \
