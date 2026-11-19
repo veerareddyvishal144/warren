@@ -2,8 +2,9 @@
 
 Status: Phase 0 (feasibility) completed on 2026-11-19. Phase 1 (the `mac`
 instance type) is implemented and unit-tested against a mock of Lume's API;
-the end-to-end run on a real Mac (`scripts/mac/e2e.sh`) is the remaining
-step before it is called done.
+on a real Mac the end-to-end run (`scripts/mac/e2e.sh`) passes create,
+health, and exec and is being worked through step by step. Current state
+and the open issue: [macos-handoff.md](macos-handoff.md).
 
 A `mac` instance is a full macOS virtual machine on an Apple silicon host,
 with the same API, URLs, gateway, templates, sleep and cron as every other
