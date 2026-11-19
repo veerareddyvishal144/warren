@@ -434,6 +434,9 @@ pub struct FakeRuntime {
     pub fail_start: AtomicBool,
     /// Make `start` answer `host_capacity_reached` (the host is full).
     pub refuse_start_capacity: AtomicBool,
+    /// Make `check_capacity` answer `host_capacity_reached`, so create and
+    /// fork are refused before any storage exists.
+    pub refuse_capacity: AtomicBool,
     pub fail_stop: AtomicBool,
     pub fail_destroy: AtomicBool,
     pub fail_recreate: AtomicBool,
@@ -500,6 +503,12 @@ impl Runtime for FakeRuntime {
         self.record("ensure_image", image_ref);
         Self::failing(&self.fail_ensure_image, "image pull")?;
         Ok(format!("sha256:{image_ref}"))
+    }
+    async fn check_capacity(&self) -> Result<()> {
+        if self.refuse_capacity.load(Ordering::SeqCst) {
+            return Err(Error::host_capacity(2, 2));
+        }
+        Ok(())
     }
     async fn create(&self, inst: &mut Instance, tpl: &Template) -> Result<()> {
         self.record("create", &inst.id);

@@ -546,7 +546,9 @@ mod tests {
     fn home() -> PathBuf {
         let d = std::env::temp_dir().join(format!("warren-gw-exec-{}", warren_core::ids::new_id()));
         std::fs::create_dir_all(&d).unwrap();
-        d
+        // macOS puts the temp dir behind a symlink (/var -> /private/var) and
+        // `pwd` in the child reports the physical path; compare like with like.
+        d.canonicalize().unwrap()
     }
 
     fn me() -> HomeOwner {

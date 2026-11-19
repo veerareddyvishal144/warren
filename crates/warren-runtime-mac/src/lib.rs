@@ -366,6 +366,15 @@ impl Runtime for MacRuntime {
         Ok(format!("sha256:{}", hex::encode(h.finalize())))
     }
 
+    async fn check_capacity(&self) -> Result<()> {
+        let capacity = self.lume.capacity().await?;
+        if capacity.has_room() {
+            Ok(())
+        } else {
+            Err(Error::host_capacity(capacity.max_running, capacity.running))
+        }
+    }
+
     async fn create(&self, inst: &mut Instance, tpl: &Template) -> Result<()> {
         let vm = Self::vm_name(inst);
         let existing = self.lume.get(&vm).await?;
@@ -403,10 +412,7 @@ impl Runtime for MacRuntime {
         if details.is_running() {
             tracing::info!(instance = %inst.id, vm, "VM already running; adopting it");
         } else {
-            let capacity = self.lume.capacity().await?;
-            if !capacity.has_room() {
-                return Err(Error::host_capacity(capacity.max_running, capacity.running));
-            }
+            self.check_capacity().await?;
             if !self.share_dir(inst).join(share::ENV_FILE).is_file() {
                 return Err(Error::conflict(format!(
                     "instance {} has no shared folder; create it first",

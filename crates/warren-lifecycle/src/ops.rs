@@ -558,9 +558,12 @@ impl Manager {
         let shape = shapes::normalize(req.shape.as_ref(), Some(&base), src.kind)?;
 
         // The workspace lock spans the quota check and the insert of the
-        // child, which is what consumes the awake slot.
+        // child, which is what consumes the awake slot. The child needs a
+        // slot of its own on the host (the source takes its slot back after
+        // the copy), so a full host is refused before the source is touched.
         let ws_guard = self.ws_lock(&ws.id).await;
         self.check_awake_quota(&ws.id).await?;
+        rt.check_capacity().await?;
 
         let was_running = src.status == InstanceStatus::Running;
         if was_running {
@@ -733,9 +736,12 @@ impl Lifecycle for Manager {
         };
         // The workspace lock spans the quota check and the insert that
         // consumes the awake slot; the instance lock is taken before the row
-        // exists so nothing interleaves with provisioning.
+        // exists so nothing interleaves with provisioning. A full host (a Mac
+        // with two macOS guests running) is refused here too, before a VM is
+        // cloned for nothing.
         let ws_guard = self.ws_lock(&ws.id).await;
         self.check_awake_quota(&ws.id).await?;
+        rt.check_capacity().await?;
         let guard = self.lock(&inst.id).await;
         self.deps.store.create_instance(&inst).await?;
         drop(ws_guard);

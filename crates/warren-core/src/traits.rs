@@ -99,6 +99,14 @@ pub trait Runtime: Send + Sync {
     async fn ready(&self) -> Result<()>;
     /// Make `image_ref` available locally and return its digest.
     async fn ensure_image(&self, image_ref: &str) -> Result<String>;
+    /// Whether the host can run one more instance of this type right now;
+    /// `Err(host_capacity_reached)` when it cannot (a Mac runs at most two
+    /// macOS guests). The lifecycle asks before `create` and `fork` so a full
+    /// host is refused before any storage is allocated; `start` checks again
+    /// itself. Unlimited by default.
+    async fn check_capacity(&self) -> Result<()> {
+        Ok(())
+    }
     /// Prepare persistent storage and the runtime object without starting it.
     /// Must set `inst.storage_path` and `inst.runtime_ref`.
     async fn create(&self, inst: &mut Instance, tpl: &Template) -> Result<()>;

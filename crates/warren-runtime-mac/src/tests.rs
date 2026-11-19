@@ -613,6 +613,12 @@ async fn a_full_host_refuses_with_host_capacity_reached() {
         },
     );
     let e = env_with(m).await;
+    // The up-front check the lifecycle runs before create and fork.
+    let err = e.rt.check_capacity().await.unwrap_err();
+    assert_eq!(err.code, CODE_HOST_CAPACITY_REACHED);
+    assert_eq!(err.status, 409);
+    assert_eq!(err.details.as_ref().unwrap()["max_running"], 2);
+    assert_eq!(err.details.as_ref().unwrap()["running"], 2);
     let mut inst = instance("ab12cd34ef");
     e.rt.create(&mut inst, &template()).await.unwrap();
     let err = e.rt.start(&mut inst).await.unwrap_err();
@@ -626,6 +632,7 @@ async fn a_full_host_refuses_with_host_capacity_reached() {
     );
     // Linux guests do not take a slot.
     e.state.lock().unwrap().vms.get_mut("other-b").unwrap().os = "linux".into();
+    e.rt.check_capacity().await.unwrap();
     e.rt.start(&mut inst).await.unwrap();
 }
 

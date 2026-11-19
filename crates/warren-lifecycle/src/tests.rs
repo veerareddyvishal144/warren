@@ -2293,6 +2293,51 @@ async fn gateway_credentials_need_a_running_instance() {
     assert_eq!(token, inst.instance_token);
 }
 
+/// When the runtime reports a full host up front, create and fork answer
+/// `409 host_capacity_reached` before any row or storage exists, and a fork
+/// leaves the source untouched (not slept for a copy that cannot start).
+#[tokio::test]
+async fn create_and_fork_are_refused_on_a_full_host() {
+    let env = Env::new();
+    env.runtime.refuse_capacity.store(true, Ordering::SeqCst);
+    let err = env
+        .mgr
+        .create(&env.ws, &CreateInstanceRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, errors::CODE_HOST_CAPACITY_REACHED);
+    assert_eq!(err.status, 409);
+    assert_eq!(err.details.as_ref().unwrap()["max_running"], 2);
+    assert!(env.mgr.list(WS).await.unwrap().is_empty());
+    assert!(
+        env.runtime.calls.lock().is_empty(),
+        "nothing was provisioned"
+    );
+
+    env.runtime.refuse_capacity.store(false, Ordering::SeqCst);
+    let src = env.create_running().await;
+
+    env.runtime.refuse_capacity.store(true, Ordering::SeqCst);
+    let err = env
+        .mgr
+        .fork(&env.ws, &src.id, &ForkRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, errors::CODE_HOST_CAPACITY_REACHED);
+    assert_eq!(env.mgr.list(WS).await.unwrap().len(), 1);
+    let src = env.store.instance(&src.id);
+    assert_eq!(src.status, InstanceStatus::Running, "source was not slept");
+    assert_eq!(env.runtime.ops_for(&src.id), ["create", "start"]);
+
+    env.runtime.refuse_capacity.store(false, Ordering::SeqCst);
+    let dst = env
+        .mgr
+        .fork(&env.ws, &src.id, &ForkRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(dst.status, InstanceStatus::Running);
+}
+
 /// A full host is not a failure of the instance: the row goes back to
 /// `stopped` (or `sleeping` for a wake) with the refusal as its reason, and
 /// the next attempt simply tries again.
