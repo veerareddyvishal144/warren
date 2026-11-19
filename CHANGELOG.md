@@ -9,6 +9,7 @@ All notable changes to Warren are recorded here. The format follows [Keep a Chan
 - The `mac` instance type: a macOS virtual machine per instance on an Apple silicon host, through Lume's API server. New crate `warren-runtime-mac` (clone of a base VM per instance, headless start with a read-only shared folder carrying the gateway and its environment, sleep as suspend with memory kept, host capacity of two macOS guests reported as `409 host_capacity_reached`, copy-on-write backups), new crate `warren-gateway-client` shared with the Firecracker runtime, daemon flags `--runtime none`, `--mac-base-vm`, `--lume-api`, `--lume-bin`, `--mac-vnc`, the built-in template `warren-macos`, `GET /v1/health` reporting `lume`, dashboard/CLI/MCP/SDK support for type `mac`, and the Mac-side scripts `scripts/mac/{build-base.sh,e2e.sh,guest/}`. `docs/macos.md` is the operator guide.
 - `warren-gateway`: `GET /v1/stats` (guest-side CPU, memory and disk) and user names from the system user database (Open Directory on macOS, NSS on Linux) when `/etc/passwd` lacks the entry.
 - `Runtime::sleep`: runtimes may keep memory across sleep; the lifecycle calls it instead of `stop`. A `host_capacity_reached` refusal on start puts the instance back to `stopped`/`sleeping` instead of `failed`.
+- `Runtime::check_capacity`: create and fork ask the runtime whether the host has room before any storage is allocated, so a Mac with two macOS guests running answers `409 host_capacity_reached` at create time instead of cloning a VM it cannot start. Unlimited for the container and Firecracker runtimes.
 
 ### Changed
 
@@ -18,6 +19,8 @@ All notable changes to Warren are recorded here. The format follows [Keep a Chan
 
 ### Fixed
 
+- macOS guests: the gateway's LaunchDaemon ran it as `lume` in launchd's system domain, where Apple's `nohup` fails ("can't detach from console"), so every background process an agent started through exec died at once. The launcher now runs as root and starts the gateway inside the guest user's own launchd domain (`launchctl asuser` + `sudo -n -E`), where `nohup` works; the base image must be rebuilt with `scripts/mac/build-base.sh`. `scripts/mac/e2e.sh` keeps a `nohup` marker as the regression check and bounds its guest-side `nc` probe with `-G`.
+- `warren-gateway`'s exec unit test compared a symlinked temp path with the physical one `pwd` prints on macOS.
 - `warren-gateway` read its effective uid and gid from `/proc/self/status`, which does not exist on macOS, so `/v1/health` reported `home_owner` as 4294967295 there. It now uses `geteuid`/`getegid` (nix `user` feature).
 
 ## [0.1.0] - Unreleased

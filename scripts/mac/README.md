@@ -33,8 +33,10 @@ Clones `base` to `warren-macos-26`, boots the clone headless, copies
 `scripts/mac/guest/` into it and runs `install.sh` as root, which installs:
 
 - `/usr/local/libexec/warren-gateway-launcher.sh` and the LaunchDaemon
-  `dev.warren.gateway` (runs the gateway as `lume` from the `share` folder
-  warrend attaches; restarted by launchd on exit),
+  `dev.warren.gateway` (root; the launcher starts the gateway as `lume` from
+  the `share` folder warrend attaches, inside lume's own launchd domain via
+  `launchctl asuser` and `sudo`, because Apple's `nohup` fails in the system
+  domain; restarted by launchd on exit),
 - the pf anchor `dev.warren` (blocks the NAT subnet except the host) and the
   LaunchDaemon `dev.warren.pf` that enables pf at boot,
 - your SSH public key for `lume`, no system sleep, no automatic updates.
@@ -70,3 +72,13 @@ from an earlier run before starting).
 Requests go to `http://127.0.0.1:PORT` with a `Host:` header
 (`api.warren.localhost:PORT`, `<id>.warren.localhost:PORT`) because macOS's
 resolver does not resolve `*.localhost` for `curl`.
+
+### When the guest misbehaves: `bash scripts/mac/debug-guest.sh [--keep]`
+
+Boots a throwaway clone of the base VM with a `share` folder attached the way
+warrend does, waits for the launcher, and prints what the guest sees: the
+virtiofs mount, the launcher's log, the LaunchDaemon state, the pf rules,
+the gateway's health from the host, which launchd domain exec runs in and
+whether `nohup` works there, and whether background processes started
+through exec survive (plain `nohup &`, own session, own process group).
+`--keep` leaves the clone running for manual probing over `ssh lume@<ip>`.

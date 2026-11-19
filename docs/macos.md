@@ -1,10 +1,12 @@
 # macOS sandboxes
 
-Status: Phase 0 (feasibility) completed on 2026-11-19. Phase 1 (the `mac`
-instance type) is implemented and unit-tested against a mock of Lume's API;
-on a real Mac the end-to-end run (`scripts/mac/e2e.sh`) passes create,
-health, and exec and is being worked through step by step. Current state
-and the open issue: [macos-handoff.md](macos-handoff.md).
+Status: Phase 1 done on 2026-11-19. The `mac` instance type is implemented,
+unit-tested against a mock of Lume's API, and `scripts/mac/e2e.sh` passes
+end to end, twice in a row, on a MacBook Pro (Apple silicon, Lume 0.7.2,
+macOS 26.6.2 guests): create, health, exec, a background process surviving
+sleep and wake, fork, guest-to-guest isolation, `409 host_capacity_reached`
+and delete. Measured numbers are under "Running it"; what the script does
+not cover is noted under "Acceptance for Phase 1".
 
 A `mac` instance is a full macOS virtual machine on an Apple silicon host,
 with the same API, URLs, gateway, templates, sleep and cron as every other
@@ -40,10 +42,15 @@ type), `--lume-api` / `WARREN_LUME_API`, `--lume-bin` / `WARREN_LUME_BIN`,
 `--mac-vnc` / `WARREN_MAC_VNC`, `--runtime none` / `WARREN_RUNTIME=none`.
 `GET /v1/health` lists `lume` in `runtimes` when the type is on.
 
-What to expect: create to running in well under a minute (clone is instant,
-boot was 11 s in Phase 0, plus the gateway start); sleep writes the VM's
-memory to disk and frees one of the two slots; wake resumes with every
-process intact; a third awake instance answers `409 host_capacity_reached`.
+What to expect, as measured by `scripts/mac/e2e.sh` on the Phase 0 MacBook
+(four runs on 2026-11-19): create to running with a healthy gateway in 21 to
+23 s (the clone is instant, the rest is the boot); sleep in 3 to 4 s, which
+writes the VM's memory to disk and frees one of the two slots; wake in 5 to 11 s
+with every process intact (the marker process keeps its pid); fork of a
+running instance in 30 to 37 s (the source is suspended for the copy, the
+copy boots, the source resumes); delete of two instances in about 20 s; a
+third awake instance answers `409 host_capacity_reached` at create time,
+before anything is cloned.
 Known limits in this phase: template updates that change the base VM are
 refused (`not_supported`); backups are APFS clones that share blocks with
 the VM until either side writes, so their reported size is small and real
@@ -120,6 +127,29 @@ Other facts:
   `lume shutdown` and `lume restart` (graceful, over SSH as `lume`/`lume`).
 - Disks are sparse. A clone costs nothing until the guest writes.
 
+## Lessons from the Mac (do not rediscover)
+
+- `lume run` holds the VM in its process; `--detach` backgrounds it. VMs
+  started through the API live in the `lume serve` process, and `suspend`
+  works only for those. `lume get -f json` prints a one-element array.
+- Powering a VM off right after writing files loses them: the first base
+  image came up without its LaunchDaemons. `build-base.sh` syncs and shuts
+  macOS down from inside; the runtime gives a guest at least 45 s to stop.
+- pf `pass` rules must be `flags any no state`, or enabling pf cuts the
+  connections that already exist (the installer's SSH session included).
+- Apple's `nohup` fails in launchd's system domain ("can't detach from
+  console"), so the gateway must run in the user's domain; see "Gateway
+  inside the guest". `scripts/mac/debug-guest.sh` prints the domain exec
+  runs in and whether `nohup` works there.
+- macOS `nc -w N` bounds idle time, not the connect; a SYN that pf drops
+  waits on TCP retransmits for over a minute. Use `nc -G N` for a connect
+  timeout.
+- The shared folder is `/Volumes/My Shared Files/share` in the guest; the
+  launcher copies the gateway to `/Users/lume/.warren/` and sources
+  `warren.env` (shell-safe `export KEY='value'` lines).
+- `*.localhost` does not resolve for `curl` on macOS; the scripts send
+  `Host:` headers to `127.0.0.1:<port>`. Browsers resolve it fine.
+
 ## Design
 
 ### Topology on a Mac host
@@ -191,10 +221,17 @@ before Lume's own 409 is hit.
 ### Gateway inside the guest
 
 - A LaunchDaemon in the base image (`/Library/LaunchDaemons/dev.warren.gateway.plist`)
-  runs `/usr/local/libexec/warren-gateway-launcher.sh`, which waits for
-  `/Volumes/My Shared Files/share/warren-gateway`, reads `warren.env`, and
-  executes the gateway as the `lume` user with `WARREN_HOME=/Users/lume`.
-  Restart-on-exit is `KeepAlive`.
+  runs `/usr/local/libexec/warren-gateway-launcher.sh` as root, which waits
+  for `/Volumes/My Shared Files/share/warren-gateway`, reads `warren.env`,
+  and starts the gateway as the `lume` user with `WARREN_HOME=/Users/lume`
+  through `launchctl asuser <uid> sudo -n -E -u lume -H`. The detour
+  matters: a LaunchDaemon's children live in launchd's system domain, where
+  Apple's `nohup` fails with "can't detach from console" (it calls
+  `_vprocmgr_detach_from_console`), so an agent's `nohup server &` died
+  before it ran. `launchctl asuser` moves the gateway into the user's own
+  "Background" domain, the one SSH sessions get, where `nohup` works; `sudo`
+  then drops root and keeps the environment. Restart-on-exit is `KeepAlive`;
+  launchd tracks the job through `sudo`, which relays signals.
 - User names on macOS live in Open Directory, not `/etc/passwd`; the owner
   lookup moves to `nix::unistd::User::from_uid` (the `user` feature is already
   enabled) so health reports `lume` instead of `501`.
@@ -256,7 +293,7 @@ add `/etc/hosts` entries for the few names used in testing.
 5. `cargo check --target aarch64-apple-darwin --workspace` in CI (needs a C
    compiler shim for `aws-lc-sys`; documented in `docs/DEVELOPMENT.md`).
 
-### Phase 1b: base image and end-to-end on the Mac — scripts written, run pending
+### Phase 1b: base image and end-to-end on the Mac — done
 
 1. `scripts/mac/build-base.sh`: from a stock Lume macOS VM, install the
    LaunchDaemon and launcher, the `pf` anchor, SSH hardening, optional Xcode
@@ -267,6 +304,11 @@ add `/etc/hosts` entries for the few names used in testing.
    full host → 409 → delete. Records create-to-ready, wake time, clone time
    and disk delta.
 3. Fix what the Mac finds; repeat until the script passes twice in a row.
+   Done on 2026-11-19. The Mac found three things: `nohup` is broken in a
+   LaunchDaemon's domain (the launcher now moves into the user's domain, see
+   "Gateway inside the guest"); macOS `nc -w` does not bound a connect that
+   pf silently drops (`-G` does); and create and fork did not consult host
+   capacity before cloning (`Runtime::check_capacity` now does).
 
 ### Phase 1c: surfaces and docs — done
 
@@ -298,6 +340,10 @@ On the MacBook used for Phase 0:
 - Delete removes the VM and the share directory; after a `warrend` restart
   running VMs are adopted, not duplicated.
 - From inside one guest, the other guest's gateway port is unreachable.
+
+Met on 2026-11-19 by consecutive runs of `scripts/mac/e2e.sh` (numbers
+under "Running it"), with one exception: the script does not restart the
+daemon, so adoption after a `warrend` restart is not exercised by it yet.
 
 ## Open decisions
 
