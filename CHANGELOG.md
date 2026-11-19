@@ -8,6 +8,8 @@ All notable changes to Warren are recorded here. The format follows [Keep a Chan
 
 - `warren-gateway` now builds on non-Linux hosts (macOS included): the PID 1 code in `init.rs` is compiled only on Linux and other targets get a stub, so `--init` and `POST /v1/shutdown` report `not_supported` there. Groundwork for macOS sandboxes.
 
+- `docs/macos.md`: Phase 0 feasibility results for macOS sandboxes (Lume on Apple silicon) and the Phase 1 design for a `mac` instance type. `scripts/mac/boot-test.sh` measures boot-to-SSH and VM memory.
+
 ### Fixed
 
 - `warren-gateway` read its effective uid and gid from `/proc/self/status`, which does not exist on macOS, so `/v1/health` reported `home_owner` as 4294967295 there. It now uses `geteuid`/`getegid` (nix `user` feature).

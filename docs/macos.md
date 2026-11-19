@@ -1,0 +1,266 @@
+# macOS sandboxes
+
+Status: Phase 0 (feasibility) completed on 2026-11-19. Phase 1 (the `mac`
+instance type) is planned below and not started.
+
+A `mac` instance is a full macOS virtual machine on an Apple silicon host,
+with the same API, URLs, gateway, templates, sleep and cron as every other
+Warren instance. It is for agents that need Xcode and the iOS simulators,
+Safari, or macOS applications.
+
+## Constraints that shape everything
+
+- macOS guests run only on Apple silicon Macs (Virtualization.framework), and
+  Apple's software licence allows macOS virtual machines on Apple hardware
+  only. Warren can never schedule a `mac` instance onto a Linux node.
+- Virtualization.framework runs at most **two macOS guests per host** at a
+  time. A Mac is therefore a two-slot node; a sleeping instance must free its
+  slot, and the third `create`/`wake` on a full host is refused.
+- Lume (trycua, MIT) is the VM manager. Version 0.7.2 or newer is required
+  (0.1.x cannot pull images reliably).
+
+## Phase 0 results
+
+Measured on a MacBook Pro (Apple silicon) with Lume 0.7.2 and a VM created
+from Apple's `UniversalMac_26.6.2_25G83_Restore.ipsw`, 4 CPU, 4 GB, 50 GB.
+
+| Check | Result |
+|---|---|
+| Create a macOS VM from an IPSW | works (about 24 GB on disk after install) |
+| Clone the VM (APFS clonefile) | instant, blocks shared with the source |
+| Two VMs running at once | works (`sandbox` and `second`) |
+| Cold boot to SSH | 11 s |
+| Memory right after boot | 415 MB for the VM helper process, of a 4 GB cap |
+| `warren-gateway` built on macOS | works after two fixes (commits fe1e4b3, 814d152) |
+| Gateway inside the VM | `GET /v1/health`, `POST /v1/exec`, `POST /v1/responses` all answer |
+| Whole workspace type-checks for `aarch64-apple-darwin` | yes, `warrend` included |
+
+Two facts about Lume's process model came out of this:
+
+- `lume run <vm>` **is** the VM. The process does not return until the VM
+  stops, and killing it kills the VM. `lume run --detach` wraps itself in
+  `nohup`; VMs started through the HTTP API live inside the `lume serve`
+  process.
+- `POST /lume/vms/:name/suspend` saves the machine state next to the disk and
+  the next run resumes from it, but only for VMs the same `lume serve`
+  process started. So Warren drives the API server and lets it host the VMs.
+
+## Lume 0.7.2 facts the runtime relies on
+
+HTTP API, `lume serve` on `127.0.0.1:7777` (`--port` to change):
+
+| Call | Behaviour |
+|---|---|
+| `GET /lume/host/status` | `{ status, vmCount, maxVMs: 2, availableSlots, version }` |
+| `GET /lume/vms`, `GET /lume/vms/:name` | `VMDetails`: `name, os, cpu, memory, diskSize, display, status ("running" or "stopped"), vncUrl, ipAddress, sshAvailable, macAddress, savedState, networkMode, forwards, locationName` |
+| `POST /lume/vms/clone` | `{ name, newName, withSavedState? }`; APFS clone of disk, NVRAM and config |
+| `POST /lume/vms/:name/run` | body `{ noDisplay, sharedDirectories: [{ hostPath, readOnly }], network, vnc: "enabled"/"disabled", forwards: [guestPort] }`; returns **202** immediately; refuses with 409 when two macOS guests already run |
+| `POST /lume/vms/:name/stop` | graceful shutdown, force after a timeout (default 10 s), then waits 5 s for locks |
+| `POST /lume/vms/:name/suspend` | pause, save state to disk, VM leaves the running set; `savedState: true` afterwards |
+| `PATCH /lume/vms/:name` | `{ cpu, memory, diskSize (grow only), display }`; VM must be stopped |
+| `DELETE /lume/vms/:name` | removes the VM directory |
+
+Other facts:
+
+- The guest's address comes from the host DHCP lease for the VM's MAC on the
+  NAT network (`192.168.64.0/24`). All VMs on one host share that network;
+  nothing isolates them from each other by default.
+- Shared directories are virtiofs and macOS guests automount them under
+  `/Volumes/My Shared Files/<folder name>`. Lume itself always attaches a
+  read-only `lume-config` share.
+- `forwards` opens host loopback ports to guest ports over vsock, an
+  alternative to the NAT address if lease discovery ever proves slow.
+- CLI equivalents exist for everything except suspend: `lume get -f json`,
+  `lume ls -f json`, `lume run --detach --display none --vnc disabled
+  --shared-dir <host path>:ro`, `lume stop [--force] [--timeout N]`,
+  `lume clone`, `lume set`, `lume delete`, `lume ssh`, `lume cp`,
+  `lume shutdown` and `lume restart` (graceful, over SSH as `lume`/`lume`).
+- Disks are sparse. A clone costs nothing until the guest writes.
+
+## Design
+
+### Topology on a Mac host
+
+```
+warrend (same binary, built on macOS)
+  ├── supervises:  lume serve --port 7777        (hosts every warren-* VM)
+  ├── edge proxy → <vm ip>:3737                  (gateway, as for Firecracker)
+  └── <data_dir>/mac/<instance id>/share/        (read-only virtiofs share)
+        ├── warren-gateway                       (arm64 macOS build)
+        └── warren.env                           (instance id, token, driver, model, ...)
+
+Lume VMs: warren-<instance id>, each an APFS clone of a base VM
+          (for example warren-macos-26), ~/.lume/<name>/{config.json,disk.img,nvram.bin,state}
+```
+
+Linux-only runtimes stay compiled in but become optional at startup: when
+Docker is unreachable and `--runtime none` (or no socket) is configured, the
+daemon starts without the `default` and `performance` types instead of
+exiting.
+
+### Core contract changes (`warren-core`)
+
+- `InstanceType::Mac`, API string `"mac"`. Shapes: `cpu` 2 to 8, `memory_mb`
+  4096 to 16384, `disk_gb` fixed by the base image and grow-only.
+- `Config`: `lume_api_url` (default `http://127.0.0.1:7777`), `lume_bin`
+  (default `lume` on PATH), `mac_base_vm` (default none; the type is disabled
+  until set), `mac_vnc: bool` (default off).
+- `Error::host_capacity_reached` → 409 `host_capacity_reached`, details
+  `{ "max_running": 2, "running": n }`. Distinct from `instance_limit_reached`,
+  which is the operator's quota.
+- Templates gain `image` values that name a Lume VM for `mac` types
+  (`mac-base` first; `mac-xcode` later).
+
+### New crate `warren-runtime-mac`
+
+Implements `Runtime` over the Lume HTTP API with `reqwest` (already a
+workspace dependency). Mapping:
+
+| `Runtime` method | Lume |
+|---|---|
+| `ready` | `GET /lume/host/status` answers and `version >= 0.7.2`; base VM exists and is stopped; else the type is disabled with a logged reason |
+| `ensure_image` | `GET /lume/vms/<base>` exists; digest = hash of the base's `config.json` + disk mtime |
+| `create` | `POST /lume/vms/clone { name: base, newName: warren-<id> }`; write the share dir; `storage_path` = share dir, `runtime_ref` = VM name |
+| `start` | write `warren.env`; `POST run { noDisplay: true, vnc: cfg.mac_vnc, sharedDirectories: [{ share, readOnly: true }] }`; poll `GET` until `status == running` and `ipAddress` set (lease), then poll `http://<ip>:3737/v1/health` (bounded, 90 s); `RunInfo { address: <ip>:3737 }` |
+| `stop(grace)` | `POST stop` with `timeout = grace` |
+| sleep (lifecycle calls `stop` today) | `POST suspend`; falls back to `stop` when suspend fails; wake is `start`, which resumes from the saved state |
+| `destroy` | `DELETE /lume/vms/warren-<id>`; remove the share dir |
+| `exec` | the gateway's `POST /v1/exec` with the instance token, exactly as the Firecracker runtime does |
+| `logs` | the Lume log for the VM plus the gateway's own log fetched over `exec` |
+| `stats` | new gateway `GET /v1/stats` (guest-side `vm_stat`, `sysctl`, load) because every VM lives in one host process |
+| `is_running` | `GET /lume/vms/:name` → `status == running` |
+| `resize` | `requires_restart()` while running; `PATCH` when stopped |
+| `recreate` | refused for `mac` in Phase 1 (`not_supported`): the VM disk **is** the home, so a fresh clone of the base would discard it; a later phase can copy `/Users/lume` across |
+| `clone_storage` | `POST /lume/vms/clone { name: warren-<src>, newName: warren-<dst> }`; the clone carries the suspended state when the source sleeps |
+| `backup_storage` | `cp -c` (APFS clonefile) of `disk.img`, `nvram.bin`, `config.json` into `dest_path`; instant, no extra space until divergence; VM must not be running (lifecycle already stops first) |
+| `restore_storage` | reverse copy into the VM directory while stopped |
+| `disk_usage` | allocated blocks of the VM directory (`du -k`) |
+
+The crate is unit-tested on Linux against a small axum mock of the Lume
+API (clone, run with delayed `running`, capacity 409, suspend, stop). The
+real API is exercised only by `scripts/mac/e2e.sh` on a Mac.
+
+Capacity: `create`, `start`, `wake` and `fork` consult
+`GET /lume/host/status` under the per-workspace lock already used for
+`--max-awake-instances`, so a full host returns `host_capacity_reached`
+before Lume's own 409 is hit.
+
+### Gateway inside the guest
+
+- A LaunchDaemon in the base image (`/Library/LaunchDaemons/dev.warren.gateway.plist`)
+  runs `/usr/local/libexec/warren-gateway-launcher.sh`, which waits for
+  `/Volumes/My Shared Files/share/warren-gateway`, reads `warren.env`, and
+  executes the gateway as the `lume` user with `WARREN_HOME=/Users/lume`.
+  Restart-on-exit is `KeepAlive`.
+- User names on macOS live in Open Directory, not `/etc/passwd`; the owner
+  lookup moves to `nix::unistd::User::from_uid` (the `user` feature is already
+  enabled) so health reports `lume` instead of `501`.
+- `GET /v1/stats` is added to the gateway (works on Linux too).
+- `--init` and `/v1/shutdown` stay Linux-only; stopping is Lume's job.
+
+### Daemon changes (`warrend`)
+
+- `--runtime none` (or an unreachable Docker socket with `--runtime auto`)
+  disables the container types instead of failing startup.
+- `--lume-api`, `--lume-bin`, `--mac-base-vm`, `--mac-vnc` flags and
+  `WARREN_*` variables.
+- Supervises `lume serve`: starts it when the API port does not answer,
+  restarts it when it exits, and runs the existing reconciler afterwards.
+  If the server dies, every hosted VM dies with it; the reconciler marks
+  those instances stopped (disk intact) and the next request wakes them.
+- Reconciler adopts `warren-*` VMs reported running by Lume at startup.
+
+### Lifecycle rules for `mac`
+
+- Sleep = suspend (memory kept, slot freed). Wake resumes; expected to be
+  faster than the 11 s cold boot, to be measured.
+- Default idle timeout for `mac` templates: 10 minutes (two slots are
+  scarce). Operators can raise it per instance as today.
+- Stop = graceful stop (10 s), then force.
+- Restart = stop + start (full boot).
+
+### Security on a Mac host
+
+- All guests share the NAT network. The base image installs a `pf` anchor
+  that blocks `192.168.64.0/24` except the host gateway (`192.168.64.1`) and
+  DNS, so one tenant's VM cannot reach another's gateway port. The e2e script
+  verifies this from inside a guest.
+- The gateway requires the instance token on every route except health and
+  version, as on Linux. The edge still strips the `sk_live_` bearer key.
+- The base image disables SSH password authentication and installs a
+  per-host Warren key; the default `lume`/`lume` credentials are rotated by
+  `scripts/mac/build-base.sh`.
+- VNC stays off unless `--mac-vnc` is set; Lume generates a random password
+  per run. Exposing the screen through the edge is Phase 2.
+
+### Host naming
+
+macOS's resolver does not resolve `*.localhost` subdomains for `curl` and
+most tools (browsers do). On a Mac host use a wildcard domain that resolves
+to the host, for example `--base-domain 127.0.0.1.sslip.io` or `lvh.me`, or
+add `/etc/hosts` entries for the few names used in testing.
+
+## Phases
+
+### Phase 1a: runtime and daemon (this host, no Mac needed)
+
+1. `warren-core`: `InstanceType::Mac`, shapes, config fields, error code,
+   `mac-base` template.
+2. `warren-runtime-mac` with the mock-API unit tests.
+3. `warrend`: optional Docker, Lume flags, `lume serve` supervision,
+   reconciler adoption.
+4. Gateway: `GET /v1/stats`, Open Directory owner names.
+5. `cargo check --target aarch64-apple-darwin --workspace` in CI (needs a C
+   compiler shim for `aws-lc-sys`; documented in `docs/DEVELOPMENT.md`).
+
+### Phase 1b: base image and end-to-end on the Mac
+
+1. `scripts/mac/build-base.sh`: from a stock Lume macOS VM, install the
+   LaunchDaemon and launcher, the `pf` anchor, SSH hardening, optional Xcode
+   Command Line Tools; stop and name it `warren-macos-26`.
+2. `scripts/mac/e2e.sh`: start `warrend` with `--runtime none --mac-base-vm
+   warren-macos-26`, then create → health → exec → files → Agent API →
+   sleep (`savedState: true`, slot freed) → wake → fork → third create on a
+   full host → 409 → delete. Records create-to-ready, wake time, clone time
+   and disk delta.
+3. Fix what the Mac finds; repeat until the script passes twice in a row.
+
+### Phase 1c: surfaces and docs
+
+1. Dashboard type picker, CLI and SDK `--type mac`, MCP tool descriptions.
+2. `docs/macos.md` becomes the operator guide (requirements, base image,
+   limits, troubleshooting); `CHANGELOG.md`; README roadmap.
+
+### Phase 2 candidates
+
+- Screen: noVNC through the edge (WebSocket to the VM's VNC port).
+- Linux guests through Lume on Mac hosts (not subject to the two-guest
+  limit) as cheap extra capacity on the same machine.
+- One `lume serve` per instance for crash containment and host-side stats.
+- `mac-xcode` template with Xcode preinstalled; simulator-ready.
+- Multi-node: Mac minis as two-slot nodes behind one `warrend` (the general
+  multi-node item on the roadmap).
+
+## Acceptance for Phase 1
+
+On the MacBook used for Phase 0:
+
+- `warrend --runtime none --mac-base-vm warren-macos-26 --base-domain 127.0.0.1.sslip.io --dev`
+  starts, reports the `mac` type enabled, and supervises `lume serve`.
+- `warren instances create --type mac` reaches `running` with a healthy
+  gateway in under 60 s; exec and the Agent API answer.
+- Sleep suspends the VM and frees a slot; wake resumes in under 15 s with the
+  same processes still running inside.
+- With two awake instances a third create returns 409 `host_capacity_reached`.
+- Delete removes the VM and the share directory; after a `warrend` restart
+  running VMs are adopted, not duplicated.
+- From inside one guest, the other guest's gateway port is unreachable.
+
+## Open decisions
+
+1. Guest user: keep `lume` (created by the IPSW install with autologin) and
+   rotate its password, or create a dedicated `warren` user. Recommendation:
+   keep `lume` in Phase 1.
+2. Whether to ship Linux-guest support on Mac hosts in Phase 1 or 2.
+   Recommendation: Phase 2.
+3. Screen access priority. Recommendation: after Phase 1 passes.
