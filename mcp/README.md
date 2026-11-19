@@ -62,7 +62,7 @@ Cursor picks it up under Settings > MCP; enable the server and its tools appear 
 |---|---|---|
 | `list_instances` | none | `{ data: [instance...] }` newest first |
 | `get_instance` | `id` | the instance object |
-| `create_instance` | `template?`, `type?` (`default`/`vm`), `cpu?`, `memory?`, `disk?`, `name?`, `auto_sleep?`, `idle_timeout_seconds?`, `env?` | the instance, after waiting up to 120 s for `running` (still returned, with a note, if it is not running yet) |
+| `create_instance` | `template?`, `type?` (`default`/`vm`/`mac`), `cpu?`, `memory?`, `disk?`, `name?`, `auto_sleep?`, `idle_timeout_seconds?`, `env?` | the instance, after waiting up to 120 s for `running` (still returned, with a note, if it is not running yet) |
 | `delete_instance` | `id` | `{ id, status: "deleting" }` |
 | `stop_instance` | `id` | `{ id, status: "stopping" }` |
 | `start_instance` | `id` | `{ id, status: "starting" }` |

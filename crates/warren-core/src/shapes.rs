@@ -38,6 +38,11 @@ const CATALOG: [Spec; 4] = [
 pub const MAX_CPU: u32 = 4;
 /// Smallest disk on every shape.
 pub const MIN_DISK_GB: u32 = 2;
+/// Largest disk on the `vm` and `performance` types.
+pub const MAX_DISK_GB_VM: u32 = 100;
+/// Largest disk on the `mac` type. The disk starts at the base image's size
+/// and only grows; the runtime enforces the lower bound.
+pub const MAX_DISK_GB_MAC: u32 = 500;
 
 /// The CPU/RAM pairs with their default disks.
 pub fn valid_shapes() -> Vec<Shape> {
@@ -57,8 +62,10 @@ fn lookup(cpu: u32, memory: u32) -> Option<&'static Spec> {
 
 /// Fill defaults and validate a requested shape. A missing request yields the
 /// template's default shape. CPU above `MAX_CPU` is clamped while keeping the
-/// requested memory. Disk must be a whole number of
-/// GB within the shape's range (up to 100 GB on vm and performance types).
+/// requested memory. Disk must be a whole number of GB within the shape's
+/// range (up to 100 GB on vm and performance types, 500 GB on mac). On the
+/// `mac` type an unrequested disk keeps the template's size whatever the
+/// CPU/RAM pair, because the disk is the base image's and never shrinks.
 pub fn normalize(
     req: Option<&ShapeRequest>,
     tpl: Option<&Template>,
@@ -99,17 +106,15 @@ pub fn normalize(
         ))
     })?;
     if !disk_requested && (out.disk == 0 || (out.cpu, out.memory) != (base.cpu, base.memory)) {
-        out.disk = if out.disk > 0 && (out.cpu, out.memory) == (base.cpu, base.memory) {
+        let keep_template_disk = out.disk > 0
+            && (t == InstanceType::Mac || (out.cpu, out.memory) == (base.cpu, base.memory));
+        out.disk = if keep_template_disk {
             out.disk
         } else {
             spec.default_disk
         };
     }
-    let max_disk = if matches!(t, InstanceType::Vm | InstanceType::Performance) {
-        100
-    } else {
-        spec.max_disk
-    };
+    let max_disk = max_disk_for(spec, t);
     if out.disk < MIN_DISK_GB || out.disk > max_disk {
         return Err(Error::invalid(format!(
             "disk must be between {MIN_DISK_GB} and {max_disk} GB for this shape"
@@ -118,14 +123,23 @@ pub fn normalize(
     Ok(out)
 }
 
-/// Maximum disk for a shape on the default type.
-pub fn max_disk(shape: Shape, t: InstanceType) -> u32 {
-    if matches!(t, InstanceType::Vm | InstanceType::Performance) {
-        return 100;
+fn max_disk_for(spec: &Spec, t: InstanceType) -> u32 {
+    match t {
+        InstanceType::Vm | InstanceType::Performance => MAX_DISK_GB_VM,
+        InstanceType::Mac => MAX_DISK_GB_MAC,
+        InstanceType::Default => spec.max_disk,
     }
-    lookup(shape.cpu, shape.memory)
-        .map(|s| s.max_disk)
-        .unwrap_or(12)
+}
+
+/// Maximum disk for a shape on the given type.
+pub fn max_disk(shape: Shape, t: InstanceType) -> u32 {
+    match t {
+        InstanceType::Vm | InstanceType::Performance => MAX_DISK_GB_VM,
+        InstanceType::Mac => MAX_DISK_GB_MAC,
+        InstanceType::Default => lookup(shape.cpu, shape.memory)
+            .map(|s| s.max_disk)
+            .unwrap_or(12),
+    }
 }
 
 #[cfg(test)]

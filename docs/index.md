@@ -24,6 +24,7 @@ Warren is free software you host yourself. It does no billing: nothing in it has
 | [Agent API](agent-api.md) | `POST /v1/responses`, streaming events, sessions, models, drivers. |
 | [Crons](crons.md) | Scheduled prompts for agent instances. |
 | [VM instances](vm-instances.md) | The experimental Firecracker type: requirements, assets, flags, limits. |
+| [macOS sandboxes](macos.md) | The `mac` type: macOS virtual machines through Lume on an Apple silicon host; requirements, base image, the two-VM limit, daemon flags. |
 
 ## Operating Warren
 

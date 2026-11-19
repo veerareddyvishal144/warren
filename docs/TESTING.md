@@ -179,6 +179,19 @@ otherwise the test prints that it was skipped. Without KVM the daemon logs
 "firecracker runtime not ready; vm instances disabled" and the test fails with
 that message in the log tail.
 
+## The mac test (Apple silicon only)
+
+`mac` instances cannot be tested on a Linux host. `crates/warren-runtime-mac`
+unit-tests the runtime against a mock of Lume's API and a fake gateway
+(`cargo test -p warren-runtime-mac`), and `scripts/mac/e2e.sh` exercises the
+real thing on a Mac: it builds `warrend` and the native gateway, starts the
+daemon with `--runtime none --mac-base-vm <vm>`, then creates a `mac`
+instance, execs in it, suspends and resumes it (a background process must
+survive), forks it, checks that one guest cannot reach the other's gateway,
+provokes `409 host_capacity_reached` with a third instance and deletes
+everything. `scripts/mac/README.md` lists the prerequisites (Lume 0.7.2+, a
+base VM prepared with `scripts/mac/build-base.sh`, `jq`).
+
 ## Dashboard smoke test (real browser)
 
 `scripts/dashboard-smoke.mjs` drives the embedded dashboard in headless Chrome against a dev daemon it starts itself: signup through the UI, create an instance from the form, wait for `running`, run a command in the exec console, delete the instance. It fails on any browser console error, page error or failed request.

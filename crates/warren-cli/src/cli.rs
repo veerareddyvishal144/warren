@@ -245,8 +245,8 @@ pub struct CreateArgs {
     /// Template `name` or `name@revision` (default warren-base).
     #[arg(long)]
     pub template: Option<String>,
-    /// Instance type: default or vm.
-    #[arg(long = "type", value_name = "default|vm", value_parser = parse_instance_type)]
+    /// Instance type: default, vm or mac (macOS VM; needs an Apple silicon host).
+    #[arg(long = "type", value_name = "default|vm|mac", value_parser = parse_instance_type)]
     pub kind: Option<InstanceType>,
     /// vCPUs.
     #[arg(long)]
@@ -378,7 +378,7 @@ pub enum FilesCmd {
 /// clap value parser for `--type`.
 pub fn parse_instance_type(s: &str) -> Result<InstanceType, String> {
     InstanceType::parse(s.trim())
-        .ok_or_else(|| format!("unknown instance type {s:?}; use default or vm"))
+        .ok_or_else(|| format!("unknown instance type {s:?}; use default, vm or mac"))
 }
 
 /// clap value parser for `--network`.
@@ -564,10 +564,16 @@ mod tests {
             panic!()
         };
         assert!(a.template.is_none() && a.kind.is_none() && !a.wait && a.env.is_empty());
-        assert_eq!(
-            fails(&["instances", "create", "--type", "huge"]).kind(),
-            ErrorKind::ValueValidation
-        );
+        let Command::Instances {
+            cmd: InstancesCmd::Create(a),
+        } = parse(&["instances", "create", "--type", "mac"]).command
+        else {
+            panic!()
+        };
+        assert_eq!(a.kind, Some(InstanceType::Mac));
+        let err = fails(&["instances", "create", "--type", "huge"]);
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("use default, vm or mac"), "{err}");
         assert_eq!(
             fails(&["instances", "create", "--network", "some"]).kind(),
             ErrorKind::ValueValidation

@@ -2292,3 +2292,49 @@ async fn gateway_credentials_need_a_running_instance() {
     assert_eq!(ip, woken.ip);
     assert_eq!(token, inst.instance_token);
 }
+
+/// A full host is not a failure of the instance: the row goes back to
+/// `stopped` (or `sleeping` for a wake) with the refusal as its reason, and
+/// the next attempt simply tries again.
+#[tokio::test]
+async fn host_capacity_refusals_do_not_fail_the_instance() {
+    let env = Env::new();
+    env.runtime
+        .refuse_start_capacity
+        .store(true, Ordering::SeqCst);
+    let created = env.create(CreateInstanceRequest::default()).await;
+    let inst = env.wait_for(&created.id, InstanceStatus::Stopped).await;
+    assert!(
+        inst.status_reason.contains("at most 2"),
+        "reason carries the refusal: {}",
+        inst.status_reason
+    );
+    assert!(inst.ip.is_empty());
+    env.runtime
+        .refuse_start_capacity
+        .store(false, Ordering::SeqCst);
+    let inst = env.mgr.start(WS, &inst.id).await.unwrap();
+    assert_eq!(inst.status, InstanceStatus::Running);
+
+    env.mgr.sleep(WS, &inst.id).await.unwrap();
+    env.runtime
+        .refuse_start_capacity
+        .store(true, Ordering::SeqCst);
+    let err = env.mgr.start(WS, &inst.id).await.unwrap_err();
+    assert_eq!(err.code, warren_core::errors::CODE_HOST_CAPACITY_REACHED);
+    assert_eq!(err.status, 409);
+    let inst = env.store.instance(&inst.id);
+    assert_eq!(
+        inst.status,
+        InstanceStatus::Sleeping,
+        "{}",
+        inst.status_reason
+    );
+    env.runtime
+        .refuse_start_capacity
+        .store(false, Ordering::SeqCst);
+    assert_eq!(
+        env.mgr.start(WS, &inst.id).await.unwrap().status,
+        InstanceStatus::Running
+    );
+}

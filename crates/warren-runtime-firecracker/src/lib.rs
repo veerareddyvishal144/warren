@@ -25,7 +25,6 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-mod gateway;
 mod host;
 mod image;
 mod inject;
@@ -494,7 +493,7 @@ impl Runtime for FirecrackerRuntime {
 
         if let Some(pid) = self.running_pid(&p)? {
             tracing::info!(instance = %inst.id, pid, "VM already running; adopting it");
-            gateway::wait_for_port(ip, GATEWAY_PORT, BOOT_TIMEOUT, || {
+            warren_gateway_client::wait_for_port(ip, GATEWAY_PORT, BOOT_TIMEOUT, || {
                 process::is_alive(pid, &marker)
             })
             .await?;
@@ -525,10 +524,11 @@ impl Runtime for FirecrackerRuntime {
         process::write_pid(&p.pid(), pid)?;
         tracing::info!(instance = %inst.id, pid, ip = %ip, tap, "firecracker started; waiting for the gateway");
 
-        if let Err(mut e) = gateway::wait_for_port(ip, GATEWAY_PORT, BOOT_TIMEOUT, || {
-            process::is_alive(pid, &marker)
-        })
-        .await
+        if let Err(mut e) =
+            warren_gateway_client::wait_for_port(ip, GATEWAY_PORT, BOOT_TIMEOUT, || {
+                process::is_alive(pid, &marker)
+            })
+            .await
         {
             let console = process::tail(&p.console(), 40, 64 << 10).unwrap_or_default();
             self.kill_vm(&p, pid).await;
@@ -555,7 +555,7 @@ impl Runtime for FirecrackerRuntime {
         if let Some(pid) = self.running_pid(&p)? {
             host::require_root("stop a microVM")?;
             if let Some(ip) = ip {
-                match gateway::shutdown(&self.http, ip, &inst.instance_token).await {
+                match warren_gateway_client::shutdown(&self.http, ip, &inst.instance_token).await {
                     Ok(()) => tracing::debug!(instance = %inst.id, "shutdown requested"),
                     Err(e) => {
                         tracing::debug!(instance = %inst.id, error = %e, "shutdown request failed; waiting then signalling")
@@ -609,7 +609,7 @@ impl Runtime for FirecrackerRuntime {
         }
         let ip = Self::guest_ip(inst, &p)
             .ok_or_else(|| Error::internal(format!("instance {} has no guest address", inst.id)))?;
-        gateway::exec(&self.http, ip, &inst.instance_token, req).await
+        warren_gateway_client::exec(&self.http, ip, &inst.instance_token, req).await
     }
 
     async fn logs(&self, inst: &Instance, opts: LogsOptions) -> Result<String> {

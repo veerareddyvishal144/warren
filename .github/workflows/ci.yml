@@ -42,6 +42,21 @@ jobs:
       - name: cargo test (every crate except warren-e2e)
         run: cargo test --workspace --exclude warren-e2e --locked
 
+  macos:
+    name: macOS build (Apple silicon)
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy (every crate, native arm64)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: cargo test (the crates that run on a Mac host)
+        run: cargo test --locked -p warren-core -p warren-gateway -p warren-gateway-client -p warren-runtime-mac -p warren-lifecycle -p warren-api -p warren-cli
+      - name: Syntax-check the Mac scripts
+        run: for f in scripts/mac/*.sh scripts/mac/guest/*.sh; do bash -n "$f"; done; for p in scripts/mac/guest/*.plist; do plutil -lint "$p"; done
+
   images:
     name: template images
     runs-on: ubuntu-latest

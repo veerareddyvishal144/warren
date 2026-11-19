@@ -95,6 +95,9 @@ pub enum InstanceType {
     Vm,
     /// Reserved for hosts with pinned cores; not available in the single-node build.
     Performance,
+    /// A macOS virtual machine (Virtualization.framework through Lume) on an
+    /// Apple silicon host. At most two run per host.
+    Mac,
 }
 
 impl InstanceType {
@@ -103,6 +106,7 @@ impl InstanceType {
             Self::Default => "default",
             Self::Vm => "vm",
             Self::Performance => "performance",
+            Self::Mac => "mac",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -110,6 +114,7 @@ impl InstanceType {
             "default" => Some(Self::Default),
             "vm" => Some(Self::Vm),
             "performance" => Some(Self::Performance),
+            "mac" => Some(Self::Mac),
             _ => None,
         }
     }

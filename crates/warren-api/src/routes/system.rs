@@ -12,12 +12,25 @@ use crate::{
     routes::created, validate,
 };
 
-/// `GET /v1/health`
+/// `GET /v1/health`. `runtimes` lists the runtimes that actually came up
+/// ("docker", "firecracker", "lume"), as the daemon recorded them at startup;
+/// a configuration without that record falls back to what was asked for.
 pub async fn health(State(d): State<Arc<Deps>>) -> Json<Value> {
-    let mut runtimes = vec!["docker"];
-    if d.config.enable_firecracker {
-        runtimes.push("firecracker");
-    }
+    let runtimes: Vec<String> = if d.config.runtime_names.is_empty() {
+        let mut v = Vec::new();
+        if d.config.runtime != "none" {
+            v.push("docker".to_string());
+        }
+        if d.config.enable_firecracker {
+            v.push("firecracker".to_string());
+        }
+        if d.config.mac_base_vm.is_some() {
+            v.push("lume".to_string());
+        }
+        v
+    } else {
+        d.config.runtime_names.clone()
+    };
     Json(json!({
         "healthy": true,
         "version": d.config.version,

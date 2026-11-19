@@ -14,6 +14,7 @@ warren-core.workspace = true
 warren-store.workspace = true
 warren-runtime-docker.workspace = true
 warren-runtime-firecracker.workspace = true
+warren-runtime-mac.workspace = true
 warren-templates.workspace = true
 warren-lifecycle.workspace = true
 warren-edge.workspace = true

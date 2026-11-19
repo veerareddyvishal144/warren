@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.warren.gateway</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/libexec/warren-gateway-launcher.sh</string>
+	</array>
+	<key>UserName</key>
+	<string>lume</string>
+	<key>GroupName</key>
+	<string>staff</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/lume</string>
+	<key>StandardOutPath</key>
+	<string>/Users/lume/Library/Logs/warren-gateway.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/lume/Library/Logs/warren-gateway.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>HOME</key>
+		<string>/Users/lume</string>
+	</dict>
+</dict>
+</plist>

@@ -1,12 +1,54 @@
 # macOS sandboxes
 
 Status: Phase 0 (feasibility) completed on 2026-11-19. Phase 1 (the `mac`
-instance type) is planned below and not started.
+instance type) is implemented and unit-tested against a mock of Lume's API;
+the end-to-end run on a real Mac (`scripts/mac/e2e.sh`) is the remaining
+step before it is called done.
 
 A `mac` instance is a full macOS virtual machine on an Apple silicon host,
 with the same API, URLs, gateway, templates, sleep and cron as every other
 Warren instance. It is for agents that need Xcode and the iOS simulators,
 Safari, or macOS applications.
+
+## Running it
+
+On the Mac (Apple silicon, macOS 14 or newer, [Lume](https://github.com/trycua/cua)
+0.7.2 or newer, `jq`, a Rust toolchain):
+
+1. Create a stock macOS VM once, from Apple's restore image, and make sure
+   SSH works in it: `lume create base --os macos --cpu 4 --memory 4GB
+   --disk-size 50GB --ipsw latest`, `lume run base`, finish the macOS setup,
+   enable Remote Login, `lume stop base`.
+2. Turn it into Warren's base image: `bash scripts/mac/build-base.sh
+   --source base --target warren-macos-26`. This clones the VM, installs the
+   gateway LaunchDaemon and launcher, the `pf` isolation rules, your SSH key,
+   disables sleep and automatic updates, and stops the clone.
+3. Build and run the daemon natively:
+   `cargo build --release -p warrend -p warren-gateway` then
+   `target/release/warrend --runtime none --mac-base-vm warren-macos-26 --dev`.
+   `--runtime none` skips Docker; drop it on a Mac that also runs Docker
+   Desktop for `default` instances. The daemon starts `lume serve` itself
+   when the API on `127.0.0.1:7777` is not answering (`--lume-api` to
+   change) and restarts it if it dies.
+4. Create instances with `"type": "mac"` from the `warren-macos` template
+   (the dashboard, CLI `--type mac`, SDKs and MCP all know the type), or run
+   the whole scenario with `bash scripts/mac/e2e.sh`.
+
+Flags and variables: `--mac-base-vm` / `WARREN_MAC_BASE_VM` (enables the
+type), `--lume-api` / `WARREN_LUME_API`, `--lume-bin` / `WARREN_LUME_BIN`,
+`--mac-vnc` / `WARREN_MAC_VNC`, `--runtime none` / `WARREN_RUNTIME=none`.
+`GET /v1/health` lists `lume` in `runtimes` when the type is on.
+
+What to expect: create to running in well under a minute (clone is instant,
+boot was 11 s in Phase 0, plus the gateway start); sleep writes the VM's
+memory to disk and frees one of the two slots; wake resumes with every
+process intact; a third awake instance answers `409 host_capacity_reached`.
+Known limits in this phase: template updates that change the base VM are
+refused (`not_supported`); backups are APFS clones that share blocks with
+the VM until either side writes, so their reported size is small and real
+usage grows as the disk diverges; the guest user is `lume` with Lume's
+default password (reachable only from the Mac itself and blocked between
+guests by `pf`); screen access is not exposed yet.
 
 ## Constraints that shape everything
 
@@ -109,7 +151,7 @@ exiting.
   `{ "max_running": 2, "running": n }`. Distinct from `instance_limit_reached`,
   which is the operator's quota.
 - Templates gain `image` values that name a Lume VM for `mac` types
-  (`mac-base` first; `mac-xcode` later).
+  (`warren-macos` first; a `mac-xcode` template later).
 
 ### New crate `warren-runtime-mac`
 
@@ -202,10 +244,10 @@ add `/etc/hosts` entries for the few names used in testing.
 
 ## Phases
 
-### Phase 1a: runtime and daemon (this host, no Mac needed)
+### Phase 1a: runtime and daemon (this host, no Mac needed) — done
 
 1. `warren-core`: `InstanceType::Mac`, shapes, config fields, error code,
-   `mac-base` template.
+   `warren-macos` template.
 2. `warren-runtime-mac` with the mock-API unit tests.
 3. `warrend`: optional Docker, Lume flags, `lume serve` supervision,
    reconciler adoption.
@@ -213,7 +255,7 @@ add `/etc/hosts` entries for the few names used in testing.
 5. `cargo check --target aarch64-apple-darwin --workspace` in CI (needs a C
    compiler shim for `aws-lc-sys`; documented in `docs/DEVELOPMENT.md`).
 
-### Phase 1b: base image and end-to-end on the Mac
+### Phase 1b: base image and end-to-end on the Mac — scripts written, run pending
 
 1. `scripts/mac/build-base.sh`: from a stock Lume macOS VM, install the
    LaunchDaemon and launcher, the `pf` anchor, SSH hardening, optional Xcode
@@ -225,7 +267,7 @@ add `/etc/hosts` entries for the few names used in testing.
    and disk delta.
 3. Fix what the Mac finds; repeat until the script passes twice in a row.
 
-### Phase 1c: surfaces and docs
+### Phase 1c: surfaces and docs — done
 
 1. Dashboard type picker, CLI and SDK `--type mac`, MCP tool descriptions.
 2. `docs/macos.md` becomes the operator guide (requirements, base image,

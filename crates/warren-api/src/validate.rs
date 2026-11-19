@@ -149,7 +149,7 @@ pub fn create_instance(cfg: &Config, req: &CreateInstanceRequest) -> Result<()> 
     }
     if req.kind == Some(InstanceType::Performance) {
         return Err(Error::not_supported(
-            "performance instances are not available in this build; use type \"default\" or \"vm\"",
+            "performance instances are not available in this build; use type \"default\", \"vm\" or \"mac\"",
         ));
     }
     if let Some(n) = &req.name {

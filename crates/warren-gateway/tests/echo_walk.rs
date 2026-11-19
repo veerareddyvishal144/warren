@@ -582,6 +582,54 @@ async fn non_agent_template_serves_files_exec_and_health_only() {
 }
 
 #[tokio::test]
+async fn stats_report_guest_usage() {
+    let s = start("none", "stats-token").await;
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let (status, stats) = s.get_json("/v1/stats").await;
+    assert_eq!(status, 200, "{stats}");
+    // Exactly the contract's fields, every one a number.
+    let mut keys: Vec<&str> = stats
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "at",
+            "cpu_percent",
+            "disk_bytes",
+            "memory_bytes",
+            "memory_limit_bytes"
+        ]
+    );
+    let at = stats["at"].as_i64().unwrap();
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(
+        at >= before && at <= after,
+        "at={at} before={before} after={after}"
+    );
+    let cpu = stats["cpu_percent"].as_f64().unwrap();
+    assert!((0.0..=100.0).contains(&cpu), "{cpu}");
+    // The home lives on a real filesystem and this host has memory.
+    assert!(stats["disk_bytes"].as_i64().unwrap() > 0, "{stats}");
+    assert!(stats["memory_bytes"].as_i64().unwrap() > 0, "{stats}");
+    assert!(stats["memory_limit_bytes"].as_i64().unwrap() > 0, "{stats}");
+    // Token-protected like every other route.
+    let (status, e) = s.anonymous(reqwest::Method::GET, "/v1/stats").await;
+    assert_eq!(status, 401);
+    assert_eq!(error_code(&e), "invalid_api_key");
+}
+
+#[tokio::test]
 async fn token_guards_every_route_except_health_and_version() {
     use reqwest::Method;
     let s = start("echo", "guard-token").await;
@@ -623,6 +671,7 @@ async fn token_guards_every_route_except_health_and_version() {
         (Method::POST, "/v1/files/move"),
         (Method::GET, "/v1/files/download?path=."),
         (Method::POST, "/v1/exec"),
+        (Method::GET, "/v1/stats"),
         (Method::POST, "/v1/shutdown"),
         (Method::GET, "/v1/nope"),
         (Method::POST, "/v1/health"),

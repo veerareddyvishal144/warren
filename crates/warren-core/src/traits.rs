@@ -106,6 +106,12 @@ pub trait Runtime: Send + Sync {
     /// bounded timeout passes.
     async fn start(&self, inst: &mut Instance) -> Result<RunInfo>;
     async fn stop(&self, inst: &Instance, grace: Duration) -> Result<()>;
+    /// Put the instance to sleep: bring the runtime down while keeping the
+    /// disk, and the memory too when the runtime can (a macOS VM is suspended
+    /// and resumes where it was). `start` wakes it. Defaults to `stop`.
+    async fn sleep(&self, inst: &Instance, grace: Duration) -> Result<()> {
+        self.stop(inst, grace).await
+    }
     /// Remove the runtime object and, when `remove_storage`, the disk.
     async fn destroy(&self, inst: &Instance, remove_storage: bool) -> Result<()>;
     async fn exec(&self, inst: &Instance, req: &ExecRequest) -> Result<ExecResult>;

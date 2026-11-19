@@ -8,8 +8,12 @@
 //! [`HomeOwner`] unless the request names another user. The switch goes
 //! through `runuser` (util-linux; `--session-command` keeps the command in
 //! our process group so a timeout still kills the whole tree), else `su`,
-//! else the child changes its ids itself (when the owner has no `/etc/passwd`
-//! entry or neither helper is installed).
+//! else the child changes its ids itself (when the owner is known to no user
+//! database or neither helper is installed).
+//!
+//! Users are looked up in `/etc/passwd` first and then through the system's
+//! `getpwnam_r`/`getpwuid_r` (NSS on Linux, Open Directory on macOS, where
+//! ordinary accounts never appear in `/etc/passwd`).
 
 use std::{
     os::unix::process::ExitStatusExt,
@@ -21,7 +25,7 @@ use std::{
 use axum::{Json, extract::State};
 use nix::{
     sys::signal::{Signal, killpg},
-    unistd::Pid,
+    unistd::{Pid, Uid, User},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -59,9 +63,9 @@ pub async fn exec_handler(
 ///
 /// An empty `user` means the owner of the persistent home: the agent user in
 /// the built-in images, where the gateway is root; the gateway's own user
-/// otherwise. `HOME` is then the persistent home. Any user listed in
-/// `/etc/passwd`, `"root"` included, may be asked for explicitly when the
-/// gateway is root; such a user gets its passwd home as `HOME`.
+/// otherwise. `HOME` is then the persistent home. Any user the system knows
+/// (see [`lookup_passwd`]), `"root"` included, may be asked for explicitly
+/// when the gateway is root; such a user gets its passwd home as `HOME`.
 pub async fn run_exec(home: &Path, owner: &HomeOwner, req: &ExecRequest) -> Result<ExecResult> {
     if req.command.trim().is_empty() {
         return Err(Error::invalid("command must not be empty"));
@@ -270,7 +274,8 @@ pub struct Identity {
     pub name: String,
     pub uid: u32,
     pub gid: u32,
-    /// `name` is listed in `/etc/passwd`, so `runuser`/`su` can resolve it.
+    /// `name` is known to the user database (`/etc/passwd` or the system's
+    /// `getpwnam`), so `runuser`/`su` can resolve it.
     pub named: bool,
 }
 
@@ -410,7 +415,8 @@ pub fn is_root() -> bool {
     effective_uid() == 0
 }
 
-/// One `/etc/passwd` line.
+/// One user record: an `/etc/passwd` line or the equivalent answer of the
+/// system's user database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasswdEntry {
     pub name: String,
@@ -440,19 +446,57 @@ pub fn parse_passwd(content: &str) -> Vec<PasswdEntry> {
         .collect()
 }
 
-/// Look a user up by name in `/etc/passwd`.
+impl From<User> for PasswdEntry {
+    fn from(u: User) -> Self {
+        PasswdEntry {
+            name: u.name,
+            uid: u.uid.as_raw(),
+            gid: u.gid.as_raw(),
+            home: u.dir,
+            shell: u.shell.to_string_lossy().into_owned(),
+        }
+    }
+}
+
+/// Look a user up by name: in `/etc/passwd` first, then in the system's user
+/// database (see [`system_user_by_name`]).
 pub fn lookup_passwd(name: &str) -> Option<PasswdEntry> {
-    let content = std::fs::read_to_string("/etc/passwd").ok()?;
-    parse_passwd(&content).into_iter().find(|e| e.name == name)
+    passwd_file()
+        .and_then(|c| parse_passwd(&c).into_iter().find(|e| e.name == name))
+        .or_else(|| system_user_by_name(name))
 }
 
-/// Look a user up by uid in `/etc/passwd`.
+/// Look a user up by uid: in `/etc/passwd` first, then in the system's user
+/// database (see [`system_user_by_uid`]).
 pub fn lookup_uid(uid: u32) -> Option<PasswdEntry> {
-    let content = std::fs::read_to_string("/etc/passwd").ok()?;
-    parse_passwd(&content).into_iter().find(|e| e.uid == uid)
+    passwd_file()
+        .and_then(|c| parse_passwd(&c).into_iter().find(|e| e.uid == uid))
+        .or_else(|| system_user_by_uid(uid))
 }
 
-/// Name of the effective user from `/etc/passwd`, if listed.
+fn passwd_file() -> Option<String> {
+    std::fs::read_to_string("/etc/passwd").ok()
+}
+
+/// `getpwuid_r`: the user database behind NSS on Linux and Open Directory on
+/// macOS, where ordinary accounts (uid 501 and up) are not in `/etc/passwd`.
+/// `None` when the uid is unknown or the lookup fails.
+pub fn system_user_by_uid(uid: u32) -> Option<PasswdEntry> {
+    User::from_uid(Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(PasswdEntry::from)
+}
+
+/// `getpwnam_r`; see [`system_user_by_uid`]. An empty name is never found.
+pub fn system_user_by_name(name: &str) -> Option<PasswdEntry> {
+    if name.is_empty() {
+        return None;
+    }
+    User::from_name(name).ok().flatten().map(PasswdEntry::from)
+}
+
+/// Name of the effective user, if the user database knows it.
 pub fn current_user_name() -> Option<String> {
     lookup_uid(effective_uid()).map(|e| e.name)
 }
@@ -683,6 +727,42 @@ mod tests {
         if std::fs::metadata("/etc/passwd").is_ok() {
             assert_eq!(lookup_uid(0).unwrap().name, "root");
         }
+    }
+
+    #[test]
+    fn uid_lookup_falls_back_to_the_system_user_database() {
+        let me = effective_uid();
+        let entry = lookup_uid(me).expect("the effective user is known to the system");
+        assert!(
+            entry.name.parse::<u32>().is_err(),
+            "numeric name {:?} for uid {me}",
+            entry.name
+        );
+        assert_eq!(entry.uid, me);
+        // `getpwuid_r` agrees with whatever source answered.
+        let sys = User::from_uid(Uid::from_raw(me))
+            .expect("getpwuid_r")
+            .expect("the effective user has a system record");
+        assert_eq!(entry.name, sys.name);
+        assert_eq!(entry.gid, sys.gid.as_raw());
+        assert_eq!(entry.home, sys.dir);
+        // The fallbacks alone find the same user, by uid and by name.
+        let by_uid = system_user_by_uid(me).unwrap();
+        assert_eq!(
+            (by_uid.name.as_str(), by_uid.uid),
+            (entry.name.as_str(), me)
+        );
+        let by_name = system_user_by_name(&entry.name).unwrap();
+        assert_eq!(by_name, by_uid);
+        assert_eq!(lookup_passwd(&entry.name).unwrap().uid, me);
+        assert!(Identity::from_passwd(&by_uid).named);
+        // Unknown users stay unknown through every path.
+        assert!(system_user_by_uid(4_000_000_000).is_none());
+        assert!(lookup_uid(4_000_000_000).is_none());
+        assert!(system_user_by_name("nobody-such-user-xyz").is_none());
+        assert!(system_user_by_name("").is_none());
+        assert!(system_user_by_name("bad\0name").is_none());
+        assert!(lookup_passwd("nobody-such-user-xyz").is_none());
     }
 
     fn removed_envs(cmd: &Command) -> Vec<String> {

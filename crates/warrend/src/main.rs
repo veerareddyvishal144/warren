@@ -29,7 +29,8 @@ struct Args {
     /// Data directory (sqlite, instances, backups, secret).
     #[arg(long, env = "WARREN_DATA_DIR", default_value = "/var/lib/warren")]
     data_dir: PathBuf,
-    /// Docker runtime for default instances: auto | runsc | runc.
+    /// Docker runtime for default instances: auto | runsc | runc, or none to run
+    /// without Docker (a macOS host serving only mac instances).
     #[arg(long, env = "WARREN_RUNTIME", default_value = "auto")]
     runtime: String,
     /// Region label reported on instances.
@@ -68,6 +69,20 @@ struct Args {
     /// warrend or in /usr/local/bin when unset.
     #[arg(long, env = "WARREN_GATEWAY_BIN")]
     gateway_bin: Option<PathBuf>,
+    /// Enable mac-type instances (macOS VMs through Lume on an Apple silicon
+    /// host): the name of the stopped Lume VM to clone them from.
+    #[arg(long, env = "WARREN_MAC_BASE_VM", value_name = "VM")]
+    mac_base_vm: Option<String>,
+    /// Lume API server that hosts mac instances; started as `lume serve` when
+    /// it is local and not running.
+    #[arg(long, env = "WARREN_LUME_API", default_value = "http://127.0.0.1:7777")]
+    lume_api: String,
+    /// The lume executable.
+    #[arg(long, env = "WARREN_LUME_BIN", default_value = "lume")]
+    lume_bin: PathBuf,
+    /// Start mac instances with Lume's VNC server on (host-only, random password).
+    #[arg(long, env = "WARREN_MAC_VNC", default_value_t = false)]
+    mac_vnc: bool,
     /// HMAC secret for signed URLs; generated into the data dir when unset.
     #[arg(long, env = "WARREN_SECRET")]
     secret: Option<String>,
@@ -103,6 +118,11 @@ impl Args {
             firecracker_bin: self.firecracker_bin,
             kernel_image: self.kernel,
             gateway_bin: Config::resolve_gateway_bin(self.gateway_bin),
+            mac_base_vm: self.mac_base_vm.filter(|v| !v.trim().is_empty()),
+            lume_api_url: self.lume_api,
+            lume_bin: self.lume_bin,
+            mac_vnc: self.mac_vnc,
+            runtime_names: Vec::new(),
             secret: self.secret.unwrap_or_default(),
             image_tag: self.image_tag,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -130,11 +150,15 @@ async fn main() -> anyhow::Result<()> {
     let clock = Arc::new(RealClock);
 
     let mut runtimes: HashMap<InstanceType, Arc<dyn Runtime>> = HashMap::new();
-    let docker = warren_runtime_docker::DockerRuntime::new(cfg.clone())
-        .await
-        .context("docker runtime")?;
-    docker.ready().await.context("docker runtime not ready")?;
-    runtimes.insert(InstanceType::Default, Arc::new(docker));
+    if cfg.runtime == "none" {
+        tracing::info!("docker runtime disabled (--runtime none); default instances are off");
+    } else {
+        let docker = warren_runtime_docker::DockerRuntime::new(cfg.clone())
+            .await
+            .context("docker runtime")?;
+        docker.ready().await.context("docker runtime not ready")?;
+        runtimes.insert(InstanceType::Default, Arc::new(docker));
+    }
     if cfg.enable_firecracker {
         match warren_runtime_firecracker::FirecrackerRuntime::new(cfg.clone()).await {
             Ok(fc) => match fc.ready().await {
@@ -149,6 +173,42 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => tracing::warn!(err = %e, "firecracker runtime disabled"),
         }
     }
+    let shutdown = CancellationToken::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    if cfg.mac_base_vm.is_some() {
+        match warren_runtime_mac::MacRuntime::new(cfg.clone()) {
+            Ok(mac) => match mac.ready().await {
+                Ok(()) => {
+                    tracing::info!("lume runtime enabled; mac instances available");
+                    tasks.spawn({
+                        let cfg = cfg.clone();
+                        let client = mac.lume().clone();
+                        let s = shutdown.clone();
+                        async move {
+                            warren_runtime_mac::serve::supervise(cfg, client, s).await;
+                            Ok(())
+                        }
+                    });
+                    runtimes.insert(InstanceType::Mac, Arc::new(mac));
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "lume runtime not ready; mac instances disabled")
+                }
+            },
+            Err(e) => tracing::warn!(err = %e, "lume runtime disabled"),
+        }
+    }
+    if runtimes.is_empty() {
+        anyhow::bail!(
+            "no runtime came up: enable Docker (--runtime auto) or configure --mac-base-vm on a Mac"
+        );
+    }
+    cfg.runtime_names = {
+        let mut names: Vec<String> = runtimes.values().map(|r| r.name().to_string()).collect();
+        names.sort();
+        names.dedup();
+        names
+    };
     let runtimes: Runtimes = Arc::new(runtimes);
 
     let templates = warren_templates::Templates::new(store.clone(), runtimes.clone(), cfg.clone());
@@ -188,8 +248,6 @@ async fn main() -> anyhow::Result<()> {
         signer,
     });
 
-    let shutdown = CancellationToken::new();
-    let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn({
         let lc = lifecycle.clone();
         let s = shutdown.clone();

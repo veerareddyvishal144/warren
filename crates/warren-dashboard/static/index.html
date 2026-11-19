@@ -103,13 +103,14 @@
         </div>
         <div class="field">
           <label for="create-disk">Disk GB <span class="muted">(optional override)</span></label>
-          <input id="create-disk" name="disk" type="number" min="2" max="100" step="1" placeholder="shape default">
+          <input id="create-disk" name="disk" type="number" min="2" max="500" step="1" placeholder="shape default">
         </div>
         <div class="field">
           <label for="create-type">Type</label>
           <select id="create-type" name="type">
             <option value="default">default — gVisor container</option>
             <option value="vm">vm — Firecracker microVM</option>
+            <option value="mac">mac — macOS VM (Apple silicon host)</option>
           </select>
         </div>
         <div class="field">

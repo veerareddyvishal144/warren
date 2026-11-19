@@ -45,7 +45,7 @@ pub const CODE_INSTANCE_FAILED: &str = "instance_failed";
 /// Tool error code when the agent inside the instance reports a failed turn.
 pub const CODE_RESPONSE_FAILED: &str = "response_failed";
 
-const INSTRUCTIONS: &str = "Warren gives you persistent Linux computers (instances) reachable over HTTPS. \
+const INSTRUCTIONS: &str = "Warren gives you persistent computers (instances; Linux, or macOS with type mac) reachable over HTTPS. \
 Typical flow: create_instance (returns once the instance is running) -> exec / write_file / read_file / list_files \
 or chat (agent templates only) -> sleep_instance or stop_instance when idle -> delete_instance when done. \
 Instance ids are 10 lowercase alphanumerics (e.g. ab12cd34ef). File paths are relative to the instance home. \
@@ -310,7 +310,7 @@ impl<B: Backend> WarrenServer<B> {
     }
 
     #[tool(
-        description = "Create a persistent Linux instance and wait up to 120 seconds for it to be running, then return the instance object. All arguments are optional: template (default warren-base; warren-agent for chat), type default|vm, cpu/memory/disk, name, auto_sleep, idle_timeout_seconds, env. The workspace's awake-instance limit applies (instance_limit_reached). If the instance is not running after the wait it is still returned with its current status; poll get_instance.",
+        description = "Create a persistent instance (Linux, or macOS with type mac) and wait up to 120 seconds for it to be running, then return the instance object. All arguments are optional: template (default warren-base; warren-agent for chat), type default|vm|mac, cpu/memory/disk, name, auto_sleep, idle_timeout_seconds, env. The workspace's awake-instance limit applies (instance_limit_reached); a mac host that already runs two macOS VMs answers host_capacity_reached. If the instance is not running after the wait it is still returned with its current status; poll get_instance.",
         annotations(
             title = "Create instance",
             read_only_hint = false,

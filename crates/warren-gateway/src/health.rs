@@ -25,7 +25,8 @@ pub struct HealthReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HomeOwnerInfo {
     pub uid: u32,
-    /// Name from `/etc/passwd`, or the numeric uid as a string when unlisted.
+    /// Name from `/etc/passwd` or the system's user database (Open Directory
+    /// on macOS), or the numeric uid as a string when unknown.
     pub name: String,
 }
 

@@ -33,7 +33,8 @@ Only touch files inside your crate (and the scripts/docs you own). Other crates 
 - Every fallible function returns `warren_core::Result<T>` (`warren_core::Error`). Use the constructors (`Error::invalid`, `not_found`, `conflict`, `try_again`, `not_supported`, `instance_limit`, `internal`). Never panic on bad input.
 - Timestamps are unix seconds (ms on the Agent API). Ids come from `warren_core::ids`.
 - Logging: `tracing`. No `println!` in library crates.
-- Tests: unit tests in each crate with in-memory fakes for the traits you consume. Integration tests live in `crates/warren-e2e`.
+- Tests: unit tests in each crate with in-memory fakes for the traits you consume. Integration tests live in `crates/warren-e2e`; the macOS runtime's end-to-end check is `scripts/mac/e2e.sh`, run on a Mac.
+- macOS: every crate must keep compiling for `aarch64-apple-darwin` (the daemon runs natively on Apple silicon hosts for `mac` instances). On a Linux box the check needs a stand-in C compiler because one TLS dependency has a C build step and `cargo check` never links: create executables `cc` and `ar` that create their `-o` output and exit 0 (an `ar` that creates the archive path), then `CC_aarch64_apple_darwin=<cc> CXX_aarch64_apple_darwin=<cc> AR_aarch64_apple_darwin=<ar> RANLIB_aarch64_apple_darwin=<ar> cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings` after `rustup target add aarch64-apple-darwin`. CI runs the real thing on a macOS runner. Linux-only code goes behind `#[cfg(target_os = "linux")]` with a stub for other targets (see `crates/warren-gateway/src/init_stub.rs`).
 - Style: `cargo fmt`, `cargo clippy -- -D warnings` clean. Small modules, doc comments on public items, no unsafe without a comment explaining why.
 
 ## Host facts that matter

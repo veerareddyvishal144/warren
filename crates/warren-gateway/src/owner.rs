@@ -11,8 +11,9 @@
 //! and the agent works as root inside its own machine.
 //!
 //! At startup, when the process is root, the home directory is stat'ed and
-//! its uid/gid recorded; the user name is looked up in `/etc/passwd` and
-//! falls back to the numeric uid. When the gateway is not root the owner is
+//! its uid/gid recorded; the user name is looked up in `/etc/passwd`, then
+//! through `getpwuid` (Open Directory on macOS), and falls back to the
+//! numeric uid. When the gateway is not root the owner is
 //! the current user and every operation here is a no-op.
 
 use std::{
@@ -26,11 +27,12 @@ use crate::exec::{Identity, effective_gid, effective_uid, lookup_uid, parse_pass
 /// The user who owns the persistent home.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HomeOwner {
-    /// User name from `/etc/passwd`, or the numeric uid when unlisted.
+    /// User name from the user database (`/etc/passwd`, else `getpwuid`),
+    /// or the numeric uid when unknown.
     pub name: String,
     pub uid: u32,
     pub gid: u32,
-    /// `name` is listed in `/etc/passwd`, so `runuser`/`su` can resolve it.
+    /// `name` is known to the user database, so `runuser`/`su` can resolve it.
     pub named: bool,
     /// Effective uid of the gateway process.
     pub process_uid: u32,
@@ -85,7 +87,7 @@ impl HomeOwner {
     }
 
     /// True when `user` names this owner and a switch applies (the numeric
-    /// uid counts when the owner has no `/etc/passwd` entry).
+    /// uid counts when the owner is unknown to the user database).
     pub fn is_named(&self, user: &str) -> bool {
         self.switches() && self.name == user.trim()
     }
@@ -181,8 +183,8 @@ pub fn name_for_uid(passwd: &str, uid: u32) -> Option<String> {
         .map(|e| e.name)
 }
 
-/// `(name, true)` from `/etc/passwd`, or `(uid as a string, false)` when the
-/// uid is not listed.
+/// `(name, true)` from the user database (`/etc/passwd`, else `getpwuid`),
+/// or `(uid as a string, false)` when the uid is unknown.
 pub fn owner_name(uid: u32) -> (String, bool) {
     match lookup_uid(uid) {
         Some(e) => (e.name, true),

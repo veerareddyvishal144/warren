@@ -29,7 +29,7 @@ ID=ab12cd34ef
 }
 ```
 
-Timestamps are unix seconds; zero-valued ones are omitted. `url` is derived from the base domain. `runtime` is `docker` or `firecracker`. `parent_id` is set on forks. `status_reason` explains `failed`.
+Timestamps are unix seconds; zero-valued ones are omitted. `url` is derived from the base domain. `runtime` is `docker`, `firecracker` or `lume` (type `mac`). `parent_id` is set on forks. `status_reason` explains `failed`.
 
 ## Lifecycle
 
@@ -78,7 +78,7 @@ curl -s -X POST $WARREN_API/instances -H "$AUTH" -H "$JSON" -d '{
 }'
 ```
 
-All fields are optional. Validation, in order: the template must resolve (`name` or `name@rev`); the type must be allowed by the template and have a runtime (`performance` and `vm` without Firecracker answer `400 not_supported`); the shape is normalised (see below); `idle_timeout_seconds` must be within `[300, 86400]` (`[5, 86400]` in dev mode); env keys match `[A-Z_][A-Z0-9_]*`, at most 64 entries, values at most 4 KiB; at most 32 metadata entries; names at most 100 characters. Then the awake quota, when the daemon has one: `409 instance_limit_reached` if the workspace is already at `--max-awake-instances`. The response is `201` with `status: provisioning`.
+All fields are optional. Validation, in order: the template must resolve (`name` or `name@rev`); the type must be allowed by the template and have a runtime (`performance`, `vm` without Firecracker and `mac` without Lume answer `400 not_supported`); the shape is normalised (see below); `idle_timeout_seconds` must be within `[300, 86400]` (`[5, 86400]` in dev mode); env keys match `[A-Z_][A-Z0-9_]*`, at most 64 entries, values at most 4 KiB; at most 32 metadata entries; names at most 100 characters. Then the awake quota, when the daemon has one: `409 instance_limit_reached` if the workspace is already at `--max-awake-instances`. For type `mac` the host's capacity is checked too: a Mac runs at most two macOS VMs, and a full host answers `409 host_capacity_reached` with `details: { "max_running": 2, "running": 2 }`. The response is `201` with `status: provisioning`.
 
 Template default env (for example `WARREN_AGENT_DRIVER=openai` on `warren-agent`) is merged under the instance env; the platform variables (`WARREN_INSTANCE_ID`, `WARREN_HOME`, ...) always win.
 
@@ -115,11 +115,11 @@ A stopped instance keeps its disk and never wakes on request: its URLs answer `4
 curl -s -X POST $WARREN_API/instances/$ID/sleep -H "$AUTH"     # {"id":"ab12cd34ef","status":"sleeping"}
 ```
 
-- **Sleep stops the container and keeps the disk.** Processes and memory are gone; files under the mount path are intact. The instance reports `sleeping` and holds no CPU or memory.
-- **Anything that reaches the instance wakes it**: a request to any of its URLs (default port or `<id>-<port>`), an exec through the Sandbox API, a cron firing. The edge holds the request while the lifecycle starts the container and waits for the gateway's health endpoint, then forwards it. Expect a few seconds; harness clients should allow a generous timeout on the first request. A wake enforces the awake quota like a start.
+- **Sleep stops the container and keeps the disk.** Processes and memory are gone; files under the mount path are intact. The instance reports `sleeping` and holds no CPU or memory. The exception is type `mac`: sleep suspends the VM, its memory is saved and restored on wake, so processes survive ([macos.md](macos.md)).
+- **Anything that reaches the instance wakes it**: a request to any of its URLs (default port or `<id>-<port>`), an exec through the Sandbox API, a cron firing. The edge holds the request while the lifecycle starts the container and waits for the gateway's health endpoint, then forwards it. Expect a few seconds; harness clients should allow a generous timeout on the first request. A wake enforces the awake quota like a start (and, for `mac`, the host's two-VM capacity).
 - **Auto-sleep** (`auto_sleep: true`) sleeps the instance once `idle_timeout_seconds` pass without activity. Activity is any proxied request or response through the edge and any exec; `last_activity_at` on the object shows the last one. The minimum timeout is 300 seconds (5 in dev mode), the maximum 86,400, the default 900. Default `auto_sleep` is `false`: an instance you create runs until you stop, sleep or delete it.
 - **Manual sleep** works regardless of `auto_sleep`.
-- **Memory checkpoints** (gVisor checkpoint/restore, Firecracker snapshots) are the roadmap item that will make wake resume processes; the API will not change.
+- **Memory checkpoints** (gVisor checkpoint/restore, Firecracker snapshots) are the roadmap item that will make wake resume processes for `default` and `vm`; `mac` already has it through Lume suspend. The API will not change.
 
 Design a long-running service inside an instance accordingly: start it from something the first request can trigger, or keep the instance awake with `auto_sleep: false`.
 
@@ -146,7 +146,7 @@ Shapes are four CPU/RAM pairs; disk is any whole number of GB in the shape's ran
 | 4 vCPU / 16 GB | 12 GB | 2 - 40 GB | 2 - 100 GB |
 | 4 vCPU / 32 GB | 24 GB | 2 - 80 GB | 2 - 100 GB |
 
-CPU and memory limits are enforced per container (or per microVM) from the shape. Disk is a sizing number: the bind-mounted home has no filesystem quota in this build, so watch `disk_used_bytes`.
+Type `mac` does not use the per-shape disk ranges: the disk starts at the base image's size, only grows, and may be set up to 500 GB (`warren-macos` defaults to 2 vCPU / 4 GB / 50 GB). CPU and memory limits are enforced per container (or per microVM) from the shape. Disk is a sizing number: the bind-mounted home has no filesystem quota in this build, so watch `disk_used_bytes`.
 
 Normalisation rules (`warren_core::shapes::normalize`): a missing `resources` gives the template's default shape; a CPU count above 4 is clamped to 4 while keeping the requested memory (so `{"cpu": 16, "memory": 32}` becomes 4/32 with 24 GB of disk); an unsupported pair such as 2/8 is `400 invalid_request`; changing the pair without naming a disk picks that pair's default disk; a disk outside the range is `400`.
 
@@ -168,7 +168,7 @@ curl -s -X POST $WARREN_API/instances/$ID/update -H "$AUTH" -H "$JSON" -d '{"tem
 curl -s -X POST $WARREN_API/instances/$ID/update -H "$AUTH"      # same template, latest revision
 ```
 
-The image is replaced and the data under `mount_path` kept. The template's `default_port`, `mount_path` and `agent` flag come from the new template.
+The image is replaced and the data under `mount_path` kept. The template's `default_port`, `mount_path` and `agent` flag come from the new template. Not available for type `mac` in this phase (`400 not_supported`): the VM disk is the home, so there is no image to swap underneath it.
 
 ## Fork
 
@@ -178,7 +178,7 @@ curl -s -X POST $WARREN_API/instances/$ID/fork -H "$AUTH" -H "$JSON" -d '{
 }'
 ```
 
-`201` with a new instance: a copy of the disk, the same template, revision, type and env, a new id and URL, `parent_id` pointing at the source. The source must be stopped or sleeping; a running source is slept first and woken after the copy, so expect a short interruption. The fork is a new awake instance, so the awake quota applies.
+`201` with a new instance: a copy of the disk, the same template, revision, type and env, a new id and URL, `parent_id` pointing at the source. The source must be stopped or sleeping; a running source is slept first and woken after the copy, so expect a short interruption. The fork is a new awake instance, so the awake quota applies (and, for `mac`, the host's two-VM capacity).
 
 ## Backups and restore
 
@@ -220,8 +220,9 @@ The runtime object and the disk are destroyed, the backups removed, and the inst
 | Code | HTTP | When |
 |---|---|---|
 | `invalid_request` | 400 | Bad shape, bad env key, idle timeout out of range, unknown JSON field |
-| `not_supported` | 400 | `type: "performance"`, `type: "vm"` without the Firecracker runtime, crons on a non-agent template |
+| `not_supported` | 400 | `type: "performance"`, `type: "vm"` without the Firecracker runtime, `type: "mac"` without the Lume runtime, a template update (`recreate`) of a `mac` instance, crons on a non-agent template |
 | `not_found` | 404 | Unknown id, or an instance of another workspace |
 | `conflict` | 409 | Action not valid in the current state (exec or URL on a stopped instance, fork of a provisioning one) |
 | `instance_limit_reached` | 409 | Awake quota hit at create, start, wake or fork; `details` has `limit` and `awake` |
+| `host_capacity_reached` | 409 | Type `mac` only: the host already runs two macOS VMs at create, start, wake or fork; `details` has `max_running` and `running`. Sleep or stop one to free a slot |
 | `try_again` | 503 | Transient: the instance is mid-transition; retry after a moment |

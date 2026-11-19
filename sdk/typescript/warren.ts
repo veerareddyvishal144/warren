@@ -45,7 +45,7 @@ export type InstanceStatus =
   | "deleting"
   | "deleted";
 
-export type InstanceType = "default" | "vm" | "performance";
+export type InstanceType = "default" | "vm" | "mac" | "performance";
 export type NetworkMode = "allow-all" | "deny-all";
 export type TemplateScope = "system" | "workspace";
 

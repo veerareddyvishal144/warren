@@ -1,0 +1,24 @@
+# Warren guest isolation (pf anchor "dev.warren").
+#
+# Every Warren VM on a Mac host shares one NAT network (@SUBNET@). This VM may
+# talk to the host gateway (@GATEWAY@: NAT, DNS, DHCP and warrend reaching the
+# gateway port) but to nothing else on that subnet, so one tenant's VM cannot
+# reach another tenant's gateway or SSH port. Everything else (loopback, the
+# internet through the NAT) is untouched. Rendered by install.sh into
+# /etc/pf.anchors/dev.warren; rules are evaluated in order and `quick` stops
+# evaluation at the first match.
+
+host_gateway = "@GATEWAY@"
+vm_subnet = "@SUBNET@"
+
+# Loopback first: the VM's own address talking to itself goes over lo0 and
+# must never be caught by the subnet block below.
+pass quick on lo0 all
+
+# The host is always reachable in both directions.
+pass in quick from $host_gateway to any
+pass out quick from any to $host_gateway
+
+# Every other address on the NAT subnet is another VM: drop both directions.
+block in quick from $vm_subnet to any
+block out quick from any to $vm_subnet

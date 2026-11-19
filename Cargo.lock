@@ -3098,6 +3098,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "warren-gateway-client"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "warren-core",
+]
+
+[[package]]
 name = "warren-lifecycle"
 version = "0.1.0"
 dependencies = [
@@ -3174,6 +3184,26 @@ dependencies = [
  "tracing",
  "walkdir",
  "warren-core",
+ "warren-gateway-client",
+]
+
+[[package]]
+name = "warren-runtime-mac"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "warren-core",
+ "warren-gateway-client",
 ]
 
 [[package]]
@@ -3240,6 +3270,7 @@ dependencies = [
  "warren-lifecycle",
  "warren-runtime-docker",
  "warren-runtime-firecracker",
+ "warren-runtime-mac",
  "warren-store",
  "warren-templates",
 ]

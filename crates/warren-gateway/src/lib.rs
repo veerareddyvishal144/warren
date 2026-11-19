@@ -1,7 +1,7 @@
 //! warren-gateway runs inside every Warren instance. It serves the Agent API
 //! (`/v1/responses`, sessions, models), the files API confined to the
-//! persistent home directory, the token-protected `/v1/exec` endpoint and the
-//! health endpoints on port 3737. It also supervises the browser terminal
+//! persistent home directory, the token-protected `/v1/exec` and `/v1/stats`
+//! endpoints and the health endpoints on port 3737. It also supervises the browser terminal
 //! (`ttyd`) and acts as PID 1 inside Firecracker microVMs. When it runs as
 //! root, files it creates in the persistent home belong to the home's owner
 //! and agent commands run as that user (see `owner.rs`). In images that do
@@ -27,6 +27,7 @@ pub mod owner;
 pub mod responses;
 pub mod server;
 pub mod sessions;
+pub mod stats;
 pub mod terminal;
 pub mod wrap;
 

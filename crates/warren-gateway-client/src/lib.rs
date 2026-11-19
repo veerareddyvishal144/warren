@@ -1,5 +1,8 @@
-//! Talking to the gateway inside a guest: waiting for its port, `POST /v1/exec`
-//! with the instance token, and `POST /v1/shutdown`.
+//! Talking to the `warren-gateway` inside a guest from the host: waiting for
+//! its port, `GET /v1/health`, `POST /v1/exec` and `GET /v1/stats` with the
+//! instance token, and `POST /v1/shutdown`. Shared by the runtimes that reach
+//! their guests over the network (Firecracker microVMs, macOS VMs); the Docker
+//! runtime uses Docker's own exec instead.
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -8,7 +11,7 @@ use std::{
 
 use warren_core::{
     DEFAULT_EXEC_TIMEOUT_SEC, Error, ExecRequest, ExecResult, GATEWAY_PORT, HEADER_INSTANCE_TOKEN,
-    Result, json::ErrorEnvelope,
+    Result, Stats, json::ErrorEnvelope,
 };
 
 /// Poll a TCP connect to `ip:port` until it succeeds, `timeout` passes, or
@@ -44,7 +47,92 @@ pub async fn wait_for_port(
 }
 
 fn base_url(ip: Ipv4Addr) -> String {
-    format!("http://{ip}:{GATEWAY_PORT}")
+    base_url_at(ip, GATEWAY_PORT)
+}
+
+fn base_url_at(ip: Ipv4Addr, port: u16) -> String {
+    format!("http://{ip}:{port}")
+}
+
+/// `GET /v1/health` as the gateway reports it. `Ok(false)` when it answers
+/// but is not healthy, an error when it cannot be reached.
+pub async fn healthy(http: &reqwest::Client, ip: Ipv4Addr) -> Result<bool> {
+    healthy_at(http, ip, GATEWAY_PORT).await
+}
+
+/// [`healthy`] against a gateway on another port.
+pub async fn healthy_at(http: &reqwest::Client, ip: Ipv4Addr, port: u16) -> Result<bool> {
+    let resp = http
+        .get(format!("{}/v1/health", base_url_at(ip, port)))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| map_transport(ip, e))?;
+    let status = resp.status();
+    let body = resp.bytes().await.map_err(|e| map_transport(ip, e))?;
+    if !status.is_success() {
+        return Err(error_from_body(status.as_u16(), &body));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Error::bad_gateway(format!("gateway returned unreadable health: {e}")))?;
+    Ok(v.get("healthy").and_then(|h| h.as_bool()).unwrap_or(false))
+}
+
+/// Poll `GET /v1/health` until the gateway reports healthy, `timeout` passes,
+/// or `still_alive` says the guest is gone.
+pub async fn wait_for_health(
+    http: &reqwest::Client,
+    ip: Ipv4Addr,
+    port: u16,
+    timeout: Duration,
+    mut still_alive: impl FnMut() -> bool,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if healthy_at(http, ip, port).await.unwrap_or(false) {
+            return Ok(());
+        }
+        if !still_alive() {
+            return Err(Error::internal(format!(
+                "the guest exited before the gateway at {ip} became healthy"
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::timeout(format!(
+                "gateway at {ip} did not become healthy within {}s",
+                timeout.as_secs()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// `GET /v1/stats`: the guest's own view of CPU, memory and disk use.
+pub async fn stats(http: &reqwest::Client, ip: Ipv4Addr, token: &str) -> Result<Stats> {
+    stats_at(http, ip, GATEWAY_PORT, token).await
+}
+
+/// [`stats`] against a gateway on another port.
+pub async fn stats_at(
+    http: &reqwest::Client,
+    ip: Ipv4Addr,
+    port: u16,
+    token: &str,
+) -> Result<Stats> {
+    let resp = http
+        .get(format!("{}/v1/stats", base_url_at(ip, port)))
+        .header(HEADER_INSTANCE_TOKEN, token)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| map_transport(ip, e))?;
+    let status = resp.status();
+    let body = resp.bytes().await.map_err(|e| map_transport(ip, e))?;
+    if status.is_success() {
+        return serde_json::from_slice::<Stats>(&body)
+            .map_err(|e| Error::bad_gateway(format!("gateway returned unreadable stats: {e}")));
+    }
+    Err(error_from_body(status.as_u16(), &body))
 }
 
 fn map_transport(ip: Ipv4Addr, e: reqwest::Error) -> Error {
@@ -64,13 +152,24 @@ pub async fn exec(
     token: &str,
     req: &ExecRequest,
 ) -> Result<ExecResult> {
+    exec_at(http, ip, GATEWAY_PORT, token, req).await
+}
+
+/// [`exec`] against a gateway on another port.
+pub async fn exec_at(
+    http: &reqwest::Client,
+    ip: Ipv4Addr,
+    port: u16,
+    token: &str,
+    req: &ExecRequest,
+) -> Result<ExecResult> {
     let secs = if req.timeout_seconds == 0 {
         DEFAULT_EXEC_TIMEOUT_SEC
     } else {
         req.timeout_seconds
     };
     let resp = http
-        .post(format!("{}/v1/exec", base_url(ip)))
+        .post(format!("{}/v1/exec", base_url_at(ip, port)))
         .header(HEADER_INSTANCE_TOKEN, token)
         .json(req)
         .timeout(Duration::from_secs(u64::from(secs) + 30))

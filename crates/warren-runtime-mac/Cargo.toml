@@ -1,0 +1,23 @@
+[package]
+name = "warren-runtime-mac"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+warren-core.workspace = true
+warren-gateway-client.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+hex.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+axum.workspace = true

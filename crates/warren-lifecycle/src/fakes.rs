@@ -432,6 +432,8 @@ pub struct FakeRuntime {
     pub fail_ensure_image: AtomicBool,
     pub fail_create: AtomicBool,
     pub fail_start: AtomicBool,
+    /// Make `start` answer `host_capacity_reached` (the host is full).
+    pub refuse_start_capacity: AtomicBool,
     pub fail_stop: AtomicBool,
     pub fail_destroy: AtomicBool,
     pub fail_recreate: AtomicBool,
@@ -515,6 +517,9 @@ impl Runtime for FakeRuntime {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
         Self::failing(&self.fail_start, "start")?;
+        if self.refuse_start_capacity.load(Ordering::SeqCst) {
+            return Err(Error::host_capacity(2, 2));
+        }
         self.starts.fetch_add(1, Ordering::SeqCst);
         self.set_running(&inst.id, true);
         Ok(RunInfo {

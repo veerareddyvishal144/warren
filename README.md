@@ -19,7 +19,7 @@ Warren is a single Rust binary (`warrend`) that runs the whole platform on one L
 | Fork, backup, restore, resize | Copy an instance with its disk, take backups without stopping, restore, grow the disk or change the shape. |
 | Crons | Scheduled prompts for agent instances; each firing wakes the instance and runs one turn. |
 | Capacity quota | An optional cap on how many instances a workspace may keep awake at once (`--max-awake-instances`); sleeping and stopped instances never count. |
-| Isolation | gVisor (`runsc`) for the default type; Firecracker microVMs for the experimental `vm` type. |
+| Isolation | gVisor (`runsc`) for the default type; Firecracker microVMs for the experimental `vm` type; macOS virtual machines through Lume on Apple silicon hosts for the `mac` type ([docs/macos.md](docs/macos.md)). |
 | Clients | `warren` CLI, an MCP server for Claude Code and Cursor, a Rust SDK, one-file Python and TypeScript clients, a dashboard. |
 
 ## Quickstart (90 seconds)
@@ -86,6 +86,7 @@ Chrome, Firefox and hosts running systemd-resolved resolve `*.localhost` to the 
 |     v                                                                                            |
 |  Runtime trait  --> warren-runtime-docker (gVisor runsc, runc fallback)                          |
 |                 --> warren-runtime-firecracker (microVMs, experimental)                          |
+|                 --> warren-runtime-mac (macOS VMs through Lume, Apple silicon hosts)             |
 |  warren-store   SQLite at <data>/warren.db                                                       |
 +-----------------------------------------------|--------------------------------------------------+
                                                 | docker / firecracker
@@ -121,15 +122,15 @@ The quota counts instances that are `provisioning`, `running`, `starting`, `rest
 
 ## Instance types
 
-| | `default` | `vm` (experimental) | `performance` |
-|---|---|---|---|
-| Isolation | Container under gVisor (`runsc`); `runc` fallback for development | Firecracker microVM with its own kernel | Reserved for hosts with pinned cores |
-| Host needs | Docker | Root, `/dev/kvm`, a Firecracker binary and a kernel | Not available in this build: `not_supported` |
-| Disk | 2 GB up to the shape's maximum (12 / 20 / 40 / 80 GB) | 2 GB up to 100 GB | - |
-| Exec | `docker exec` | the in-instance gateway, authenticated with a per-instance token | - |
-| Sleep and wake | Stop the container, keep the disk, boot on request | Same | - |
+| | `default` | `vm` (experimental) | `mac` | `performance` |
+|---|---|---|---|---|
+| Isolation | Container under gVisor (`runsc`); `runc` fallback for development | Firecracker microVM with its own kernel | macOS virtual machine (Virtualization.framework through Lume); at most two per host | Reserved for hosts with pinned cores |
+| Host needs | Docker | Root, `/dev/kvm`, a Firecracker binary and a kernel | An Apple silicon Mac with Lume 0.7.2+ and a base VM (`--mac-base-vm`) | Not available in this build: `not_supported` |
+| Disk | 2 GB up to the shape's maximum (12 / 20 / 40 / 80 GB) | 2 GB up to 100 GB | The base image's size up to 500 GB, grow only | - |
+| Exec | `docker exec` | the in-instance gateway, authenticated with a per-instance token | Same as `vm` | - |
+| Sleep and wake | Stop the container, keep the disk, boot on request | Same | Suspend the VM; memory and processes survive | - |
 
-Shapes are the four CPU/RAM pairs above (`2/4`, `4/8`, `4/16`, `4/32`); a requested CPU count above 4 is clamped to 4 while keeping the requested memory. See [docs/instances.md](docs/instances.md) and [docs/vm-instances.md](docs/vm-instances.md).
+Shapes are the four CPU/RAM pairs above (`2/4`, `4/8`, `4/16`, `4/32`); a requested CPU count above 4 is clamped to 4 while keeping the requested memory. See [docs/instances.md](docs/instances.md), [docs/vm-instances.md](docs/vm-instances.md) and [docs/macos.md](docs/macos.md).
 
 ## Clients
 
@@ -146,7 +147,8 @@ Shapes are the four CPU/RAM pairs above (`2/4`, `4/8`, `4/16`, `4/32`); a reques
 
 ## Roadmap
 
-- **Memory checkpoints**: gVisor checkpoint/restore and Firecracker snapshots so sleep keeps processes and memory, not only files. The API does not change.
+- **Memory checkpoints**: gVisor checkpoint/restore and Firecracker snapshots so sleep keeps processes and memory, not only files (`mac` instances already get this from Lume suspend). The API does not change.
+- **macOS sandboxes, next phases**: screen access through the edge (noVNC) and Linux guests on Mac hosts; the `mac` type itself and its limits are in [docs/macos.md](docs/macos.md).
 - **Multi-node scheduler**: place instances across hosts; the `region` field is already on every instance.
 - **Allowlist egress**: per-instance outbound rules beyond today's `allow-all` and `deny-all`. 0.1.0 already blocks cloud metadata (`169.254.0.0/16`) and, unless `--allow-private-egress` is set, private ranges host-wide; the allowlist adds per-instance destinations.
 - **Cloudflare edge**: terminate TLS and authenticate at the edge, with the daemon as origin.

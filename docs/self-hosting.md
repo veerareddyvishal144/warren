@@ -87,7 +87,7 @@ WARREN_LOG=info                         # tracing filter, e.g. info,warren_edge=
 | `WARREN_PUBLIC_SCHEME` | `--public-scheme` | `http` | Scheme in URLs the API returns and signs |
 | `WARREN_PUBLIC_PORT` | `--public-port` | `7337` | Port in URLs; 443 or 80 are omitted; 0 omits always |
 | `WARREN_DATA_DIR` | `--data-dir` | `/var/lib/warren` | Everything persistent |
-| `WARREN_RUNTIME` | `--runtime` | `auto` | Docker OCI runtime for `default` instances |
+| `WARREN_RUNTIME` | `--runtime` | `auto` | Docker OCI runtime for `default` instances (`auto`, `runsc`, `runc`), or `none` to run without Docker (a Mac serving only `mac` instances) |
 | `WARREN_REGION` | `--region` | `local` | Reported on instances; the multi-node scheduler will use it |
 | `WARREN_DEV` | `--dev` | `false` | 5 s minimum idle timeout and `host.docker.internal` inside instances; never in production |
 | `WARREN_MAX_AWAKE_INSTANCES` | `--max-awake-instances` | unset | Cap on awake instances per workspace; unset means unlimited ([quotas.md](quotas.md)) |
@@ -95,7 +95,8 @@ WARREN_LOG=info                         # tracing filter, e.g. info,warren_edge=
 | `WARREN_SECRET` | `--secret` | generated | Rotating it invalidates every signed URL and cookie |
 | `WARREN_IMAGE_TAG` | `--image-tag` | `dev` | Tag of the built-in images |
 | `WARREN_ENABLE_FIRECRACKER`, `WARREN_FIRECRACKER_BIN`, `WARREN_KERNEL_IMAGE` | `--firecracker`, `--firecracker-bin`, `--kernel` | off | [vm-instances.md](vm-instances.md) |
-| `WARREN_GATEWAY_BIN` | `--gateway-bin` | next to `warrend`, else `/usr/local/bin/warren-gateway` | Static gateway injected into registered images |
+| `WARREN_GATEWAY_BIN` | `--gateway-bin` | next to `warrend`, else `/usr/local/bin/warren-gateway` | Static gateway injected into registered images; the native build placed in `mac` VMs |
+| `WARREN_MAC_BASE_VM`, `WARREN_LUME_API`, `WARREN_LUME_BIN`, `WARREN_MAC_VNC` | `--mac-base-vm`, `--lume-api`, `--lume-bin`, `--mac-vnc` | off, `http://127.0.0.1:7777`, `lume`, off | `mac` instances on an Apple silicon host: [macos.md](macos.md) |
 | `WARREN_SIGNUP_ENABLED` | `--signup-enabled` | `true` | `false` makes `POST /v1/signup` answer 404 |
 | `WARREN_ALLOW_PRIVATE_EGRESS` | `--allow-private-egress` | `false` | Lets instances reach RFC 1918 ranges and the host; 169.254.0.0/16 stays blocked |
 | `WARREN_LOG` | `--log` | `info` | tracing `EnvFilter` syntax |

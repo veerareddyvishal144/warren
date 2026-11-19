@@ -14,6 +14,8 @@ warren-core = { path = "crates/warren-core" }
 warren-store = { path = "crates/warren-store" }
 warren-runtime-docker = { path = "crates/warren-runtime-docker" }
 warren-runtime-firecracker = { path = "crates/warren-runtime-firecracker" }
+warren-runtime-mac = { path = "crates/warren-runtime-mac" }
+warren-gateway-client = { path = "crates/warren-gateway-client" }
 warren-templates = { path = "crates/warren-templates" }
 warren-lifecycle = { path = "crates/warren-lifecycle" }
 warren-edge = { path = "crates/warren-edge" }

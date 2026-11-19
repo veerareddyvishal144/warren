@@ -4,6 +4,12 @@ All notable changes to Warren are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Added
+
+- The `mac` instance type: a macOS virtual machine per instance on an Apple silicon host, through Lume's API server. New crate `warren-runtime-mac` (clone of a base VM per instance, headless start with a read-only shared folder carrying the gateway and its environment, sleep as suspend with memory kept, host capacity of two macOS guests reported as `409 host_capacity_reached`, copy-on-write backups), new crate `warren-gateway-client` shared with the Firecracker runtime, daemon flags `--runtime none`, `--mac-base-vm`, `--lume-api`, `--lume-bin`, `--mac-vnc`, the built-in template `warren-macos`, `GET /v1/health` reporting `lume`, dashboard/CLI/MCP/SDK support for type `mac`, and the Mac-side scripts `scripts/mac/{build-base.sh,e2e.sh,guest/}`. `docs/macos.md` is the operator guide.
+- `warren-gateway`: `GET /v1/stats` (guest-side CPU, memory and disk) and user names from the system user database (Open Directory on macOS, NSS on Linux) when `/etc/passwd` lacks the entry.
+- `Runtime::sleep`: runtimes may keep memory across sleep; the lifecycle calls it instead of `stop`. A `host_capacity_reached` refusal on start puts the instance back to `stopped`/`sleeping` instead of `failed`.
+
 ### Changed
 
 - `warren-gateway` now builds on non-Linux hosts (macOS included): the PID 1 code in `init.rs` is compiled only on Linux and other targets get a stub, so `--init` and `POST /v1/shutdown` report `not_supported` there. Groundwork for macOS sandboxes.

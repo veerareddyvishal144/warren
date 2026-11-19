@@ -7,6 +7,9 @@ pub const CODE_FORBIDDEN: &str = "forbidden";
 pub const CODE_NOT_FOUND: &str = "not_found";
 pub const CODE_CONFLICT: &str = "conflict";
 pub const CODE_INSTANCE_LIMIT_REACHED: &str = "instance_limit_reached";
+/// The host cannot run another instance of this type right now (Apple limits
+/// a Mac to two running macOS guests); distinct from the workspace quota.
+pub const CODE_HOST_CAPACITY_REACHED: &str = "host_capacity_reached";
 pub const CODE_TRY_AGAIN: &str = "try_again";
 pub const CODE_NOT_SUPPORTED: &str = "not_supported";
 pub const CODE_TIMEOUT: &str = "timeout";
@@ -86,6 +89,16 @@ impl Error {
             ),
         )
         .with_details(serde_json::json!({ "limit": limit, "awake": awake }))
+    }
+    pub fn host_capacity(max_running: u32, running: u32) -> Self {
+        Self::new(
+            CODE_HOST_CAPACITY_REACHED,
+            409,
+            format!(
+                "This host runs at most {max_running} instances of this type at once and {running} are running; stop or sleep one first."
+            ),
+        )
+        .with_details(serde_json::json!({ "max_running": max_running, "running": running }))
     }
     /// Wrap an unexpected failure. The cause is kept in `details` for logs; the
     /// JSON layer strips it before answering clients.

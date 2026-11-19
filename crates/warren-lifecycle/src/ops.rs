@@ -15,7 +15,9 @@ use warren_core::{
     ExecRequest, ExecResult, ForkRequest, Instance, InstanceStatus, InstanceType, Lifecycle,
     LogsOptions, MAX_BACKUP_BYTES_PER_WORKSPACE, MAX_BACKUPS_PER_INSTANCE, MetricPoint,
     NetworkMode, PatchInstanceRequest, Result, Runtime, STOP_GRACE_SECS, ShapeRequest, Template,
-    Workspace, errors::is_requires_restart, ids, shapes,
+    Workspace,
+    errors::{CODE_HOST_CAPACITY_REACHED, is_requires_restart},
+    ids, shapes,
 };
 
 use crate::{
@@ -39,6 +41,16 @@ pub const BACKUP_QUOTA_MESSAGE: &str = "backup storage quota reached";
 
 fn grace() -> Duration {
     Duration::from_secs(STOP_GRACE_SECS)
+}
+
+/// Remove a backup: an archive file for container and microVM instances, a
+/// directory of copy-on-write clones for mac instances.
+async fn remove_backup_path(path: &std::path::Path) -> std::io::Result<()> {
+    match tokio::fs::metadata(path).await {
+        Ok(m) if m.is_dir() => tokio::fs::remove_dir_all(path).await,
+        Ok(_) => tokio::fs::remove_file(path).await,
+        Err(e) => Err(e),
+    }
 }
 
 fn transitional(status: InstanceStatus) -> bool {
@@ -74,8 +86,9 @@ impl Manager {
     /// restore, the fork source); new admissions go through [`Self::boot_admitted`].
     pub(crate) async fn boot(&self, inst: &mut Instance, via: InstanceStatus) -> Result<()> {
         let rt = self.runtime_for(inst)?;
+        let from = inst.status;
         self.transition(inst, via, "").await?;
-        self.start_runtime(rt, inst).await
+        self.start_runtime(rt, inst, from).await
     }
 
     /// Admit the instance to the workspace's awake set and boot it. The quota
@@ -88,15 +101,24 @@ impl Manager {
         via: InstanceStatus,
     ) -> Result<()> {
         let rt = self.runtime_for(inst)?;
+        let from = inst.status;
         {
             let _ws = self.ws_lock(&inst.workspace_id).await;
             self.check_awake_quota(&inst.workspace_id).await?;
             self.transition(inst, via, "").await?;
         }
-        self.start_runtime(rt, inst).await
+        self.start_runtime(rt, inst, from).await
     }
 
-    async fn start_runtime(&self, rt: Arc<dyn Runtime>, inst: &mut Instance) -> Result<()> {
+    /// Start the runtime for an instance already moved into a transitional
+    /// status; `from` is where it was before, which a host-capacity refusal
+    /// returns it to.
+    async fn start_runtime(
+        &self,
+        rt: Arc<dyn Runtime>,
+        inst: &mut Instance,
+        from: InstanceStatus,
+    ) -> Result<()> {
         match rt.start(inst).await {
             Ok(info) => {
                 if !info.ip.is_empty() {
@@ -110,6 +132,23 @@ impl Manager {
                 inst.last_activity_at = now;
                 self.touch_activity(&inst.id, now);
                 self.transition(inst, InstanceStatus::Running, "").await
+            }
+            Err(e) if e.code == CODE_HOST_CAPACITY_REACHED => {
+                // Nothing is wrong with the instance: the host is full. Put the
+                // row back where it was so the next attempt can simply retry.
+                let back = if from == InstanceStatus::Sleeping {
+                    InstanceStatus::Sleeping
+                } else {
+                    InstanceStatus::Stopped
+                };
+                inst.ip.clear();
+                if back == InstanceStatus::Stopped && inst.stopped_at == 0 {
+                    inst.stopped_at = self.now();
+                }
+                if let Err(save) = self.transition(inst, back, &e.message).await {
+                    tracing::error!(instance = %inst.id, error = %save, "could not record the capacity refusal");
+                }
+                Err(e)
             }
             Err(e) => {
                 self.fail(inst, &e, "start").await;
@@ -142,15 +181,17 @@ impl Manager {
         self.transition(inst, InstanceStatus::Stopped, reason).await
     }
 
-    /// Stop the runtime, keep the disk and mark the instance `Sleeping`. The
-    /// status is written before the stop so a request arriving meanwhile queues
-    /// on the lock and wakes the instance instead of reaching a dying runtime.
+    /// Put the runtime to sleep (stopped, or suspended with its memory saved
+    /// where the runtime can), keep the disk and mark the instance `Sleeping`.
+    /// The status is written before the stop so a request arriving meanwhile
+    /// queues on the lock and wakes the instance instead of reaching a dying
+    /// runtime.
     pub(crate) async fn sleep_locked(&self, inst: &mut Instance, reason: &str) -> Result<()> {
         let rt = self.runtime_for(inst)?;
         inst.slept_at = self.now();
         self.transition(inst, InstanceStatus::Sleeping, reason)
             .await?;
-        if let Err(e) = rt.stop(inst, grace()).await
+        if let Err(e) = rt.sleep(inst, grace()).await
             && !e.is_not_found()
         {
             self.fail_force(inst, &e, "sleep").await;
@@ -268,7 +309,8 @@ impl Manager {
         match result {
             Ok(()) => tracing::info!(instance = %inst.id, ip = %inst.ip, "provisioned"),
             Err(e) => {
-                if inst.status != InstanceStatus::Failed {
+                // Already failed, or parked `stopped` by a host-capacity refusal.
+                if !settled(inst.status) {
                     self.fail(&mut inst, &e, "provision").await;
                 }
             }
@@ -567,7 +609,7 @@ impl Manager {
         }
         .await;
         if let Err(e) = result
-            && dst.status != InstanceStatus::Failed
+            && !settled(dst.status)
         {
             self.fail(&mut dst, &e, "fork").await;
         }
@@ -933,7 +975,7 @@ impl Lifecycle for Manager {
         let path = dir.join(format!("{backup_id}.tar.gz"));
         let size = rt.backup_storage(&inst, &path).await?;
         if ws_bytes.saturating_add(size.max(0) as u64) > MAX_BACKUP_BYTES_PER_WORKSPACE {
-            if let Err(e) = tokio::fs::remove_file(&path).await {
+            if let Err(e) = remove_backup_path(&path).await {
                 tracing::warn!(instance = %inst.id, path = %path.display(), error = %e, "could not remove an over-quota backup");
             }
             return Err(Error::conflict(BACKUP_QUOTA_MESSAGE));
@@ -961,7 +1003,7 @@ impl Lifecycle for Manager {
             }
             for b in pruned {
                 let old = self.backup_path(b);
-                match tokio::fs::remove_file(&old).await {
+                match remove_backup_path(&old).await {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => {

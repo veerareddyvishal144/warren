@@ -22,7 +22,7 @@ CORS: only trusted origins are granted. On an instance host the trusted origins 
 - Other ids: 32 hex characters. Workspace ids: `ws_` + 20 lowercase alphanumerics. API keys: `sk_live_` + 40 base62 characters; only the SHA-256 is stored.
 - Timestamps: unix seconds on the Sandbox API; the Agent API uses unix milliseconds.
 - Lists: `{ "data": [...] }`, newest first.
-- Errors: `{ "error": { "code": "...", "message": "...", "details": {...} } }`. Codes: `invalid_request` 400, `not_supported` 400, `invalid_api_key` 401, `forbidden` 403, `not_found` 404, `conflict` 409, `instance_limit_reached` 409, `try_again` 503, `timeout` 504, `internal` 500.
+- Errors: `{ "error": { "code": "...", "message": "...", "details": {...} } }`. Codes: `invalid_request` 400, `not_supported` 400, `invalid_api_key` 401, `forbidden` 403, `not_found` 404, `conflict` 409, `instance_limit_reached` 409, `host_capacity_reached` 409, `try_again` 503, `timeout` 504, `internal` 500.
 - Instance `status`: `provisioning | running | stopping | stopped | starting | restarting | updating | sleeping | waking | failed | deleting | deleted`.
 - Unknown JSON fields are rejected with `invalid_request`.
 
@@ -43,12 +43,12 @@ CORS: only trusted origins are granted. On an instance host the trusted origins 
 }
 ```
 
-`url` is derived from the base domain; `runtime` is `docker` or `firecracker`.
+`url` is derived from the base domain; `runtime` is `docker`, `firecracker` or `lume`. `type` is `default` (gVisor container), `vm` (Firecracker microVM) or `mac` (macOS VM through Lume on an Apple silicon host; see [macos.md](macos.md)).
 
 ## Sandbox API (`/v1`)
 
 ### Health, version, signup
-- `GET /v1/health` -> `{ "healthy": true, "version": "...", "runtimes": ["docker"], "dev_mode": false, "time": 1763000000 }`. No auth.
+- `GET /v1/health` -> `{ "healthy": true, "version": "...", "runtimes": ["docker"], "dev_mode": false, "time": 1763000000 }`. No auth. `runtimes` lists the runtimes that came up at startup: `docker` (type `default`), `firecracker` (type `vm`), `lume` (type `mac`).
 - `GET /v1/version` -> `{ "version": "..." }`. No auth.
 - `POST /v1/signup` body `{ "name"?: string }` -> `201 { "workspace": { "id": "ws_...", "name": "...", "created_at": ... }, "api_key": "sk_live_...", "key_id": "..." }`. No auth. `404 not_found` when the daemon runs with `--signup-enabled false` (`WARREN_SIGNUP_ENABLED`). Limited to 10 signups per hour per client IP, `429 try_again` beyond that; in dev mode loopback clients are exempt.
 
@@ -58,6 +58,9 @@ CORS: only trusted origins are granted. On an instance host the trusted origins 
 
 ### Awake quota
 The daemon may cap the number of instances a workspace keeps awake at once: `--max-awake-instances N` (`WARREN_MAX_AWAKE_INSTANCES`); unset means unlimited. Awake means `provisioning`, `running`, `starting`, `restarting`, `updating`, `stopping` or `waking`; sleeping and stopped instances never count. The cap is enforced on create, start, wake (a request to an instance URL, an exec, a cron firing) and fork, which answer `409 instance_limit_reached` with `details: { "limit": N, "awake": n }` when the workspace is at the limit.
+
+### Host capacity
+A host may also be unable to run another instance of a type regardless of the workspace: a Mac runs at most two macOS guests at once. Then create, start, wake and fork answer `409 host_capacity_reached` with `details: { "max_running": 2, "running": 2 }`. Nothing is wrong with the instance: it stays (or returns to) `stopped`, or `sleeping` for a wake, with the refusal as `status_reason`, and the same request succeeds once another `mac` instance sleeps or stops.
 
 ### Templates
 - `GET /v1/templates` -> system catalog first, then workspace templates by name.
@@ -74,7 +77,7 @@ The daemon may cap the number of instances a workspace keeps awake at once: `--m
 Lifecycle operations below return `{ "id", "status" }`. In the single-node build they complete synchronously, so the status is the resulting state: `stop` answers `stopped`, `start` and `restart` answer `running`, `sleep` answers `sleeping`, `update` answers `running`; clients must still accept the transitional states (`stopping`, `starting`, `restarting`, `updating`) that a multi-node build may return.
 - `POST /v1/instances/{id}/stop` -> `{ "id", "status": "stopping" }`. Stopped keeps the disk and never wakes on request.
 - `POST /v1/instances/{id}/start` -> `{ "id", "status": "starting" }` (from stopped or sleeping). Enforces the awake quota.
-- `POST /v1/instances/{id}/sleep` -> `{ "id", "status": "sleeping" }` now, regardless of auto-sleep. In this build sleep stops the container and keeps the disk; any request to the instance URL wakes it (fresh boot, files intact), and the wake enforces the awake quota. Memory checkpoints are a roadmap item.
+- `POST /v1/instances/{id}/sleep` -> `{ "id", "status": "sleeping" }` now, regardless of auto-sleep. On `default` and `vm` instances sleep stops the container or microVM and keeps the disk; any request to the instance URL wakes it (fresh boot, files intact), and the wake enforces the awake quota and the host capacity. On `mac` instances sleep suspends the VM: its memory is saved next to the disk and the wake resumes it with every process still running. Memory checkpoints for the other types are a roadmap item.
 - `POST /v1/instances/{id}/restart` -> `{ "id", "status": "restarting" }`.
 - `POST /v1/instances/{id}/resize` body `{ "cpu"?, "memory"?, "disk"? }` -> `{ "id", "status", "resources" }`. Disk may only grow. The runtime applies live when it can, otherwise stop/apply/start.
 - `POST /v1/instances/{id}/update` body `{ "template"?: "name" | "name@rev" }` -> `{ "id", "status": "updating", "image_ref", "template_revision" }`. Replaces the image, keeps `mount_path` data.
@@ -105,6 +108,7 @@ Processes the gateway starts for users (`/v1/exec` children, the drivers' shells
 - Files, all paths relative to the persistent home and confined to it (`..` and absolute paths outside home -> `403 forbidden`): `GET /v1/files?path=.` -> `{ "path", "entries": [{ "name", "type": "file"|"dir", "size", "modified_at" }] }`; `GET /v1/files/content?path=` -> raw bytes with a content type guess; `PUT /v1/files/content?path=` raw body -> `{ "path", "size" }` (creates parents); `DELETE /v1/files?path=` -> `{ "path", "deleted": true }`; `POST /v1/files/move` body `{ "from", "to" }`; `GET /v1/files/download?path=` -> `application/gzip` tarball of a directory.
 - `POST /v1/exec` body `ExecRequest` -> `ExecResult`. Used by the daemon for vm-type instances and by the cron scheduler; the docker runtime uses Docker exec instead. The child's environment is the gateway's minus the `WARREN_*` variables (except `WARREN_HOME`), plus `HOME`, `USER`/`LOGNAME` when switching user, and the request's `env`.
 - `POST /v1/shutdown` -> `{ "status": "powering_off" }` in microVM init mode, else `400 not_supported`.
+- `GET /v1/stats` -> `{ "at": unix seconds, "cpu_percent": 0..100, "memory_bytes", "memory_limit_bytes", "disk_bytes" }`: the guest's own view of its CPU, memory and the filesystem holding the home. Linux reads `/proc` and the cgroup limit; macOS reads `vm_stat`, `sysctl` and the 1-minute load (an approximation of CPU). The daemon uses it for `mac` instances, whose VMs it cannot measure from the host. Token required.
 
 Agent drivers (selected by `WARREN_AGENT_DRIVER`):
 - `echo`: deterministic for tests. Replies `echo: <input>`; an input starting with `!` runs the rest as a shell command and replies with its combined output; `!!sleep N` style commands are allowed. Streams the reply in at least two deltas.

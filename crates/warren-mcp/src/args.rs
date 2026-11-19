@@ -68,14 +68,14 @@ impl InstanceIdArgs {
 pub struct CreateInstanceArgs {
     /// Template name, optionally pinned as "name@revision". Default "warren-base" (plain Linux: Node, Python, git, browser terminal, files API, no agent). "warren-agent" adds the built-in chat agent so `chat` works; "warren-opencode" runs OpenCode. Use `list_templates` for the full catalog.
     pub template: Option<String>,
-    /// Isolation type: "default" (gVisor container) or "vm" (Firecracker microVM, compute billed at 2.5x). Default "default".
+    /// Isolation type: "default" (gVisor container), "vm" (Firecracker microVM) or "mac" (macOS virtual machine on an Apple silicon host; at most two run per host, so a full host answers 409 host_capacity_reached; sleep suspends the VM and keeps its memory, so processes survive sleep). Default "default".
     #[serde(rename = "type")]
     pub kind: Option<String>,
     /// vCPUs. Valid cpu/memory pairs are 2/4, 4/8, 4/16 and 4/32 (GB). Omit for the template default (2 vCPU, 4 GB).
     pub cpu: Option<u32>,
     /// Memory in GB; see `cpu` for the valid pairs.
     pub memory: Option<u32>,
-    /// Disk in GB. Whole number; 2..12 GB for the 2/4 shape, up to 20/40/80 GB for the larger shapes and up to 100 GB on type "vm". Omit for the shape default.
+    /// Disk in GB. Whole number; 2..12 GB for the 2/4 shape, up to 20/40/80 GB for the larger shapes, up to 100 GB on type "vm" and up to 500 GB on type "mac" (a mac disk starts at the base image size and only grows). Omit for the shape default.
     pub disk: Option<u32>,
     /// Human-readable name shown in listings.
     pub name: Option<String>,
@@ -99,7 +99,7 @@ impl CreateInstanceArgs {
             None => None,
             Some(s) => Some(InstanceType::parse(s).ok_or_else(|| {
                 Error::invalid(format!(
-                    "unknown instance type {s:?}; use \"default\" or \"vm\""
+                    "unknown instance type {s:?}; use \"default\", \"vm\" or \"mac\""
                 ))
             })?),
         };
@@ -322,7 +322,10 @@ mod tests {
     #[test]
     fn create_args_reject_bad_type_and_env() {
         let args: CreateInstanceArgs = serde_json::from_value(json!({ "type": "huge" })).unwrap();
-        assert!(args.into_request().unwrap_err().message.contains("huge"));
+        let msg = args.into_request().unwrap_err().message;
+        assert!(msg.contains("huge") && msg.contains("\"mac\""), "{msg}");
+        let args: CreateInstanceArgs = serde_json::from_value(json!({ "type": "mac" })).unwrap();
+        assert_eq!(args.into_request().unwrap().kind, Some(InstanceType::Mac));
         let args: CreateInstanceArgs =
             serde_json::from_value(json!({ "env": { "lower": "x" } })).unwrap();
         assert!(args.into_request().unwrap_err().message.contains("lower"));

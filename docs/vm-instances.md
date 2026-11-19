@@ -1,6 +1,6 @@
 # VM instances (experimental)
 
-Type `vm` runs an instance as a Firecracker microVM with its own Linux kernel instead of a gVisor container. The API is identical; what changes is isolation and host requirements. This type is experimental: it needs root on the host, it is tested on one machine, and it is off unless you enable it.
+Type `vm` runs an instance as a Firecracker microVM with its own Linux kernel instead of a gVisor container. The API is identical; what changes is isolation and host requirements. This type is experimental: it needs root on the host, it is tested on one machine, and it is off unless you enable it. The third type, `mac` (a macOS virtual machine through Lume on an Apple silicon host), is documented separately in [macos.md](macos.md).
 
 ## What differs from `default`
 

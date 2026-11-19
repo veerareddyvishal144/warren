@@ -28,7 +28,7 @@ use crate::{
     owner::HomeOwner,
     responses,
     sessions::SessionStore,
-    terminal, wrap,
+    stats, terminal, wrap,
 };
 
 /// After the stop signal (and, in wrap mode, after the wrapped program is
@@ -183,6 +183,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/v1/files/move", post(files::move_handler))
         .route("/v1/files/download", get(files::download_handler))
         .route("/v1/exec", post(exec::exec_handler))
+        .route("/v1/stats", get(stats::stats_handler))
         .route("/v1/shutdown", post(shutdown_handler))
         .fallback(not_found)
         // Bodies are capped explicitly: JSON through `JsonBody`, uploads in `files`.

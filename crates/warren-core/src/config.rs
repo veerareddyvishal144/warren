@@ -13,12 +13,26 @@ pub struct Config {
     /// Port clients use in URLs; 0 omits it.
     pub public_port: u16,
     pub data_dir: PathBuf,
-    /// Docker runtime for default instances: "auto" | "runsc" | "runc".
+    /// Docker runtime for default instances: "auto" | "runsc" | "runc", or
+    /// "none" to run without Docker (a macOS host serving only `mac` instances).
     pub runtime: String,
     pub region: String,
     pub enable_firecracker: bool,
     pub firecracker_bin: PathBuf,
     pub kernel_image: Option<PathBuf>,
+    /// Base URL of the Lume API server (`lume serve`) that hosts `mac` instances.
+    pub lume_api_url: String,
+    /// The `lume` executable, started as `lume serve` when the API is down.
+    pub lume_bin: PathBuf,
+    /// Name of the stopped Lume VM every `mac` instance is cloned from. None
+    /// leaves the `mac` type disabled.
+    pub mac_base_vm: Option<String>,
+    /// Start `mac` instances with Lume's VNC server on (a random password per
+    /// run, reachable from the host only). Off by default.
+    pub mac_vnc: bool,
+    /// Names of the runtimes that came up, as reported by `GET /v1/health`
+    /// ("docker", "firecracker", "lume"). Filled by the daemon after startup.
+    pub runtime_names: Vec<String>,
     /// The static `warren-gateway` binary the runtimes inject into images that do
     /// not ship it (registered workspace templates). None disables injection.
     pub gateway_bin: Option<PathBuf>,
@@ -54,6 +68,11 @@ impl Default for Config {
             enable_firecracker: false,
             firecracker_bin: PathBuf::from("/usr/local/bin/firecracker"),
             kernel_image: None,
+            lume_api_url: "http://127.0.0.1:7777".into(),
+            lume_bin: PathBuf::from("lume"),
+            mac_base_vm: None,
+            mac_vnc: false,
+            runtime_names: Vec::new(),
             gateway_bin: None,
             dev_mode: false,
             signup_enabled: true,
@@ -174,12 +193,18 @@ impl Config {
         HostKind::Root
     }
 
-    /// The built-in template catalog. Image refs use `image_tag`.
+    /// Home directory of the user inside a `mac` instance: the account Lume's
+    /// unattended macOS install creates.
+    pub const MAC_HOME: &'static str = "/Users/lume";
+
+    /// The built-in template catalog. Image refs use `image_tag`. The `mac`
+    /// template exists only when a base VM is configured; its image is that
+    /// VM's name.
     pub fn system_templates(&self) -> Vec<Template> {
         let img = |n: &str| format!("warren/{n}:{}", self.image_tag);
         let all = vec![InstanceType::Default, InstanceType::Vm];
         let home = "/home/agent".to_string();
-        vec![
+        let mut out = vec![
             Template {
                 name: "warren-base".into(),
                 scope: TemplateScope::System,
@@ -221,7 +246,23 @@ impl Config {
                 revision: 1,
                 ..Default::default()
             },
-        ]
+        ];
+        if let Some(base) = &self.mac_base_vm {
+            out.push(Template {
+                name: "warren-macos".into(),
+                scope: TemplateScope::System,
+                image_ref: base.clone(),
+                default_port: GATEWAY_PORT,
+                mount_path: Self::MAC_HOME.to_string(),
+                agent: false,
+                description: "A macOS computer (Apple silicon host): the base VM's apps, a shell over exec and the files API. Two run per host; sleep keeps memory.".into(),
+                types: vec![InstanceType::Mac],
+                default_shape: Shape { cpu: 2, memory: 4, disk: 50 },
+                revision: 1,
+                ..Default::default()
+            });
+        }
+        out
     }
 
     /// Where injected gateways are mounted inside a container or placed in a VM
@@ -251,6 +292,10 @@ impl Config {
 
     pub fn instances_dir(&self) -> PathBuf {
         self.data_dir.join("instances")
+    }
+    /// Per-instance state of `mac` instances (the shared folder each VM mounts).
+    pub fn mac_dir(&self) -> PathBuf {
+        self.data_dir.join("mac")
     }
     pub fn backups_dir(&self) -> PathBuf {
         self.data_dir.join("backups")

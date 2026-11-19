@@ -448,6 +448,7 @@
       if (t && Array.isArray(t.types) && t.types.length && !t.types.includes(o.value)) ok = false;
       if (runtimes && o.value === 'vm' && !runtimes.includes('firecracker')) ok = false;
       if (runtimes && o.value === 'default' && !runtimes.includes('docker')) ok = false;
+      if (runtimes && o.value === 'mac' && !runtimes.includes('lume')) ok = false;
       o.disabled = !ok;
       o.textContent = o.textContent.replace(/ — unavailable$/, '') + (ok ? '' : ' — unavailable');
     }
