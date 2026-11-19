@@ -137,6 +137,12 @@ fi
 log "disabling sleep and automatic software updates"
 pmset -a sleep 0 displaysleep 0 disksleep 0 2>&1 | sed 's/^/  pmset: /' >&2 || log "warning: pmset failed (continuing)"
 softwareupdate --schedule off 2>&1 | sed 's/^/  softwareupdate: /' >&2 || log "warning: softwareupdate --schedule off failed (continuing)"
+# Recent macOS reports "turned on" from --schedule off; the preference keys are what the
+# update daemon actually reads, so set them as well.
+for key in AutomaticCheckEnabled AutomaticDownload AutomaticallyInstallMacOSUpdates ConfigDataInstall CriticalUpdateInstall; do
+    defaults write /Library/Preferences/com.apple.SoftwareUpdate "$key" -bool false 2>/dev/null || true
+done
+defaults write /Library/Preferences/com.apple.commerce AutoUpdate -bool false 2>/dev/null || true
 
 # --- launchd ----------------------------------------------------------------------
 bootstrap() {
