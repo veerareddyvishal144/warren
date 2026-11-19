@@ -13,11 +13,18 @@ vm_subnet = "@SUBNET@"
 
 # Loopback first: the VM's own address talking to itself goes over lo0 and
 # must never be caught by the subnet block below.
-pass quick on lo0 all
+#
+# `flags any no state` on every pass rule: pf's default for TCP is to match
+# only connection-opening packets and track the rest as state, so a
+# connection that already existed when pf was enabled (the installer's own
+# SSH session, warrend's open connections to the gateway) would stop
+# matching the pass rule and fall through to the block. Stateless rules
+# check every packet, which is what isolation wants here.
+pass quick on lo0 all flags any no state
 
 # The host is always reachable in both directions.
-pass in quick from $host_gateway to any
-pass out quick from any to $host_gateway
+pass in quick from $host_gateway to any flags any no state
+pass out quick from any to $host_gateway flags any no state
 
 # Every other address on the NAT subnet is another VM: drop both directions.
 block in quick from $vm_subnet to any
