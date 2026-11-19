@@ -18,6 +18,27 @@ anywhere; do not add any. Commits end with
 `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`; push to
 `origin main` (github.com/veerareddyvishal144/warren, private).
 
+## All phases and their status
+
+The plan and its design live in `docs/macos.md` ("Phases" and "Acceptance
+for Phase 1"); this is the status as of this handoff.
+
+| Phase | What | Status |
+|---|---|---|
+| 0 | Feasibility on this Mac: VM from IPSW, clone, two guests at once, boot-to-SSH 11 s, memory ~415 MB after boot, gateway runs inside a macOS VM | done |
+| 1a | Runtime and daemon on Linux: `warren-runtime-mac`, `warren-gateway-client`, `InstanceType::Mac`, `host_capacity_reached`, `Runtime::sleep`, `--runtime none` and the Lume flags, `GET /v1/stats`, Open Directory user names, mock-API tests, CI macOS job | done, pushed |
+| 1b | Base image and end-to-end on the Mac: `build-base.sh` (done, image built twice, second time with the clean shutdown), `e2e.sh` running through | in progress: passes health, signup, create, edge health, exec; fails at the marker process; sleep/wake/fork/isolation/capacity/delete not yet exercised |
+| 1c | Surfaces and docs: dashboard type picker, CLI/MCP/SDK, `docs/*`, operator guide `docs/macos.md`, CHANGELOG | done, pushed; final numbers and status line still to update once 1b passes |
+| 2 | Candidates, not started: screen access (noVNC through the edge), Linux guests through Lume on Mac hosts, one `lume serve` per instance, a `mac-xcode` template, Mac minis as nodes behind one daemon | not started; do not begin before 1b passes twice |
+
+Definition of done for Phase 1 (from `docs/macos.md`): `e2e.sh` green twice
+in a row on this Mac, meaning create to healthy gateway under 60 s, sleep
+suspends and frees a slot, wake resumes with processes intact in under
+15 s, the third create answers `409 host_capacity_reached`, delete removes
+the VM and the share folder, a daemon restart adopts running VMs, and one
+guest cannot reach another's gateway port. Then update `docs/macos.md`
+(status line, "Running it" numbers), `CHANGELOG.md`, and delete this file.
+
 ## Where the macOS work stands
 
 Implemented and verified on Linux (unit tests, clippy for Linux and
