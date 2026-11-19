@@ -648,15 +648,23 @@ async fn sleep_suspends_and_the_next_start_resumes() {
     let v = vm(&e, "warren-ab12cd34ef").unwrap();
     assert!(v.running && !v.saved);
 
-    // A stop asks lume for a graceful stop with the grace period.
+    // A stop asks lume for a graceful stop; a short grace is raised to the
+    // least a macOS shutdown needs, a longer one is passed through.
     e.rt.stop(&inst, Duration::from_secs(7)).await.unwrap();
     assert!(
         calls(&e)
             .iter()
-            .any(|l| l == "stop warren-ab12cd34ef force=false timeout=7")
+            .any(|l| l == "stop warren-ab12cd34ef force=false timeout=45")
     );
     assert!(!vm(&e, "warren-ab12cd34ef").unwrap().running);
     e.rt.stop(&inst, Duration::from_secs(7)).await.unwrap();
+    e.rt.start(&mut inst).await.unwrap();
+    e.rt.stop(&inst, Duration::from_secs(90)).await.unwrap();
+    assert!(
+        calls(&e)
+            .iter()
+            .any(|l| l == "stop warren-ab12cd34ef force=false timeout=90")
+    );
 }
 
 #[tokio::test]
