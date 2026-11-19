@@ -6,7 +6,8 @@
 #
 # What it does (every step is idempotent):
 #   - /usr/local/libexec/warren-gateway-launcher.sh and the two LaunchDaemons
-#     dev.warren.gateway (the gateway, as user lume) and dev.warren.pf (enables pf at boot)
+#     dev.warren.gateway (root; the launcher starts the gateway as lume inside
+#     lume's own launchd domain, see the launcher) and dev.warren.pf (enables pf at boot)
 #   - /etc/pf.anchors/dev.warren rendered from pf.anchor.template, referenced from /etc/pf.conf, loaded now
 #   - /Users/lume/.warren and /Users/lume/Library/Logs owned by lume
 #   - the given public key appended to /Users/lume/.ssh/authorized_keys
@@ -50,6 +51,10 @@ GUEST_USER=lume
 GUEST_GROUP=staff
 GUEST_HOME=/Users/$GUEST_USER
 id "$GUEST_USER" >/dev/null 2>&1 || die "user $GUEST_USER does not exist in this guest"
+# The launcher drops from root to the guest user with `sudo -n`; root needs no
+# password for that with the stock sudoers (root ALL=(ALL) ALL), but check.
+[ -x /usr/bin/sudo ] || die "/usr/bin/sudo is missing; the launcher needs it to drop privileges"
+sudo -n -u "$GUEST_USER" -H true 2>/dev/null || die "root cannot run commands as $GUEST_USER through sudo -n; the launcher relies on that"
 
 for f in warren-gateway-launcher.sh dev.warren.gateway.plist dev.warren.pf.plist pf.anchor.template; do
     [ -f "$SRC/$f" ] || die "$SRC/$f is missing; copy the whole scripts/mac/guest directory"

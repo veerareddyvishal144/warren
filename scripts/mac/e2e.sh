@@ -284,6 +284,9 @@ log "exec output: $(printf '%s' "$OUT" | tr '\n' ' ' | tr -s '\t ' ' ')"
 pass "$STEP"
 
 STEP="start marker process"
+# nohup on purpose, the way an agent starts a server: Apple's nohup fails with
+# "can't detach from console" when the gateway runs in launchd's system domain
+# (the base image used to do that), so this doubles as the regression check.
 # The shell running pgrep would itself match 'sleep 100000'; the [s] trick keeps
 # the pattern from matching its own command line.
 run_exec "$ID" 'nohup sleep 100000 </dev/null >/dev/null 2>&1 & echo started'
@@ -291,7 +294,10 @@ run_exec "$ID" 'nohup sleep 100000 </dev/null >/dev/null 2>&1 & echo started'
 case "$(jget .stdout)" in *started*) ;; *) fail "$STEP" "no 'started' in stdout" ;; esac
 run_exec "$ID" "pgrep -f '[s]leep 100000'"
 PID_BEFORE="$(jget .stdout | tr -d '[:space:]')"
-[ -n "$PID_BEFORE" ] || fail "$STEP" "marker process not found right after starting it"
+if [ -z "$PID_BEFORE" ]; then
+    run_exec "$ID" 'echo "launchd domain: $(launchctl managername 2>&1)"; nohup true; echo "nohup rc=$?"'
+    fail "$STEP" "marker process not found right after starting it; guest says: $(jget .stdout | tr '\n' ' ')$(jget .stderr | tr '\n' ' ')"
+fi
 log "marker pid $PID_BEFORE"
 pass "$STEP"
 
@@ -339,7 +345,9 @@ FORK_IP="$(lume_vm_field "warren-$FORK" ipAddress)"
 if ! nc -z -w 3 "$FORK_IP" 3737 >/dev/null 2>&1; then
     fail "$STEP" "the host cannot reach $FORK_IP:3737 either, so the guest-side check would prove nothing"
 fi
-run_exec "$ID" "nc -z -w 3 $FORK_IP 3737; echo rc=\$?" 30
+# pf drops the SYN silently, so connect() would wait on TCP retransmits for
+# over a minute; macOS nc bounds the connect with -G (-w only covers idle time).
+run_exec "$ID" "nc -z -G 3 -w 3 $FORK_IP 3737; echo rc=\$?" 30
 [ "$HTTP_CODE" = 200 ] || fail "$STEP" "exec failed (HTTP $HTTP_CODE)"
 OUT="$(jget .stdout)"
 RC="$(printf '%s' "$OUT" | sed -n 's/.*rc=\([0-9][0-9]*\).*/\1/p' | tail -n 1)"

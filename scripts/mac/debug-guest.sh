@@ -2,8 +2,10 @@
 # Boot a throwaway clone of the base VM with a shared folder attached, the way
 # warrend does, and print what the guest sees: the virtiofs mount, the share's
 # contents, the gateway launcher's log, the LaunchDaemon state, and whether the
-# gateway answers from the host. For diagnosing "the gateway inside the VM did
-# not come up".
+# gateway answers from the host, and whether a process started in the
+# background through exec survives (nohup, own session, own process group).
+# For diagnosing "the gateway inside the VM did not come up" or "background
+# processes die".
 #
 # Usage: scripts/mac/debug-guest.sh [--base-vm NAME] [--gateway-bin PATH] [--ssh-key PATH] [--keep]
 set -euo pipefail
@@ -130,8 +132,8 @@ if curl -s -m 5 -o /dev/null "http://$IP:3737/v1/health"; then
     gw_exec 'perl -e "use POSIX; POSIX::setsid(); exec @ARGV" sleep 100001 </dev/null >/dev/null 2>&1 & echo started b'
     echo "--- c) nohup via a nested sh -c"
     gw_exec 'nohup sh -c "exec sleep 100002" </dev/null >/dev/null 2>&1 & echo started c'
-    echo "--- d) launchctl submit (launchd-managed)"
-    gw_exec 'launchctl submit -l dev.warren.debug-marker -- /bin/sleep 100003 2>&1; echo rc=$?'
+    echo "--- d) which launchd domain exec runs in, and whether nohup itself works there"
+    gw_exec 'echo "domain: $(launchctl managername 2>&1), uid $(id -u)"; nohup true; echo "nohup rc=$? (127 with \"can'\''t detach from console\" means the system domain; see the launcher)"'
     sleep 3
     echo "--- what is left running (pid ppid pgid sess command)"
     gw_exec 'ps -axo pid,ppid,pgid,sess,user,command | grep "[s]leep 10000" || echo "(no sleep processes)"'
@@ -139,7 +141,7 @@ if curl -s -m 5 -o /dev/null "http://$IP:3737/v1/health"; then
     gw_exec 'echo "pgrep -f [s]leep 100000:"; pgrep -f "[s]leep 100000"; echo "rc=$?"; echo "pgrep -lf sleep:"; pgrep -lf sleep; echo "rc=$?"; echo "pgrep -x sleep:"; pgrep -x sleep; echo "rc=$?"'
     echo "--- gateway log tail inside the guest"
     "${SSH[@]}" 'tail -n 15 /Users/lume/Library/Logs/warren-gateway.log 2>&1' || true
-    gw_exec 'launchctl remove dev.warren.debug-marker 2>/dev/null; pkill -f "sleep 10000" 2>/dev/null; echo cleaned'
+    gw_exec 'pkill -f "sleep 10000" 2>/dev/null; echo cleaned'
 else
     echo "(gateway not reachable; skipping)"
 fi

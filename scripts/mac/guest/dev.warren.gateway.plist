@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
+<!-- Runs as root on purpose: the launcher moves into the guest user's own
+     launchd domain (launchctl asuser) and drops to that user with sudo, so
+     nohup(1) works for the commands the gateway runs. See the launcher. -->
 <dict>
 	<key>Label</key>
 	<string>dev.warren.gateway</string>
@@ -8,10 +11,6 @@
 	<array>
 		<string>/usr/local/libexec/warren-gateway-launcher.sh</string>
 	</array>
-	<key>UserName</key>
-	<string>lume</string>
-	<key>GroupName</key>
-	<string>staff</string>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
