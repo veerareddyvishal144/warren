@@ -139,6 +139,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let mut cfg = args.into_config();
 
+    // Runtimes hand paths under the data directory to other processes (the
+    // virtiofs share for `lume serve`, bind mounts for Docker), and those
+    // resolve a relative path against their own working directory, not ours.
+    cfg.data_dir = std::path::absolute(&cfg.data_dir)
+        .with_context(|| format!("resolve data dir {}", cfg.data_dir.display()))?;
     std::fs::create_dir_all(&cfg.data_dir)
         .with_context(|| format!("create data dir {}", cfg.data_dir.display()))?;
     if cfg.secret.is_empty() {

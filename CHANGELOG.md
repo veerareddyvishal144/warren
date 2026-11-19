@@ -21,6 +21,7 @@ All notable changes to Warren are recorded here. The format follows [Keep a Chan
 ### Fixed
 
 - macOS guests: the gateway's LaunchDaemon ran it as `lume` in launchd's system domain, where Apple's `nohup` fails ("can't detach from console"), so every background process an agent started through exec died at once. The launcher now runs as root and starts the gateway inside the guest user's own launchd domain (`launchctl asuser` + `sudo -n -E`), where `nohup` works; the base image must be rebuilt with `scripts/mac/build-base.sh`. `scripts/mac/e2e.sh` keeps a `nohup` marker as the regression check and bounds its guest-side `nc` probe with `-G`.
+- `warrend` with a relative `--data-dir` (for example `./data-mac`) made every `mac` instance fail at start: the virtiofs share path reached `lume serve` relative to the daemon's directory and Lume refused the run with `ArgumentParser.ValidationError`. The daemon now makes the data directory absolute at startup, and the mac runtime always hands Lume an absolute share path.
 - `warren-gateway`'s exec unit test compared a symlinked temp path with the physical one `pwd` prints on macOS.
 - `warren-gateway` read its effective uid and gid from `/proc/self/status`, which does not exist on macOS, so `/v1/health` reported `home_owner` as 4294967295 there. It now uses `geteuid`/`getegid` (nix `user` feature).
 

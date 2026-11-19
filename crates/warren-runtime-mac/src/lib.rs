@@ -118,7 +118,9 @@ impl MacRuntime {
                 "disabled".into()
             },
             shared_directories: vec![SharedDirectory {
-                host_path: self.share_dir(inst).to_string_lossy().into_owned(),
+                host_path: absolute_path(&self.share_dir(inst))
+                    .to_string_lossy()
+                    .into_owned(),
                 read_only: true,
             }],
         }
@@ -243,6 +245,15 @@ impl MacRuntime {
         }
         Ok(disk)
     }
+}
+
+/// `p` made absolute against this process's working directory, not
+/// canonicalized (the share may not exist yet). Lume resolves a relative
+/// `hostPath` against the `lume serve` process's own directory and refuses it
+/// with an argument validation error, so a relative `--data-dir` must never
+/// reach it.
+fn absolute_path(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// `~` and `~/...` relative to the daemon user's home.

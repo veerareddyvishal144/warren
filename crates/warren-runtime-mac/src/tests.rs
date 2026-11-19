@@ -880,3 +880,18 @@ async fn capacity_is_counted_from_the_vm_list_when_host_status_lacks_it() {
     assert_eq!(err.code, CODE_HOST_CAPACITY_REACHED);
     assert_eq!(err.details.as_ref().unwrap()["running"], 2);
 }
+
+#[test]
+fn share_host_path_is_absolute_even_for_a_relative_data_dir() {
+    let p = super::absolute_path(std::path::Path::new("data-mac/mac/ab12cd34ef/share"));
+    assert!(p.is_absolute(), "{}", p.display());
+    assert!(
+        p.ends_with("data-mac/mac/ab12cd34ef/share"),
+        "{}",
+        p.display()
+    );
+    assert_eq!(
+        super::absolute_path(std::path::Path::new("/tmp/x/share")),
+        std::path::PathBuf::from("/tmp/x/share")
+    );
+}
