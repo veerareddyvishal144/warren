@@ -78,7 +78,7 @@ LOG="$DATA/warrend.log"
 API_HOST="api.$BASE_DOMAIN:$PORT"
 
 lume get "$BASE_VM" -f json >/dev/null 2>&1 || die "base VM '$BASE_VM' does not exist; run scripts/mac/build-base.sh first"
-BASE_STATUS="$(lume get "$BASE_VM" -f json | jq -r '.status // empty')"
+BASE_STATUS="$(lume get "$BASE_VM" -f json | jq -r '(if type=="array" then .[0] else . end) | .status // empty')"
 [ "$BASE_STATUS" = stopped ] || die "base VM '$BASE_VM' is '$BASE_STATUS'; it must be stopped (lume stop $BASE_VM)"
 
 if curl -s -m 2 -o /dev/null -H "Host: $API_HOST" "http://127.0.0.1:$PORT/v1/health" 2>/dev/null; then
@@ -92,7 +92,7 @@ if [ -n "$LEFTOVERS" ]; then
     if [ "$CLEAN" = 1 ]; then
         for vm in $LEFTOVERS; do
             log "removing leftover VM $vm"
-            if [ "$(lume get "$vm" -f json | jq -r '.status // empty')" = running ]; then lume stop "$vm" || true; fi
+            if [ "$(lume get "$vm" -f json | jq -r '(if type=="array" then .[0] else . end) | .status // empty')" = running ]; then lume stop "$vm" || true; fi
             lume delete "$vm" --force
         done
     else
@@ -207,7 +207,7 @@ wait_status() {
     done
 }
 # lume_vm_field VM KEY
-lume_vm_field() { lume get "$1" -f json 2>/dev/null | jq -r --arg k "$2" '.[$k] | select(. != null)'; }
+lume_vm_field() { lume get "$1" -f json 2>/dev/null | jq -r --arg k "$2" '(if type=="array" then .[0] else . end) | .[$k] | select(. != null)'; }
 
 CREATE_PAYLOAD='{"template":"warren-macos","type":"mac","auto_sleep":false}'
 

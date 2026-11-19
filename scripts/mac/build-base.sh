@@ -85,7 +85,7 @@ lume_field() {
     json="$(lume get "$vm" -f json 2>/dev/null)" || return 1
     if [ "$HAVE_JQ" = 1 ]; then
         # `// empty` would also swallow a JSON false (savedState, sshAvailable).
-        printf '%s' "$json" | jq -r --arg k "$key" '.[$k] | select(. != null)'
+        printf '%s' "$json" | jq -r --arg k "$key" '(if type=="array" then .[0] else . end) | .[$k] | select(. != null)'
     else
         printf '%s' "$json" | tr -d '\n' | sed -nE "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"?([^\",}]*)\"?.*/\1/p" | sed 's/^null$//'
     fi
