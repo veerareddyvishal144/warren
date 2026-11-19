@@ -116,5 +116,33 @@ echo
 echo "===== host: gateway health over the network ====="
 curl -s -m 5 "http://$IP:3737/v1/health" && echo || echo "(no answer from $IP:3737)"
 echo
+echo "===== host -> gateway: does a background process survive exec? ====="
+gw_exec() {
+    curl -s -m 60 -X POST "http://$IP:3737/v1/exec" -H 'x-warren-instance-token: debug-token' \
+        -H 'content-type: application/json' \
+        --data-binary "$(jq -cn --arg c "$1" '{command: $c, timeout_seconds: 30}')"
+    echo
+}
+if curl -s -m 5 -o /dev/null "http://$IP:3737/v1/health"; then
+    echo "--- a) nohup ... & (what e2e.sh does)"
+    gw_exec 'nohup sleep 100000 </dev/null >/dev/null 2>&1 & echo started a'
+    echo "--- b) perl setsid + exec (own session)"
+    gw_exec 'perl -e "use POSIX; POSIX::setsid(); exec @ARGV" sleep 100001 </dev/null >/dev/null 2>&1 & echo started b'
+    echo "--- c) nohup via a nested sh -c"
+    gw_exec 'nohup sh -c "exec sleep 100002" </dev/null >/dev/null 2>&1 & echo started c'
+    echo "--- d) launchctl submit (launchd-managed)"
+    gw_exec 'launchctl submit -l dev.warren.debug-marker -- /bin/sleep 100003 2>&1; echo rc=$?'
+    sleep 3
+    echo "--- what is left running (pid ppid pgid sess command)"
+    gw_exec 'ps -axo pid,ppid,pgid,sess,user,command | grep "[s]leep 10000" || echo "(no sleep processes)"'
+    echo "--- pgrep variants"
+    gw_exec 'echo "pgrep -f [s]leep 100000:"; pgrep -f "[s]leep 100000"; echo "rc=$?"; echo "pgrep -lf sleep:"; pgrep -lf sleep; echo "rc=$?"; echo "pgrep -x sleep:"; pgrep -x sleep; echo "rc=$?"'
+    echo "--- gateway log tail inside the guest"
+    "${SSH[@]}" 'tail -n 15 /Users/lume/Library/Logs/warren-gateway.log 2>&1' || true
+    gw_exec 'launchctl remove dev.warren.debug-marker 2>/dev/null; pkill -f "sleep 10000" 2>/dev/null; echo cleaned'
+else
+    echo "(gateway not reachable; skipping)"
+fi
+echo
 echo "===== host: lume get $VM ====="
 lume get "$VM" -f json | jq -c '(if type=="array" then .[0] else . end) | {status, ipAddress, sharedDirectories, savedState}'
