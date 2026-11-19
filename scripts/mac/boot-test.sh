@@ -12,10 +12,16 @@ VM=${1:-sandbox}
 SSH_USER=${2:-lume}
 KEY=${3:-$HOME/.ssh/id_ed25519}
 
+# `lume run` keeps the virtual machine inside its own process and does not
+# return until the VM stops, so it runs in the background and survives this
+# script (and the terminal) ending. Its output goes to a log file.
+LOG=$HOME/.lume/$VM-run.log
 lume stop "$VM" 2>/dev/null
 sleep 3
 START=$(date +%s)
-lume run "$VM" || exit 1
+nohup lume run "$VM" >"$LOG" 2>&1 &
+RUN_PID=$!
+echo "lume run started in the background (pid $RUN_PID, log $LOG)"
 
 IP=""
 while [ -z "$IP" ]; do
@@ -32,3 +38,4 @@ echo "cold boot to ssh: $((END - START)) s (ip $IP)"
 sleep 20
 echo "memory per process:"
 ps -eo rss,command | grep -iE '[l]ume|[V]irtualization' | awk '{printf "  %d MB  %s\n", $1/1024, $2}'
+echo "the VM keeps running; stop it with: lume stop $VM"
