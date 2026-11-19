@@ -62,6 +62,16 @@ done
 
 # --- binaries ------------------------------------------------------------------------
 if [ "$BUILD" = 1 ]; then
+    # rustup installs cargo under ~/.cargo/bin and adds it to the PATH of the
+    # user's login shell only; this script runs under bash.
+    if ! command -v cargo >/dev/null 2>&1; then
+        if [ -f "$HOME/.cargo/env" ]; then
+            # shellcheck disable=SC1091
+            . "$HOME/.cargo/env"
+        elif [ -x "$HOME/.cargo/bin/cargo" ]; then
+            PATH="$HOME/.cargo/bin:$PATH"
+        fi
+    fi
     command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH (install rustup, or pass --skip-build)"
     log "building warrend, warren-gateway and warren (release) into $CARGO_TARGET_DIR"
     cargo build --release --locked -p warrend -p warren-gateway -p warren-cli
