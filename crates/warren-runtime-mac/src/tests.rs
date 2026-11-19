@@ -102,18 +102,19 @@ async fn host_status(State(s): State<Shared>) -> Json<Value> {
     if m.bare_host_status {
         return Json(json!({ "status": "healthy", "version": m.version }));
     }
+    // Lume 0.7.2 spells this response in snake_case.
     Json(json!({
-        "status": "healthy", "vmCount": running, "maxVMs": m.max,
-        "availableSlots": m.max.saturating_sub(running), "version": m.version
+        "status": "healthy", "vm_count": running, "max_vms": m.max,
+        "available_slots": m.max.saturating_sub(running), "version": m.version
     }))
 }
 
 async fn config(State(s): State<Shared>) -> Json<Value> {
     let m = s.lock().unwrap();
     Json(json!({
-        "defaultLocationName": "home",
-        "vmLocations": [{ "name": "home", "path": m.location_path }],
-        "homeDirectory": m.location_path, "cacheDirectory": "", "cachingEnabled": false
+        "default_location_name": "home",
+        "vm_locations": [{ "name": "home", "path": m.location_path }],
+        "home_directory": m.location_path, "cache_directory": "", "caching_enabled": false
     }))
 }
 

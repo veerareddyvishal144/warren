@@ -10,21 +10,21 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use warren_core::{Error, Result};
 
-/// `GET /lume/host/status`.
+/// `GET /lume/host/status`. Lume 0.7.2 encodes this one in snake_case
+/// (`max_vms`, `available_slots`) while the VM objects are camelCase, so
+/// both spellings are accepted.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct HostStatus {
     #[serde(default)]
     pub status: String,
     /// Running VMs, macOS and Linux.
-    #[serde(default)]
+    #[serde(default, alias = "vmCount")]
     pub vm_count: u32,
-    /// The most macOS guests the host runs at once (2). Lume spells the key
-    /// `maxVMs`.
-    #[serde(default, rename = "maxVMs")]
+    /// The most macOS guests the host runs at once (2).
+    #[serde(default, alias = "maxVMs", alias = "maxVms")]
     pub max_vms: u32,
     /// macOS guests that can still start.
-    #[serde(default)]
+    #[serde(default, alias = "availableSlots")]
     pub available_slots: u32,
     #[serde(default)]
     pub version: String,
@@ -131,12 +131,12 @@ pub struct Location {
     pub path: String,
 }
 
+/// `GET /lume/config`; either key spelling, like [`HostStatus`].
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Settings {
-    #[serde(default)]
+    #[serde(default, alias = "defaultLocationName")]
     pub default_location_name: String,
-    #[serde(default)]
+    #[serde(default, alias = "vmLocations")]
     pub vm_locations: Vec<Location>,
 }
 
@@ -481,12 +481,30 @@ mod tests {
     }
 
     #[test]
-    fn host_status_uses_lumes_spelling() {
+    fn host_status_and_settings_accept_both_key_spellings() {
+        // As Lume 0.7.2 really answers.
+        let h: HostStatus = serde_json::from_str(
+            r#"{"available_slots":2,"version":"0.7.2","vm_count":0,"max_vms":2,"status":"healthy"}"#,
+        )
+        .unwrap();
+        assert_eq!((h.vm_count, h.max_vms, h.available_slots), (0, 2, 2));
+        // As the Swift property names read.
         let h: HostStatus = serde_json::from_str(
             r#"{"status":"healthy","vmCount":1,"maxVMs":2,"availableSlots":1,"version":"0.7.2"}"#,
         )
         .unwrap();
         assert_eq!((h.vm_count, h.max_vms, h.available_slots), (1, 2, 1));
+        let s: Settings = serde_json::from_str(
+            r#"{"default_location_name":"home","vm_locations":[{"name":"home","path":"~/.lume"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(s.default_location_name, "home");
+        assert_eq!(s.vm_locations[0].path, "~/.lume");
+        let s: Settings = serde_json::from_str(
+            r#"{"defaultLocationName":"home","vmLocations":[{"name":"home","path":"/x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(s.vm_locations[0].path, "/x");
     }
 
     #[test]
