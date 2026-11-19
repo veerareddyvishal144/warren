@@ -225,8 +225,35 @@ impl LumeClient {
         if status != 200 {
             return Err(Self::failure("host status", status, &body));
         }
-        serde_json::from_slice(&body)
-            .map_err(|e| Error::internal(format!("lume host status is unreadable: {e}")))
+        let parsed: HostStatus = serde_json::from_slice(&body)
+            .map_err(|e| Error::internal(format!("lume host status is unreadable: {e}")))?;
+        if parsed.max_vms == 0 {
+            tracing::debug!(body = %String::from_utf8_lossy(&body), "lume host status without capacity fields");
+        }
+        Ok(parsed)
+    }
+
+    /// Running macOS guests and the host's limit, from `GET /lume/host/status`
+    /// when it carries the capacity fields, else counted from the VM list
+    /// against [`MAX_MACOS_GUESTS`] (older servers, or a different spelling).
+    pub async fn capacity(&self) -> Result<Capacity> {
+        let host = self.host_status().await?;
+        if host.max_vms > 0 {
+            return Ok(Capacity {
+                max_running: host.max_vms,
+                running: host.max_vms.saturating_sub(host.available_slots),
+            });
+        }
+        let running = self
+            .list()
+            .await?
+            .iter()
+            .filter(|v| v.is_running() && v.is_macos())
+            .count() as u32;
+        Ok(Capacity {
+            max_running: MAX_MACOS_GUESTS,
+            running,
+        })
     }
 
     pub async fn settings(&self) -> Result<Settings> {
@@ -396,6 +423,19 @@ impl LumeClient {
 
 /// Virtualization.framework runs at most this many macOS guests per host.
 pub const MAX_MACOS_GUESTS: u32 = 2;
+
+/// How many macOS guests run and how many may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capacity {
+    pub max_running: u32,
+    pub running: u32,
+}
+
+impl Capacity {
+    pub fn has_room(&self) -> bool {
+        self.running < self.max_running
+    }
+}
 
 /// Parse "0.7.2" style versions into comparable tuples; unknown parts are 0.
 pub fn parse_version(v: &str) -> (u32, u32, u32) {

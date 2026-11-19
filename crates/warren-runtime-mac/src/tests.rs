@@ -50,6 +50,9 @@ impl Default for Vm {
 struct Mock {
     vms: HashMap<String, Vm>,
     max: u32,
+    /// Answer `GET /lume/host/status` without the capacity fields, as a server
+    /// that does not have them would.
+    bare_host_status: bool,
     version: String,
     calls: Vec<String>,
     run_delay_ms: u64,
@@ -96,6 +99,9 @@ fn running_macos(m: &Mock) -> u32 {
 async fn host_status(State(s): State<Shared>) -> Json<Value> {
     let m = s.lock().unwrap();
     let running = running_macos(&m);
+    if m.bare_host_status {
+        return Json(json!({ "status": "healthy", "version": m.version }));
+    }
     Json(json!({
         "status": "healthy", "vmCount": running, "maxVMs": m.max,
         "availableSlots": m.max.saturating_sub(running), "version": m.version
@@ -830,4 +836,31 @@ fn log_lines_are_filtered_by_their_timestamp() {
         filter_since(text, 1_795_066_875),
         "2026-11-19T05:41:16Z new\nplain line\n"
     );
+}
+
+#[tokio::test]
+async fn capacity_is_counted_from_the_vm_list_when_host_status_lacks_it() {
+    let mut m = base_mock();
+    m.bare_host_status = true;
+    m.vms.insert(
+        "other-a".into(),
+        Vm {
+            running: true,
+            ..Vm::default()
+        },
+    );
+    let e = env_with(m).await;
+    e.rt.ready().await.unwrap();
+    let cap = e.rt.lume().capacity().await.unwrap();
+    assert_eq!((cap.max_running, cap.running), (2, 1));
+    let mut inst = instance("ab12cd34ef");
+    e.rt.create(&mut inst, &template()).await.unwrap();
+    e.rt.start(&mut inst).await.unwrap();
+    let cap = e.rt.lume().capacity().await.unwrap();
+    assert_eq!((cap.max_running, cap.running), (2, 2));
+    let mut second = instance("bb12cd34ef");
+    e.rt.create(&mut second, &template()).await.unwrap();
+    let err = e.rt.start(&mut second).await.unwrap_err();
+    assert_eq!(err.code, CODE_HOST_CAPACITY_REACHED);
+    assert_eq!(err.details.as_ref().unwrap()["running"], 2);
 }

@@ -307,6 +307,7 @@ impl Runtime for MacRuntime {
         share::restrict(&self.cfg.mac_dir())?;
         serve::ensure_running(&self.cfg, &self.lume).await?;
         let host = self.lume.host_status().await?;
+        let capacity = self.lume.capacity().await?;
         if lume::parse_version(&host.version) < MIN_LUME_VERSION {
             return Err(Error::not_supported(format!(
                 "lume {} is too old; 0.7.2 or newer is required",
@@ -335,8 +336,8 @@ impl Runtime for MacRuntime {
             api = %self.cfg.lume_api_url,
             base,
             disk_gb = vm.disk_gb(),
-            slots = host.available_slots,
-            max_running = host.max_vms,
+            running = capacity.running,
+            max_running = capacity.max_running,
             "lume runtime ready"
         );
         Ok(())
@@ -398,12 +399,9 @@ impl Runtime for MacRuntime {
         if details.is_running() {
             tracing::info!(instance = %inst.id, vm, "VM already running; adopting it");
         } else {
-            let host = self.lume.host_status().await?;
-            if host.available_slots == 0 {
-                return Err(Error::host_capacity(
-                    host.max_vms,
-                    host.max_vms.saturating_sub(host.available_slots),
-                ));
+            let capacity = self.lume.capacity().await?;
+            if !capacity.has_room() {
+                return Err(Error::host_capacity(capacity.max_running, capacity.running));
             }
             if !self.share_dir(inst).join(share::ENV_FILE).is_file() {
                 return Err(Error::conflict(format!(
