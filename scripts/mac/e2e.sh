@@ -97,7 +97,10 @@ fi
 
 # Every VM name is listed whatever the exact shape of `lume ls -f json`.
 lume_vm_names() { lume ls -f json 2>/dev/null | jq -r '.. | objects | select(has("name")) | .name' | sort -u; }
-LEFTOVERS="$(lume_vm_names | grep '^warren-' || true)"
+# Instance VMs are warren-<instance id> (a letter and nine lowercase alphanumerics);
+# the base VM and other warren-* names are not leftovers.
+instance_vm_names() { lume_vm_names | grep -E '^warren-[a-z][a-z0-9]{9}$' | grep -vxF "$BASE_VM" || true; }
+LEFTOVERS="$(instance_vm_names)"
 if [ -n "$LEFTOVERS" ]; then
     if [ "$CLEAN" = 1 ]; then
         for vm in $LEFTOVERS; do
@@ -155,7 +158,7 @@ finish() {
         if [ -n "$WARREND_PID" ] && kill -0 "$WARREND_PID" 2>/dev/null; then
             # Give the deletes a moment to tear the VMs down before the daemon goes.
             local waited=0
-            while [ "$waited" -lt 60 ] && [ -n "$(lume_vm_names | grep '^warren-' || true)" ]; do sleep 2; waited=$((waited + 2)); done
+            while [ "$waited" -lt 60 ] && [ -n "$(instance_vm_names)" ]; do sleep 2; waited=$((waited + 2)); done
             log "stopping warrend (pid $WARREND_PID)"
             kill -TERM "$WARREND_PID" 2>/dev/null
             waited=0
@@ -163,7 +166,7 @@ finish() {
             kill -0 "$WARREND_PID" 2>/dev/null && { log "warrend did not exit; SIGKILL"; kill -KILL "$WARREND_PID" 2>/dev/null; }
         fi
         local left
-        left="$(lume_vm_names | grep '^warren-' || true)"
+        left="$(instance_vm_names)"
         [ -n "$left" ] && log "warning: VMs still listed by lume after cleanup: $(printf '%s ' $left)"
     fi
     print_table
