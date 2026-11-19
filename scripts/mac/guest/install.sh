@@ -167,6 +167,8 @@ bootstrap() {
     done
     launchctl bootstrap system "$plist" || die "could not bootstrap $label from $plist"
 }
+launchctl enable system/dev.warren.pf 2>/dev/null || true
+launchctl enable system/dev.warren.gateway 2>/dev/null || true
 bootstrap dev.warren.pf /Library/LaunchDaemons/dev.warren.pf.plist
 bootstrap dev.warren.gateway /Library/LaunchDaemons/dev.warren.gateway.plist
 
@@ -180,3 +182,6 @@ echo "Installed. In the base image no 'share' folder is attached, so the launche
 echo "waits 300 s, exits 1 and launchd restarts it every 5 s: that is expected."
 echo "It settles once warrend starts a clone of this VM with the share attached."
 echo "Log inside the guest: $GUEST_HOME/Library/Logs/warren-gateway.log"
+
+# Everything above must be on disk before the host powers the VM off.
+sync

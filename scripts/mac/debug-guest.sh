@@ -95,6 +95,15 @@ echo
 echo "===== guest: launcher and gateway log (last 40 lines) ====="
 "${SSH[@]}" 'tail -n 40 /Users/lume/Library/Logs/warren-gateway.log 2>&1 || echo "(no log file)"' || true
 echo
+echo "===== guest: installed files (plists, launcher, pf anchor, pf.conf lines) ====="
+"${SSH[@]}" 'ls -la /Library/LaunchDaemons/ 2>&1 | grep -i -E "warren|total" ; echo ---; ls -la /usr/local/libexec/ 2>&1; echo ---; ls -la /etc/pf.anchors/ 2>&1; echo ---; grep -n "dev.warren" /etc/pf.conf 2>&1 || echo "(no dev.warren lines in /etc/pf.conf)"' || true
+echo
+echo "===== guest: launchd disabled list and loaded services mentioning warren ====="
+"${SSH[@]}" 'echo lume | sudo -S -p "" launchctl print-disabled system 2>/dev/null | grep -i warren || echo "(not in the disabled list)"; echo ---; echo lume | sudo -S -p "" launchctl list 2>/dev/null | grep -i warren || echo "(no warren service loaded)"' || true
+echo
+echo "===== guest: bootstrapping dev.warren.gateway by hand (shows the error if the plist is there but refused) ====="
+"${SSH[@]}" 'if [ -f /Library/LaunchDaemons/dev.warren.gateway.plist ]; then echo lume | sudo -S -p "" launchctl bootstrap system /Library/LaunchDaemons/dev.warren.gateway.plist 2>&1 && echo "bootstrap ok"; sleep 15; tail -n 20 /Users/lume/Library/Logs/warren-gateway.log 2>&1 || echo "(still no log file)"; echo lume | sudo -S -p "" lsof -nP -iTCP:3737 -sTCP:LISTEN 2>/dev/null || echo "(nothing listens on 3737 after the manual bootstrap)"; else echo "plist missing: the base image lost the installed files"; fi' || true
+echo
 echo "===== guest: LaunchDaemon state ====="
 "${SSH[@]}" 'echo lume | sudo -S -p "" launchctl print system/dev.warren.gateway 2>&1 | head -40' || true
 echo

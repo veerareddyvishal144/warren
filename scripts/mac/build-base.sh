@@ -225,11 +225,24 @@ ssh "${SSH_OPTS[@]}" "$REMOTE" "rm -rf $REMOTE_DIR" || true
 # --- stop ---------------------------------------------------------------------------
 sleep 5
 ssh "${SSH_OPTS[@]}" -O exit "$REMOTE" >/dev/null 2>&1 || true
-log "stopping $TARGET"
-lume stop "$TARGET"
-deadline=$((SECONDS + 90))
+# A clean shutdown from inside the guest: `lume stop` signals the VM process,
+# which powers the machine off after a short grace period, and a power-off
+# seconds after writing files can lose them (the first base image came up
+# without its LaunchDaemons). sync first, then let macOS shut itself down.
+log "shutting $TARGET down cleanly from inside the guest"
+printf '%s\n' "$PASSWORD" | ssh "${SSH_OPTS[@]}" "$REMOTE" "sync; sudo -S -k -p '' shutdown -h now" >/dev/null 2>&1 || true
+deadline=$((SECONDS + 120))
 while [ "$(lume_field "$TARGET" status || true)" != stopped ]; do
-    [ "$SECONDS" -lt "$deadline" ] || die "$TARGET did not stop within 90 s (lume get $TARGET)"
+    if [ "$SECONDS" -ge "$deadline" ]; then
+        log "warning: $TARGET did not shut down by itself within 120 s; asking lume to stop it"
+        lume stop "$TARGET" || true
+        break
+    fi
+    sleep 2
+done
+deadline=$((SECONDS + 60))
+while [ "$(lume_field "$TARGET" status || true)" != stopped ]; do
+    [ "$SECONDS" -lt "$deadline" ] || die "$TARGET did not stop (lume get $TARGET)"
     sleep 2
 done
 
