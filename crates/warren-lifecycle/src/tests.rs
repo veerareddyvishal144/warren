@@ -55,6 +55,9 @@ impl Env {
         let templates = FakeTemplates::new(cfg.system_templates());
         let mut runtimes: HashMap<InstanceType, Arc<dyn Runtime>> = HashMap::new();
         runtimes.insert(InstanceType::Default, runtime.clone());
+        // The same fake serves `mac`, so a template that implies the type can
+        // be created; `vm` stays without a runtime for the refusal cases.
+        runtimes.insert(InstanceType::Mac, runtime.clone());
         let ws = Workspace {
             id: WS.into(),
             name: "test".into(),
@@ -382,7 +385,8 @@ async fn create_validation_errors() {
         assert_eq!(err.code, code, "{what}: {err}");
     }
 
-    // A template that only allows vm instances rejects the default type.
+    // A template that only allows vm instances rejects an explicit default
+    // type; without a type it implies vm, which has no runtime in this env.
     env.templates.put(Template {
         name: "vm-only".into(),
         image_ref: "x/y:z".into(),
@@ -397,18 +401,72 @@ async fn create_validation_errors() {
             &env.ws,
             &CreateInstanceRequest {
                 template: Some("vm-only".into()),
+                kind: Some(InstanceType::Default),
                 ..Default::default()
             },
         )
         .await
         .unwrap_err();
     assert_eq!(err.code, errors::CODE_INVALID_REQUEST);
+    let err = env
+        .mgr
+        .create(
+            &env.ws,
+            &CreateInstanceRequest {
+                template: Some("vm-only".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, errors::CODE_NOT_SUPPORTED, "{err}");
 
     assert!(
         env.mgr.list(WS).await.unwrap().is_empty(),
         "no instance may be created by a rejected request"
     );
     assert!(env.runtime.calls.lock().is_empty());
+}
+
+/// A request without `type` takes the template's: `default` for templates
+/// that allow it, the template's only type otherwise (how a client that only
+/// knows templates gets a `mac` instance from `warren-macos`).
+#[tokio::test]
+async fn type_comes_from_the_template_when_omitted() {
+    let env = Env::new();
+    env.templates.put(Template {
+        name: "mac-only".into(),
+        image_ref: "warren-macos-26".into(),
+        types: vec![InstanceType::Mac],
+        default_shape: Shape {
+            cpu: 2,
+            memory: 4,
+            disk: 50,
+        },
+        revision: 1,
+        ..Default::default()
+    });
+    let inst = env
+        .create(CreateInstanceRequest {
+            template: Some("mac-only".into()),
+            shape: Some(ShapeRequest {
+                cpu: Some(2),
+                memory: Some(4),
+                disk: Some(4),
+            }),
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(inst.kind, InstanceType::Mac);
+    assert_eq!(
+        inst.shape.disk, 50,
+        "a mac disk never goes below the base image"
+    );
+    let inst = env.wait_for(&inst.id, InstanceStatus::Running).await;
+    assert_eq!(inst.kind, InstanceType::Mac);
+    // Templates that allow the default type keep it.
+    let base = env.create(CreateInstanceRequest::default()).await;
+    assert_eq!(base.kind, InstanceType::Default);
 }
 
 #[tokio::test]

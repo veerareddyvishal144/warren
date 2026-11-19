@@ -266,6 +266,18 @@ impl Template {
     pub fn allows(&self, t: InstanceType) -> bool {
         self.types.is_empty() || self.types.contains(&t)
     }
+
+    /// The type a create request gets when it names this template without a
+    /// `type`: `default` when the template allows it (or allows everything),
+    /// else the first type the template lists. So `{"template": "warren-macos"}`
+    /// makes a `mac` instance for clients that only know templates.
+    pub fn default_type(&self) -> InstanceType {
+        if self.allows(InstanceType::Default) {
+            InstanceType::Default
+        } else {
+            self.types.first().copied().unwrap_or_default()
+        }
+    }
 }
 
 /// A persistent computer for one user or workload.

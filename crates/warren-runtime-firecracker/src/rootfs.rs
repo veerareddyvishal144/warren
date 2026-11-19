@@ -458,6 +458,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // APFS reports allocated blocks differently; the copy only runs on Linux hosts
     fn sparse_copy_keeps_holes() {
         let tmp = TempDir::new("fc-sparse");
         let src = tmp.path().join("src.img");

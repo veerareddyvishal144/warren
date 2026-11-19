@@ -680,8 +680,7 @@ impl Lifecycle for Manager {
         let idle = req.idle_timeout_seconds.unwrap_or(DEFAULT_IDLE_TIMEOUT_SEC);
         validate_idle_timeout(idle, self.deps.config.min_idle_timeout_sec)?;
         let region = resolve_region(req.region.as_deref(), &self.deps.config.region)?;
-        let kind = req.kind.unwrap_or_default();
-        if kind == InstanceType::Performance {
+        if req.kind == Some(InstanceType::Performance) {
             return Err(Error::not_supported(
                 "performance instances are not available in this build",
             ));
@@ -694,6 +693,8 @@ impl Lifecycle for Manager {
             .unwrap_or(DEFAULT_TEMPLATE)
             .to_string();
         let tpl = self.deps.templates.resolve(&ws.id, &template_ref).await?;
+        // No type in the request: the template decides (`mac` for warren-macos).
+        let kind = req.kind.unwrap_or_else(|| tpl.default_type());
         if !tpl.allows(kind) {
             return Err(Error::invalid(format!(
                 "template {} does not allow type {kind}",

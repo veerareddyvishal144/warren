@@ -243,6 +243,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // is_alive, cpu_ticks and rss_bytes read /proc
     fn liveness_of_this_process_and_of_nothing() {
         let me = std::process::id() as i32;
         let exe = std::env::current_exe().unwrap();

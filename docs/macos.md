@@ -33,9 +33,13 @@ On the Mac (Apple silicon, macOS 14 or newer, [Lume](https://github.com/trycua/c
    Desktop for `default` instances. The daemon starts `lume serve` itself
    when the API on `127.0.0.1:7777` is not answering (`--lume-api` to
    change) and restarts it if it dies.
-4. Create instances with `"type": "mac"` from the `warren-macos` template
-   (the dashboard, CLI `--type mac`, SDKs and MCP all know the type), or run
-   the whole scenario with `bash scripts/mac/e2e.sh`.
+4. Create instances from the `warren-macos` template: with `"type": "mac"`
+   (the dashboard, CLI `--type mac`, SDKs and MCP all know the type) or with
+   the template alone, since a request without a type takes the template's
+   only type. That is how a client that only knows templates, such as a
+   Caret workspace with `warren.template` set to `warren-macos`, gets macOS
+   instances. A requested disk below the base image's 50 GB is raised to it.
+   Or run the whole scenario with `bash scripts/mac/e2e.sh`.
 
 Flags and variables: `--mac-base-vm` / `WARREN_MAC_BASE_VM` (enables the
 type), `--lume-api` / `WARREN_LUME_API`, `--lume-bin` / `WARREN_LUME_BIN`,

@@ -65,7 +65,8 @@ fn lookup(cpu: u32, memory: u32) -> Option<&'static Spec> {
 /// requested memory. Disk must be a whole number of GB within the shape's
 /// range (up to 100 GB on vm and performance types, 500 GB on mac). On the
 /// `mac` type an unrequested disk keeps the template's size whatever the
-/// CPU/RAM pair, because the disk is the base image's and never shrinks.
+/// CPU/RAM pair, because the disk is the base image's and never shrinks; for
+/// the same reason a requested disk below the template's is raised to it.
 pub fn normalize(
     req: Option<&ShapeRequest>,
     tpl: Option<&Template>,
@@ -105,6 +106,9 @@ pub fn normalize(
             out.cpu, out.memory
         ))
     })?;
+    if disk_requested && t == InstanceType::Mac && out.disk < base.disk {
+        out.disk = base.disk;
+    }
     if !disk_requested && (out.disk == 0 || (out.cpu, out.memory) != (base.cpu, base.memory)) {
         let keep_template_disk = out.disk > 0
             && (t == InstanceType::Mac || (out.cpu, out.memory) == (base.cpu, base.memory));
@@ -167,6 +171,46 @@ mod tests {
                 memory: 4,
                 disk: 4
             }
+        );
+    }
+
+    #[test]
+    fn mac_disk_never_goes_below_the_template() {
+        let mac = Template {
+            default_shape: Shape {
+                cpu: 2,
+                memory: 4,
+                disk: 50,
+            },
+            ..Default::default()
+        };
+        let small = ShapeRequest {
+            cpu: Some(2),
+            memory: Some(4),
+            disk: Some(4),
+        };
+        assert_eq!(
+            normalize(Some(&small), Some(&mac), InstanceType::Mac)
+                .unwrap()
+                .disk,
+            50
+        );
+        let bigger = ShapeRequest {
+            disk: Some(80),
+            ..Default::default()
+        };
+        assert_eq!(
+            normalize(Some(&bigger), Some(&mac), InstanceType::Mac)
+                .unwrap()
+                .disk,
+            80
+        );
+        // Other types keep a smaller request (they get a fresh disk of that size).
+        assert_eq!(
+            normalize(Some(&small), Some(&tpl()), InstanceType::Default)
+                .unwrap()
+                .disk,
+            4
         );
     }
 

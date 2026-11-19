@@ -443,6 +443,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // compares against /proc/self
     fn finds_tools_and_uid() {
         assert!(find_tool("sh").is_some());
         assert!(find_tool("definitely-not-a-tool-zzz").is_none());

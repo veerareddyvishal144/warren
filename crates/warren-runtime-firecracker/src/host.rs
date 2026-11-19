@@ -499,6 +499,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // reads /proc/self
     fn effective_uid_matches_the_process_owner() {
         use std::os::unix::fs::MetadataExt;
         assert_eq!(
