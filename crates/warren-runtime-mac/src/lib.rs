@@ -41,6 +41,10 @@ pub const VM_PREFIX: &str = "warren-";
 /// Clone-boot to a healthy gateway: 11 s boot plus the launcher's copy on a
 /// loaded laptop fits comfortably.
 pub const BOOT_TIMEOUT: Duration = Duration::from_secs(180);
+/// The least time a macOS guest gets to shut down cleanly before Lume
+/// forces the power off. The platform's 10 s grace is tuned for containers;
+/// a macOS shutdown that is cut short can lose the last writes.
+pub const MIN_STOP_TIMEOUT_SECS: u64 = 45;
 /// Lume keeps the VM's saved memory in these files next to the disk.
 const SAVED_STATE_FILES: [&str; 2] = ["state.vzvmsave", "state.vsock"];
 const DISK_FILE: &str = "disk.img";
@@ -440,8 +444,9 @@ impl Runtime for MacRuntime {
         let vm = Self::vm_name(inst);
         match self.lume.get(&vm).await? {
             Some(d) if d.is_running() => {
-                tracing::info!(instance = %inst.id, vm, grace = grace.as_secs(), "stopping VM");
-                self.lume.stop(&vm, false, grace.as_secs()).await
+                let timeout = grace.as_secs().max(MIN_STOP_TIMEOUT_SECS);
+                tracing::info!(instance = %inst.id, vm, timeout, "stopping VM");
+                self.lume.stop(&vm, false, timeout).await
             }
             _ => Ok(()),
         }
@@ -456,7 +461,9 @@ impl Runtime for MacRuntime {
                     Ok(()) => Ok(()),
                     Err(e) => {
                         tracing::warn!(instance = %inst.id, error = %e, "suspend failed; stopping instead");
-                        self.lume.stop(&vm, false, grace.as_secs()).await
+                        self.lume
+                            .stop(&vm, false, grace.as_secs().max(MIN_STOP_TIMEOUT_SECS))
+                            .await
                     }
                 }
             }
@@ -469,7 +476,9 @@ impl Runtime for MacRuntime {
         if let Some(d) = self.lume.get(&vm).await?
             && d.is_running()
         {
-            self.lume.stop(&vm, false, STOP_GRACE_SECS).await?;
+            self.lume
+                .stop(&vm, false, STOP_GRACE_SECS.max(MIN_STOP_TIMEOUT_SECS))
+                .await?;
         }
         if remove_storage {
             self.lume.delete(&vm).await?;
