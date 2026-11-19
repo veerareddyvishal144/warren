@@ -72,7 +72,7 @@ USAGE:
                                when it exits (health reports it under \"wrapped\"), and on SIGTERM or
                                SIGINT it receives SIGTERM, then SIGKILL after 10 s, before the gateway
                                exits with its exit code. Without a command, wrap mode just serves.
-    warren-gateway --init      run as PID 1 inside a microVM, then serve
+    warren-gateway --init      run as PID 1 inside a microVM, then serve (Linux only)
     warren-gateway --version
     warren-gateway --help
 

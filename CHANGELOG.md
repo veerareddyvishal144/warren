@@ -4,6 +4,10 @@ All notable changes to Warren are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Changed
+
+- `warren-gateway` now builds on non-Linux hosts (macOS included): the PID 1 code in `init.rs` is compiled only on Linux and other targets get a stub, so `--init` and `POST /v1/shutdown` report `not_supported` there. Groundwork for macOS sandboxes.
+
 ## [0.1.0] - Unreleased
 
 The first release: a single-node platform in one Rust binary, free software you host yourself.

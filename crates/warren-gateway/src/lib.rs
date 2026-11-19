@@ -18,6 +18,10 @@ pub mod exec;
 pub mod extract;
 pub mod files;
 pub mod health;
+// PID 1 duties (mounts, hostname, network, power-off) only exist on Linux;
+// other hosts get a stub so the gateway itself still builds, for example when
+// it runs inside a macOS virtual machine.
+#[cfg_attr(not(target_os = "linux"), path = "init_stub.rs")]
 pub mod init;
 pub mod owner;
 pub mod responses;
