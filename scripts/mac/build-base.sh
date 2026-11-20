@@ -279,11 +279,12 @@ if [ "$KEY_WORKED" = 0 ]; then
 fi
 # Password logins must now be refused (install.sh turned them off). With no
 # authentication offered, ssh fails and names the methods the server would
-# accept: "Permission denied (publickey)." is what the image must say. (BatchMode
-# refuses to type a password, so asking for password auth makes ssh fail at once
-# and print the list; asking for "none" prints nothing on macOS's ssh.)
-METHODS="$(ssh "${SSH_OPTS[@]}" -o ControlMaster=no -o ControlPath=none -o BatchMode=yes \
-    -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive "$REMOTE" true 2>&1 || true)"
+# accept. The debug line "Authentications that can continue: publickey" is
+# what the image must say; the final "Permission denied" message is not printed
+# reliably by macOS's ssh, so the verbose log is read instead.
+METHODS="$(ssh "${SSH_OPTS[@]}" -v -o ControlMaster=no -o ControlPath=none -o BatchMode=yes \
+    -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive "$REMOTE" true 2>&1 \
+    | sed -n 's/.*Authentications that can continue: //p' | head -n 1 || true)"
 case "$METHODS" in
     *password*|*keyboard-interactive*)
         log "warning: the guest's sshd still offers password authentication ($METHODS); the hardening in install.sh did not take" ;;
