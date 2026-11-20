@@ -24,6 +24,7 @@ pub mod health;
 #[cfg_attr(not(target_os = "linux"), path = "init_stub.rs")]
 pub mod init;
 pub mod owner;
+pub mod pty;
 pub mod responses;
 pub mod server;
 pub mod sessions;
