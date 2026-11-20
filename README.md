@@ -1,156 +1,111 @@
 # Warren
 
-Warren gives every AI agent, or every end user of your product, a persistent Linux computer of its own: a container under gVisor (or a Firecracker microVM) with a real shell, a home directory that survives restarts, a browser terminal, a files API and an optional built-in agent, all reachable over HTTPS at a URL derived from the instance id. Instances sleep when idle and keep only their disk; a single API key drives both the control plane and the instances themselves.
+**Agent sandboxes on hardware you own.** Linux containers (gVisor), Linux microVMs (Firecracker) and real macOS virtual machines (Apple silicon) behind one API, one CLI and one MCP server. Works with Claude Code, Codex, Cursor, Caret and any MCP client.
 
-Warren is a single Rust binary (`warrend`) that runs the whole platform on one Linux host: Sandbox API, edge proxy, lifecycle and cron. A second small binary (`warren-gateway`) runs inside every instance and serves the Agent API, the files API and exec. Everything is open source under Apache-2.0, and the whole wire contract fits in one document: [docs/API.md](docs/API.md).
+Every instance is a persistent computer: a shell, a home directory that survives sleep and restarts, a files API, an optional Agent API and an HTTPS URL for every port it listens on. Instances sleep when idle and wake on the next request; macOS instances keep their memory and processes across sleep. One Rust binary (`warrend`) runs the whole platform on one host, a second (`warren-gateway`) runs inside every instance, and the wire contract fits in one document: [docs/API.md](docs/API.md). Apache-2.0. No billing, no meter: you supply the machine.
+
+## Three commands
+
+Install the `warren` binary ([docs/install.md](docs/install.md)), then:
+
+```bash
+warren up                 # start the daemon on this machine with the runtimes it finds
+warren connect claude     # register Warren's MCP server with Claude Code
+warren run -- claude      # create an instance and run Claude Code inside it
+```
+
+On an Apple silicon Mac with Lume and a base image, `warren up` serves macOS instances; on a Linux host with Docker it serves gVisor containers. [docs/quickstart.md](docs/quickstart.md) walks through the first instance, [docs/run.md](docs/run.md) covers `warren run`, and [docs/macos.md](docs/macos.md) prepares a Mac.
 
 ## Features
 
 | Feature | What you get |
 |---|---|
-| Persistent computers | Debian 12 with Node 24, Python 3, git and build tools; `/home/agent` persists across sleep, stop, restart, resize and template updates. |
-| One URL per instance | `https://<id>.<base>/` reaches the default port, `https://<id>-<port>.<base>/` reaches any port a process listens on. WebSockets pass through. |
-| Two planes, one key | The same `sk_live_...` key authenticates the Sandbox API (`api.<base>/v1`) and every instance URL. Signed URLs and a cookie let browsers in without the key. |
-| Auto-sleep and wake on request | Idle instances stop and keep only their disk; the first request to any of their URLs wakes them and is held until the gateway answers. |
-| Agent API | `POST /v1/responses` with sessions, SSE streaming, cancel and replay, on the built-in agent (any OpenAI-compatible model), OpenCode, or your own command. |
-| Files and exec | List, read, write, move, delete and download the home directory over HTTP; run shell commands with a captured exit code, stdout and stderr. |
-| Browser terminal | `ttyd` on port 7681 inside every instance, opened with a signed URL from the dashboard or the API. |
-| Templates | Three built-in images plus your own: register any Linux image (Alpine included) and Warren injects its static gateway and wraps the image's own entrypoint, so files, exec and health work without changing the image. Publish revisions, pin instances to `name@rev`, update in place. |
-| Fork, backup, restore, resize | Copy an instance with its disk, take backups without stopping, restore, grow the disk or change the shape. |
-| Crons | Scheduled prompts for agent instances; each firing wakes the instance and runs one turn. |
-| Capacity quota | An optional cap on how many instances a workspace may keep awake at once (`--max-awake-instances`); sleeping and stopped instances never count. |
-| Isolation | gVisor (`runsc`) for the default type; Firecracker microVMs for the experimental `vm` type; macOS virtual machines through Lume on Apple silicon hosts for the `mac` type ([docs/macos.md](docs/macos.md)). |
-| Clients | `warren` CLI, an MCP server for Claude Code and Cursor, a Rust SDK, one-file Python and TypeScript clients, a dashboard. |
+| Persistent computers | Linux: Debian 12 with Node 24, Python 3, git and build tools, `/home/agent` persists across sleep, stop, restart, resize and template updates. macOS: a full macOS guest whose disk is the home. |
+| Real macOS instances | A macOS VM per instance on an Apple silicon Mac (`warren-macos` template, type `mac`): Xcode, the Simulator, Safari, anything that needs macOS. Same API, URLs, gateway and crons as every other instance. |
+| Sleep with memory | macOS instances suspend in 3 to 4 s and resume in 5 to 11 s with every process intact and the same pids. Linux instances keep their disk across sleep; memory checkpoints are on the roadmap. |
+| Fork, backup, restore, resize | Copy an instance with its disk, take backups without stopping, restore, grow the disk or change the shape. On macOS forks and backups are APFS clones: instant, sharing blocks until writes diverge. |
+| Two guests per Mac | Apple's limit, enforced before anything is cloned: a third macOS instance answers `409 host_capacity_reached`. Sleeping frees a slot, so a Mac serves many instances two at a time. |
+| One URL per instance | `https://<id>.<base>/` reaches the default port, `https://<id>-<port>.<base>/` any port. WebSockets pass through; signed URLs let browsers in without the key. |
+| Two planes, one key | The same `sk_live_...` key drives the Sandbox API (`api.<base>/v1`) and every instance URL; nothing inside an instance ever sees it. |
+| Auto-sleep and wake on request | Idle instances sleep; the first request to any of their URLs wakes them and is held until the gateway answers. |
+| Agent API | `POST /v1/responses` with sessions, SSE streaming, cancel and replay, on the built-in agent (any OpenAI-compatible model), OpenCode or your own command. Crons wake an instance and run a turn on a schedule. |
+| Files and exec | List, read, write, move, delete and download the home over HTTP; run commands with captured exit code, stdout and stderr. |
+| Templates | Built-in Linux and macOS images plus your own: register any Linux image and Warren injects its static gateway. Revisions, `name@rev` pins, in-place updates. |
+| Egress allowlist and secret broker | **New in this release**: a per-instance domain allowlist enforced by a host proxy, and provider keys that stay on the host and are injected on the way out. See [docs/security-model.md](docs/security-model.md). |
+| Clients | `warren` CLI, MCP server, Rust SDK, one-file Python and TypeScript clients, a dashboard. |
 
-## Quickstart (90 seconds)
+## How it compares
 
-Prerequisites: a Linux x86_64 host with Docker (24 or newer) that your user can talk to, a Rust toolchain (1.90 or newer), the musl target for the static gateway (`make musl-setup` installs `musl-tools` and `rustup target add x86_64-unknown-linux-musl`), `git`, `curl` and, for the examples below, `jq`.
+Claude Code's `/sandbox` wraps the Bash tool on your own machine; Docker Sandboxes gives Claude a Linux microVM on a Mac; E2B, Daytona and Modal rent Linux sandboxes by the hour; Daytona now rents Macs by the day. Warren is the one that runs Linux and macOS instances on hardware you own behind one API, and it is also newer, slower to start than the clouds, single node and without a screen for macOS yet. The full table, with sources and an honest list of where Warren is behind: [docs/compare.md](docs/compare.md).
 
-```bash
-git clone https://github.com/veerareddyvishal144/warren.git && cd warren
-sudo scripts/install-gvisor.sh    # optional but recommended: runs default instances under gVisor
-make musl-setup                    # one-time: musl-tools and the x86_64-unknown-linux-musl target
-make images                        # builds the static warren-gateway and the warren/base, warren/agent, warren/opencode images
-make dev-up                        # runs warrend --dev on :7337 with data under ./data
-```
+## Instance types
 
-In a second shell, sign up, create an instance, run a command and open its terminal:
+| | `default` | `vm` (experimental) | `mac` |
+|---|---|---|---|
+| Isolation | Container under gVisor (`runsc`); `runc` fallback for development | Firecracker microVM with its own kernel | macOS VM (Virtualization.framework through Lume); at most two per host |
+| Host | Linux x86_64 with Docker | Linux x86_64, root, `/dev/kvm`, a Firecracker binary and a kernel | Apple silicon Mac, macOS 14+, Lume 0.7.2+, a base VM (`--mac-base-vm`) |
+| Disk | 2 GB to the shape's maximum (12 / 20 / 40 / 80 GB) | 2 to 100 GB | The base image's size up to 500 GB, grow only |
+| Sleep | Stop, keep the disk, boot on request | Same | Suspend; memory and processes survive |
+| Screen | Browser terminal (`ttyd`) | Browser terminal | Not yet (Phase 2) |
 
-```bash
-export WARREN_API=http://api.warren.localhost:7337/v1
-
-# 1. A workspace and a key
-curl -s -X POST $WARREN_API/signup -H 'Content-Type: application/json' -d '{"name":"me"}'
-# {"workspace":{"id":"ws_...","name":"me","created_at":...},"api_key":"sk_live_...","key_id":"..."}
-export WARREN_API_KEY=sk_live_...      # paste the api_key from the response
-AUTH="Authorization: Bearer $WARREN_API_KEY"
-
-# 2. An instance (defaults: template warren-base, 2 vCPU / 4 GB RAM / 4 GB disk)
-ID=$(curl -s -X POST $WARREN_API/instances -H "$AUTH" -H 'Content-Type: application/json' \
-  -d '{"name":"first","auto_sleep":true}' | jq -r .id)
-until [ "$(curl -s $WARREN_API/instances/$ID -H "$AUTH" | jq -r .status)" = running ]; do sleep 1; done
-
-# 3. Run a command in it
-curl -s -X POST $WARREN_API/instances/$ID/exec -H "$AUTH" -H 'Content-Type: application/json' \
-  -d '{"command":"uname -a && whoami && node --version && python3 --version"}'
-# {"exit_code":0,"stdout":"Linux ...\nagent\nv24...\nPython 3.11...\n","stderr":"","duration_ms":...}
-
-# 4. A browser terminal via a signed URL (valid one hour), then open the url it prints
-curl -s "$WARREN_API/instances/$ID/signed-url?port=7681&ttl=3600" -H "$AUTH"
-# {"url":"http://ab12cd34ef-7681.warren.localhost:7337/?warren_token=...","expires_at":...}
-```
-
-Chrome, Firefox and hosts running systemd-resolved resolve `*.localhost` to the loopback address, so the instance URLs work in a browser and in curl without DNS setup; on other hosts add `--resolve api.warren.localhost:7337:127.0.0.1` (and the same for each instance host) to curl, or add the names to `/etc/hosts`. The dashboard is at `http://warren.localhost:7337/`; paste the key there to see your instances. [docs/quickstart.md](docs/quickstart.md) continues with the built-in agent, files, sleep and wake.
+Shapes are `2/4`, `4/8`, `4/16` and `4/32` vCPU/GB; `mac` needs at least 4 GB. Details in [docs/instances.md](docs/instances.md), [docs/vm-instances.md](docs/vm-instances.md), [docs/macos.md](docs/macos.md) and [docs/limits.md](docs/limits.md).
 
 ## Architecture
 
 ```
-          https://api.<base>/v1                https://<id>.<base>/          https://<id>-<port>.<base>/
-          Sandbox API (Bearer sk_live_...)      instance, default port        instance, any port
-                     |                          key, signed URL or cookie     key, signed URL or cookie
-                     |                                     |                            |
-+--------------------v-------------------------------------v----------------------------v---------+
-| warrend  (one process, one listener, default :7337)                                              |
-|                                                                                                  |
-|  warren-edge        Host header dispatch, instance auth, wake-on-request, reverse proxy, CORS    |
-|     |        |                                                                                   |
-|     v        v                                                                                   |
-|  warren-api  warren-dashboard                                                                    |
-|  /v1 routes  single-page UI at https://<base>/                                                   |
-|     |                                                                                            |
-|     v                                                                                            |
-|  warren-lifecycle   the only mover of instance status: create, start, stop, sleep, wake, fork,   |
-|     |               resize, update, backups, idle sleeper, reconciler, metrics sampler, quota    |
-|     |-- warren-templates   built-in catalog, workspace images, revisions and pins                |
-|     |-- warren-cron        due prompts every 30 s -> POST /v1/responses inside the instance      |
-|     v                                                                                            |
-|  Runtime trait  --> warren-runtime-docker (gVisor runsc, runc fallback)                          |
-|                 --> warren-runtime-firecracker (microVMs, experimental)                          |
-|                 --> warren-runtime-mac (macOS VMs through Lume, Apple silicon hosts)             |
-|  warren-store   SQLite at <data>/warren.db                                                       |
-+-----------------------------------------------|--------------------------------------------------+
-                                                | docker / firecracker
-            +-----------------------------------v------------------+   +-------------------------+
-            | instance ab12cd34ef (container or microVM)           |   | instance cd34ef56ab     |
-            |  warren-gateway :3737   Agent API, files, exec, health|   |  ...                    |
-            |  ttyd           :7681   browser terminal              |   +-------------------------+
-            |  /home/agent            persistent disk =             |
-            |                         <data>/instances/<id>/home    |
-            +------------------------------------------------------+
+  https://api.<base>/v1          https://<id>.<base>/        https://<id>-<port>.<base>/
+  Sandbox API (Bearer key)       instance, default port      instance, any port
+            |                              |                           |
++-----------v------------------------------v---------------------------v-----------+
+| warrend  (one process, one listener)                                             |
+|  warren-edge        host dispatch, auth, wake-on-request, reverse proxy          |
+|  warren-api         /v1       warren-dashboard   UI at https://<base>/           |
+|  warren-lifecycle   create, start, stop, sleep, wake, fork, backups, quota       |
+|  warren-templates   catalog, revisions, pins     warren-cron   scheduled turns   |
+|  Runtime trait  -> warren-runtime-docker       (gVisor runsc, runc fallback)     |
+|                 -> warren-runtime-firecracker  (microVMs, Linux, root)           |
+|                 -> warren-runtime-mac          (macOS VMs through lume serve)    |
+|  warren-store       SQLite at <data>/warren.db                                   |
++----------------------------------------|-----------------------------------------+
+                                         |
+      +----------------------------------v-----------+   +------------------------+
+      | instance ab12cd34ef (container, microVM, VM) |   | instance cd34ef56ab    |
+      |  warren-gateway :3737  Agent API, files, exec|   |  ...                   |
+      |  ttyd :7681 (Linux)    browser terminal      |   +------------------------+
+      |  persistent home       the disk              |
+      +----------------------------------------------+
 ```
 
-Every crate depends on `warren-core` (types, traits, errors, config) and on nothing else inside the workspace; `warrend` wires them together. [docs/DESIGN.md](docs/DESIGN.md) describes each crate.
-
-## Capacity and quotas
-
-Warren is free software you host yourself. It does no billing: there is no wallet, no metering and no price on anything; the only limit on a workspace is the host's capacity and, if you set one, an awake quota. Operators who run Warren as a hosted service build their own billing on top of the API, which exposes everything needed for it: the instance list, each instance's status, shape (`resources`) and uptime (`started_at`, `last_activity_at`, per-minute `metrics`).
-
-The host's vCPUs and RAM are the real limit: every awake instance holds its full shape, while sleeping and stopped instances hold only their disk. To keep one workspace from taking the whole machine, start the daemon with `--max-awake-instances N` (`WARREN_MAX_AWAKE_INSTANCES`). Unset means unlimited.
-
-```bash
-target/release/warrend --dev --data-dir ./data --max-awake-instances 3
-```
-
-The quota counts instances that are `provisioning`, `running`, `starting`, `restarting`, `updating`, `stopping` or `waking`. Create, start, wake and fork answer `409 instance_limit_reached` with `details: { "limit", "awake" }` when the workspace is at the limit; `GET /v1/workspace` returns `awake_limit` (a number, or `null` when unlimited) and `awake_count`. Auto-sleep is how you keep many instances alive with few slots. Details: [docs/quotas.md](docs/quotas.md).
-
-| Shape (vCPU / GB RAM) | Default disk | Disk range, `default` | Disk range, `vm` |
-|---|---|---|---|
-| 2 / 4 | 4 GB | 2 - 12 GB | 2 - 100 GB |
-| 4 / 8 | 6 GB | 2 - 20 GB | 2 - 100 GB |
-| 4 / 16 | 12 GB | 2 - 40 GB | 2 - 100 GB |
-| 4 / 32 | 24 GB | 2 - 80 GB | 2 - 100 GB |
-
-## Instance types
-
-| | `default` | `vm` (experimental) | `mac` | `performance` |
-|---|---|---|---|---|
-| Isolation | Container under gVisor (`runsc`); `runc` fallback for development | Firecracker microVM with its own kernel | macOS virtual machine (Virtualization.framework through Lume); at most two per host | Reserved for hosts with pinned cores |
-| Host needs | Docker | Root, `/dev/kvm`, a Firecracker binary and a kernel | An Apple silicon Mac with Lume 0.7.2+ and a base VM (`--mac-base-vm`) | Not available in this build: `not_supported` |
-| Disk | 2 GB up to the shape's maximum (12 / 20 / 40 / 80 GB) | 2 GB up to 100 GB | The base image's size up to 500 GB, grow only | - |
-| Exec | `docker exec` | the in-instance gateway, authenticated with a per-instance token | Same as `vm` | - |
-| Sleep and wake | Stop the container, keep the disk, boot on request | Same | Suspend the VM; memory and processes survive | - |
-
-Shapes are the four CPU/RAM pairs above (`2/4`, `4/8`, `4/16`, `4/32`); a requested CPU count above 4 is clamped to 4 while keeping the requested memory. See [docs/instances.md](docs/instances.md), [docs/vm-instances.md](docs/vm-instances.md) and [docs/macos.md](docs/macos.md).
+Every crate depends on `warren-core` and nothing else in the workspace; `warrend` wires them together. [docs/DESIGN.md](docs/DESIGN.md) describes each crate.
 
 ## Clients
 
-- **CLI**: `cargo build --release -p warren-cli` builds `target/release/warren`. `warren signup`, `warren instances create --template warren-agent --wait`, `warren instances exec <id> -- uname -a`, `warren chat <id> "hello"`, `warren instances open <id> --port 7681`.
-- **MCP server** for Claude Code, Cursor, Claude Desktop and Windsurf: [mcp/README.md](mcp/README.md).
-- **Rust SDK**: `warren-sdk`, a client for both the Sandbox API and the Agent API, used by the CLI, the MCP server and the end-to-end tests.
-- **Python and TypeScript**: one-file, dependency-free clients for both APIs, including streaming chat: [sdk/python](sdk/python/README.md) (Python 3.8+, standard library only) and [sdk/typescript](sdk/typescript/README.md) (`fetch`-based; Node 20+, Deno, Bun, browsers).
-- **Dashboard**: served at the root host; stores the key locally in the browser.
-- **For coding agents**: [docs/for-agents.md](docs/for-agents.md) has a prompt to paste and [docs/llms.txt](docs/llms.txt) indexes every page.
+- **CLI**: `warren up`, `warren connect claude`, `warren run -- <command>`, `warren instances create --template warren-macos --wait`, `warren instances exec <id> -- uname -a`, `warren chat <id> "hello"`, `warren instances open <id> --port 7681`.
+- **MCP server** for Claude Code, Codex, Cursor, Claude Desktop and Windsurf: [mcp/README.md](mcp/README.md). Caret workspaces target a template by name (`warren.template: warren-macos`).
+- **Rust SDK** (`warren-sdk`), one-file **Python** and **TypeScript** clients ([sdk/python](sdk/python/README.md), [sdk/typescript](sdk/typescript/README.md)), and a **dashboard** at the root host.
+- **For coding agents**: a prompt to paste in [docs/for-agents.md](docs/for-agents.md) and an index in [docs/llms.txt](docs/llms.txt).
+
+## Status
+
+- **Version 0.1.0, unreleased.** No tag and no published binaries yet; the launch work is tracked in [docs/launch-checklist.md](docs/launch-checklist.md).
+- **Single node.** One daemon drives one host. Multi-node placement is roadmap.
+- **Linux `default` type** is exercised end to end in CI under Docker. **`vm` (Firecracker)** is experimental and tested on one machine.
+- **macOS Phase 1 is verified on one Mac**: a MacBook Pro (Apple silicon, 16 GiB) running `scripts/mac/e2e.sh` on 2026-11-19, twice in a row: create, exec, sleep and wake with processes intact, daemon restart with the VM adopted, fork, guest isolation, host capacity, delete. The numbers and their method are in [docs/benchmarks.md](docs/benchmarks.md). It has not run on a second Mac, a Mac mini, or any other macOS host version.
+- **New in this release and not yet exercised beyond the development machines**: `warren up`, `warren connect` and `warren run`; the egress allowlist and secret broker; the install path in [docs/install.md](docs/install.md). Treat them as fresh.
+- **Not done**: a screen for macOS instances, `deny-all` on macOS guests, memory checkpoints for Linux, TLS in the daemon (use a proxy), an audit log. The complete list is [docs/limits.md](docs/limits.md).
 
 ## Documentation
 
-[docs/index.md](docs/index.md) lists every page. Start with [quickstart](docs/quickstart.md), [concepts](docs/concepts.md), [instances](docs/instances.md), [agent API](docs/agent-api.md), [self-hosting](docs/self-hosting.md) and [security](docs/security.md). The wire contract is [docs/API.md](docs/API.md); development rules are in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+[docs/index.md](docs/index.md) lists every page. Start with [install](docs/install.md), [quickstart](docs/quickstart.md), [run](docs/run.md) and [concepts](docs/concepts.md); then [instances](docs/instances.md), [templates](docs/templates.md), [macOS](docs/macos.md), [security model](docs/security-model.md), [limits](docs/limits.md) and [self-hosting](docs/self-hosting.md). The wire contract is [docs/API.md](docs/API.md); development rules are in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## Roadmap
 
-- **Memory checkpoints**: gVisor checkpoint/restore and Firecracker snapshots so sleep keeps processes and memory, not only files (`mac` instances already get this from Lume suspend). The API does not change.
-- **macOS sandboxes, next phases**: screen access through the edge (noVNC) and Linux guests on Mac hosts; the `mac` type itself and its limits are in [docs/macos.md](docs/macos.md).
+- **Screen for macOS instances**: noVNC through the edge, then a screenshot and input API for agents that need to see.
+- **Memory checkpoints for Linux**: gVisor checkpoint/restore and Firecracker snapshots so sleep keeps processes and memory on every type (`mac` already does through Lume suspend). The API does not change.
+- **Linux guests on Mac hosts**, outside the two-guest limit, as cheap extra capacity on the same machine.
+- **Harden the Mac host**: `deny-all` and host-wide egress drops with `pf`, one `lume serve` per instance, and in time a runtime on Virtualization.framework without Lume.
+- **Secrets at rest**: encrypt instance env and brokered secrets with a key kept outside the data directory.
 - **Multi-node scheduler**: place instances across hosts; the `region` field is already on every instance.
-- **Allowlist egress**: per-instance outbound rules beyond today's `allow-all` and `deny-all`. 0.1.0 already blocks cloud metadata (`169.254.0.0/16`) and, unless `--allow-private-egress` is set, private ranges host-wide; the allowlist adds per-instance destinations.
 - **Cloudflare edge**: terminate TLS and authenticate at the edge, with the daemon as origin.
 
 ## License
