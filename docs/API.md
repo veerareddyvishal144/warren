@@ -110,6 +110,10 @@ Processes the gateway starts for users (`/v1/exec` children, the drivers' shells
 - `POST /v1/shutdown` -> `{ "status": "powering_off" }` in microVM init mode, else `400 not_supported`.
 - `GET /v1/stats` -> `{ "at": unix seconds, "cpu_percent": 0..100, "memory_bytes", "memory_limit_bytes", "disk_bytes" }`: the guest's own view of its CPU, memory and the filesystem holding the home. Linux reads `/proc` and the cgroup limit; macOS reads `vm_stat`, `sysctl` and the 1-minute load (an approximation of CPU). The daemon uses it for `mac` instances, whose VMs it cannot measure from the host. Token required.
 
+#### Interactive PTY (`GET /v1/pty`)
+A WebSocket upgrade on the instance host (`ws(s)://<id>.<base>/v1/pty`, edge-authenticated like every instance route). The gateway starts `/bin/sh -l` on a pseudo-terminal as the home owner, with the same environment hiding as `/v1/exec`. Query parameters: `cmd` (a shell command run through `/bin/sh -lc` instead of a login shell), `cwd` (relative to the home), `cols` and `rows` (initial size, default 80x24), `term` (default `xterm-256color`). Binary frames carry terminal bytes both ways; a text frame `{"type":"resize","cols":N,"rows":N}` resizes; when the process exits the gateway sends `{"type":"exit","code":N}` and closes. Closing the socket hangs up and then kills the process group. The CLI's `warren shell` and `warren run` use it (see [run.md](run.md)).
+
+
 Agent drivers (selected by `WARREN_AGENT_DRIVER`):
 - `echo`: deterministic for tests. Replies `echo: <input>`; an input starting with `!` runs the rest as a shell command and replies with its combined output; `!!sleep N` style commands are allowed. Streams the reply in at least two deltas.
 - `openai`: an agent loop against an OpenAI-compatible chat-completions endpoint (`OPENAI_BASE_URL`, `OPENAI_API_KEY`, model from `WARREN_MODEL`) with tools `run_shell(command)`, `read_file(path)`, `write_file(path, content)`, `list_dir(path)`; at most 12 tool iterations per turn; session history is the message list; streams the final answer.

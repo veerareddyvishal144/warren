@@ -76,3 +76,7 @@ warren instances exec ab12cd34ef --user root --timeout 60 -- apt-get install -y 
 ```
 
 The CLI exits with the command's exit code and prints stdout and stderr to the matching streams, so it composes with shell pipelines.
+
+## Interactive terminals
+
+Exec captures output when the command ends. For an interactive session use the gateway's `GET /v1/pty` WebSocket (a pseudo-terminal running a login shell or one command), which the CLI exposes as `warren shell <id>` and uses for `warren run -- <command>`; see [run.md](run.md) and the PTY subsection in [API.md](API.md).
