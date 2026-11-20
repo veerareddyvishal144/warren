@@ -101,17 +101,33 @@ lume_vm_names() { lume ls -f json 2>/dev/null | jq -r '.. | objects | select(has
 # Instance VMs are warren-<instance id> (a letter and nine lowercase alphanumerics);
 # the base VM and other warren-* names are not leftovers.
 instance_vm_names() { lume_vm_names | grep -E '^warren-[a-z][a-z0-9]{9}$' | grep -vxF "$BASE_VM" || true; }
-LEFTOVERS="$(instance_vm_names)"
+# Only VMs this data directory created are ours to remove: a VM whose share
+# folder lives under $DATA/mac/<id> came from an earlier run of this script
+# with the same --data-dir. Any other warren-* VM belongs to another daemon on
+# this Mac (for example the one a Caret workspace uses) and is left alone.
+LEFTOVERS="" FOREIGN=""
+for vm in $(instance_vm_names); do
+    id="${vm#warren-}"
+    if [ -d "$DATA/mac/$id" ]; then LEFTOVERS="$LEFTOVERS $vm"; else FOREIGN="$FOREIGN $vm"; fi
+done
 if [ -n "$LEFTOVERS" ]; then
     if [ "$CLEAN" = 1 ]; then
         for vm in $LEFTOVERS; do
-            log "removing leftover VM $vm"
+            log "removing leftover VM $vm (created by an earlier run with this data dir)"
             if [ "$(lume get "$vm" -f json | jq -r '(if type=="array" then .[0] else . end) | .status // empty')" = running ]; then lume stop "$vm" || true; fi
             lume delete "$vm" --force
         done
     else
-        die "stale VMs from an earlier run occupy slots: $(printf '%s ' $LEFTOVERS); rerun with --clean-leftovers or lume delete <vm> --force"
+        die "stale VMs from an earlier run occupy slots:$LEFTOVERS; rerun with --clean-leftovers or lume delete <vm> --force"
     fi
+fi
+if [ -n "$FOREIGN" ]; then
+    RUNNING_FOREIGN=0
+    for vm in $FOREIGN; do
+        [ "$(lume get "$vm" -f json | jq -r '(if type=="array" then .[0] else . end) | .status // empty')" = running ] && RUNNING_FOREIGN=$((RUNNING_FOREIGN + 1))
+    done
+    log "other daemons' VMs on this Mac (left alone):$FOREIGN ($RUNNING_FOREIGN running)"
+    [ "$RUNNING_FOREIGN" -eq 0 ] || die "$RUNNING_FOREIGN foreign macOS guest(s) running; the scenario needs both slots. Sleep or stop them first (never delete another daemon's VMs here)"
 fi
 
 # --- bookkeeping -----------------------------------------------------------------------

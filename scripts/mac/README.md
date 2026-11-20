@@ -97,7 +97,8 @@ wake, restart, fork and delete seconds, exits non-zero on any failure and then s
 40 lines of `data-mac-e2e/warrend.log`. Flags: `--base-vm`, `--port`,
 `--data-dir`, `--base-domain`, `--keep` (leave the instances and the daemon
 running), `--skip-build`, `--clean-leftovers` (delete stale `warren-*` VMs
-from an earlier run before starting).
+from an earlier run with the same `--data-dir` before starting; VMs of other
+daemons on the Mac are never touched, and a running one aborts the run).
 
 Requests go to `http://127.0.0.1:PORT` with a `Host:` header
 (`api.warren.localhost:PORT`, `<id>.warren.localhost:PORT`) because macOS's
