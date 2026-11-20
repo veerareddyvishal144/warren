@@ -15,9 +15,9 @@ use std::{
 
 use warren_core::{
     ApiKey, Backup, Clock, Config, CreateInstanceRequest, Cron, DEFAULT_IDLE_TIMEOUT_SEC, Error,
-    ExecRequest, ExecResult, ForkRequest, Instance, InstanceStatus, InstanceType, Lifecycle,
-    LogsOptions, MetricPoint, PatchInstanceRequest, RegisterTemplateRequest, Result, Shape,
-    ShapeRequest, Store, Template, TemplateScope, TemplateService, Workspace, ids, shapes,
+    ExecRequest, ExecResult, ForkRequest, Instance, InstanceSecret, InstanceStatus, InstanceType,
+    Lifecycle, LogsOptions, MetricPoint, PatchInstanceRequest, RegisterTemplateRequest, Result,
+    Shape, ShapeRequest, Store, Template, TemplateScope, TemplateService, Workspace, ids, shapes,
 };
 
 macro_rules! boxed {
@@ -66,6 +66,8 @@ pub struct Tables {
     pub metrics: Vec<(String, MetricPoint)>,
     pub backups: Vec<Backup>,
     pub crons: Vec<Cron>,
+    /// Write-only instance secrets; nothing in the API reads them back.
+    pub secrets: Vec<InstanceSecret>,
 }
 
 /// `Store` on top of a mutex-guarded set of tables.
@@ -228,6 +230,16 @@ impl Store for MemStore {
                 .values()
                 .filter(|i| i.workspace_id == workspace_id && i.template_name == name && i.status != InstanceStatus::Deleted)
                 .count() as u32)
+        }
+
+        fn replace_instance_secrets<'a, 'b, 'c>(&'a self, instance_id: &'b str, secrets: &'c [InstanceSecret]) -> Result<()> {
+            let mut t = self.lock();
+            t.secrets.retain(|s| s.instance_id != instance_id);
+            t.secrets.extend(secrets.iter().cloned());
+            Ok(())
+        }
+        fn list_instance_secrets<'a, 'b>(&'a self, instance_id: &'b str) -> Result<Vec<InstanceSecret>> {
+            Ok(self.lock().secrets.iter().filter(|s| s.instance_id == instance_id).cloned().collect())
         }
 
         fn insert_metric<'a, 'b>(&'a self, instance_id: &'b str, p: MetricPoint) -> Result<()> {

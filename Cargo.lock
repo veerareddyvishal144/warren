@@ -3359,6 +3359,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "warren-api",
+ "warren-broker",
  "warren-core",
  "warren-cron",
  "warren-dashboard",

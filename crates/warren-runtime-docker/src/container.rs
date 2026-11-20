@@ -66,11 +66,13 @@ pub(crate) fn env_pairs(env: &BTreeMap<String, String>) -> Vec<String> {
     env.iter().map(|(k, v)| format!("{k}={v}")).collect()
 }
 
-/// The Docker network implementing a network policy.
+/// The Docker network implementing a network policy: `allowlist` instances
+/// sit on the internal bridge like `deny-all` ones and reach the host-side
+/// broker only (see `netpolicy::broker_rules`).
 pub(crate) fn network_for(mode: NetworkMode) -> &'static str {
     match mode {
         NetworkMode::AllowAll => NETWORK_PUBLIC,
-        NetworkMode::DenyAll => NETWORK_INTERNAL,
+        NetworkMode::DenyAll | NetworkMode::Allowlist => NETWORK_INTERNAL,
     }
 }
 
@@ -593,6 +595,7 @@ mod tests {
         assert_eq!(nano_cpus(2), 2_000_000_000);
         assert_eq!(network_for(NetworkMode::AllowAll), NETWORK_PUBLIC);
         assert_eq!(network_for(NetworkMode::DenyAll), NETWORK_INTERNAL);
+        assert_eq!(network_for(NetworkMode::Allowlist), NETWORK_INTERNAL);
         let env = BTreeMap::from([
             ("B".to_string(), "2".to_string()),
             ("A".to_string(), "x=y".to_string()),

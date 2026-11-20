@@ -17,7 +17,7 @@ use warren_core::{
 
 use crate::{
     Deps, Manager,
-    fakes::{FakeClock, FakeRuntime, FakeStore, FakeTemplates},
+    fakes::{FakeBroker, FakeClock, FakeRuntime, FakeStore, FakeTemplates},
 };
 
 const NOW: i64 = 1_800_000_000;
@@ -31,6 +31,7 @@ const BASE_SHAPE: Shape = Shape {
 struct Env {
     store: Arc<FakeStore>,
     runtime: Arc<FakeRuntime>,
+    broker: Arc<FakeBroker>,
     templates: Arc<FakeTemplates>,
     clock: Arc<FakeClock>,
     mgr: Arc<Manager>,
@@ -53,6 +54,7 @@ impl Env {
         };
         tweak(&mut cfg);
         let templates = FakeTemplates::new(cfg.system_templates());
+        let broker = FakeBroker::new();
         let mut runtimes: HashMap<InstanceType, Arc<dyn Runtime>> = HashMap::new();
         runtimes.insert(InstanceType::Default, runtime.clone());
         // The same fake serves `mac`, so a template that implies the type can
@@ -70,11 +72,13 @@ impl Env {
             templates: templates.clone(),
             config: cfg.clone(),
             clock: clock.clone(),
+            broker: Some(broker.clone()),
         })
         .expect("manager");
         Env {
             store,
             runtime,
+            broker,
             templates,
             clock,
             mgr,
@@ -239,6 +243,8 @@ async fn create_honours_every_option() {
         auto_sleep: Some(true),
         idle_timeout_seconds: Some(600),
         network: Some(NetworkMode::DenyAll),
+        allowed_domains: None,
+        secrets: None,
     };
     let inst = env.create(req).await;
     assert_eq!(inst.template_name, "warren-agent");
@@ -847,6 +853,8 @@ async fn patch_fields_and_network_change() {
                 auto_sleep: Some(true),
                 idle_timeout_seconds: Some(1200),
                 network: None,
+                allowed_domains: None,
+                secrets: None,
             },
         )
         .await
@@ -1943,6 +1951,7 @@ async fn manager_new_validates_deps() {
         templates: env.templates.clone(),
         config: Config::default(),
         clock: env.clock.clone(),
+        broker: None,
     })
     .err()
     .expect("no runtimes is an error");

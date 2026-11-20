@@ -14,8 +14,8 @@ use std::{
 use parking_lot::Mutex;
 use tokio::sync::OwnedMutexGuard;
 use warren_core::{
-    Clock, Config, Error, Instance, InstanceStatus, InstanceType, MAX_IDLE_TIMEOUT_SEC, Result,
-    Runtime, Runtimes, Store, Template, TemplateService,
+    BrokerRegistry, Clock, Config, Error, Instance, InstanceStatus, InstanceType,
+    MAX_IDLE_TIMEOUT_SEC, Result, Runtime, Runtimes, Store, Template, TemplateService,
 };
 
 /// Everything the lifecycle needs from the rest of the daemon.
@@ -25,6 +25,9 @@ pub struct Deps {
     pub templates: Arc<dyn TemplateService>,
     pub config: Config,
     pub clock: Arc<dyn Clock>,
+    /// The egress broker's table of running instances; `None` when the daemon
+    /// runs without a broker, which refuses `allowlist` instances and secrets.
+    pub broker: Option<Arc<dyn BrokerRegistry>>,
 }
 
 /// Orchestrates instances. Construct with [`Manager::new`], drive the

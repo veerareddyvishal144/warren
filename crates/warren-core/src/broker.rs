@@ -253,7 +253,10 @@ pub fn validate_secrets(secrets: &[SecretSpec]) -> Result<()> {
             )));
         }
         if s.value.is_empty() {
-            return Err(Error::invalid(format!("secret {} has an empty value", s.name)));
+            return Err(Error::invalid(format!(
+                "secret {} has an empty value",
+                s.name
+            )));
         }
         if s.value.len() > MAX_SECRET_VALUE_BYTES {
             return Err(Error::invalid(format!(
@@ -276,13 +279,13 @@ pub fn validate_secrets(secrets: &[SecretSpec]) -> Result<()> {
 /// `token x`); any other header carries the value as is.
 pub fn header_value(header: &str, value: &str) -> String {
     if header.eq_ignore_ascii_case("authorization") {
-        let has_scheme = value
-            .split_once(' ')
-            .is_some_and(|(scheme, rest)| {
-                !scheme.is_empty()
-                    && scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-                    && !rest.trim().is_empty()
-            });
+        let has_scheme = value.split_once(' ').is_some_and(|(scheme, rest)| {
+            !scheme.is_empty()
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && !rest.trim().is_empty()
+        });
         if !has_scheme {
             return format!("Bearer {value}");
         }
@@ -579,12 +582,8 @@ mod tests {
             assert_eq!(err.code, crate::errors::CODE_INVALID_REQUEST, "{s:?}");
         }
         // Duplicate names and env/name collisions across entries.
-        assert!(
-            validate_secrets(&[secret("A_KEY", "A_URL"), secret("A_KEY", "B_URL")]).is_err()
-        );
-        assert!(
-            validate_secrets(&[secret("A_KEY", "A_URL"), secret("B_KEY", "A_KEY")]).is_err()
-        );
+        assert!(validate_secrets(&[secret("A_KEY", "A_URL"), secret("A_KEY", "B_URL")]).is_err());
+        assert!(validate_secrets(&[secret("A_KEY", "A_URL"), secret("B_KEY", "A_KEY")]).is_err());
         let many: Vec<SecretSpec> = (0..=MAX_SECRETS)
             .map(|i| secret(&format!("K{i}"), &format!("U{i}")))
             .collect();
@@ -606,7 +605,11 @@ mod tests {
             route_token: "tok".into(),
             created_at: 1,
         };
-        let env = instance_env(NetworkMode::Allowlist, Some("172.18.0.1:7349"), &[stored.clone()]);
+        let env = instance_env(
+            NetworkMode::Allowlist,
+            Some("172.18.0.1:7349"),
+            &[stored.clone()],
+        );
         assert_eq!(env["WARREN_NETWORK"], "allowlist");
         assert_eq!(env["WARREN_BROKER"], "172.18.0.1:7349");
         for var in PROXY_VARS {

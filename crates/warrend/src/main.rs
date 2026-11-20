@@ -48,6 +48,16 @@ struct Args {
     /// off for a hosted service.
     #[arg(long, env = "WARREN_ALLOW_PRIVATE_EGRESS", default_value_t = false)]
     allow_private_egress: bool,
+    /// Where the egress broker (allowlist proxy and secret routes) listens;
+    /// it must be reachable from the instances' networks. `none` runs without
+    /// a broker, which refuses `allowlist` instances and secrets.
+    #[arg(long, env = "WARREN_BROKER_LISTEN", value_name = "HOST:PORT|none", default_value = warren_core::broker::DEFAULT_BROKER_LISTEN)]
+    broker_listen: String,
+    /// host:port instances use to reach the broker. Derived per runtime when
+    /// unset: the bridge gateway for Docker, 172.30.0.1 for Firecracker,
+    /// 192.168.64.1 for mac instances, each with the port of --broker-listen.
+    #[arg(long, env = "WARREN_BROKER_ADVERTISE", value_name = "HOST:PORT")]
+    broker_advertise: Option<String>,
     /// Instances one workspace may keep awake at once; unlimited when unset.
     #[arg(long, env = "WARREN_MAX_AWAKE_INSTANCES", value_name = "N")]
     max_awake_instances: Option<u32>,
@@ -108,6 +118,11 @@ impl Args {
             dev_mode: dev,
             signup_enabled: self.signup_enabled,
             allow_private_egress: self.allow_private_egress,
+            broker_listen: self.broker_listen,
+            broker_advertise_addr: self
+                .broker_advertise
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty()),
             max_awake_instances: self.max_awake_instances,
             min_idle_timeout_sec: self.min_idle_seconds.unwrap_or(if dev {
                 5
@@ -221,12 +236,43 @@ async fn main() -> anyhow::Result<()> {
         .ensure_system_templates()
         .await
         .context("system templates")?;
+
+    // The broker listens before any instance starts, so a registered instance
+    // never finds its proxy address closed. Its registry is the lifecycle's view.
+    let broker = if cfg.broker_enabled() {
+        let (broker, registry) = warren_broker::new_broker();
+        let addr = normalize_listen(&cfg.broker_listen);
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .with_context(|| format!("bind broker listener {addr}"))?;
+        tracing::info!(
+            listen = %addr,
+            advertise = cfg.broker_advertise_addr.as_deref().unwrap_or("(per runtime)"),
+            "egress broker enabled"
+        );
+        tasks.spawn({
+            let s = shutdown.clone();
+            async move {
+                warren_broker::serve(listener, broker, s)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("broker: {e}"))
+            }
+        });
+        Some(registry as Arc<dyn warren_core::BrokerRegistry>)
+    } else {
+        tracing::warn!(
+            "egress broker disabled (--broker-listen none): allowlist instances and secrets are refused"
+        );
+        None
+    };
+
     let lifecycle = warren_lifecycle::Manager::new(warren_lifecycle::Deps {
         store: store.clone(),
         runtimes: runtimes.clone(),
         templates: templates.clone(),
         config: cfg.clone(),
         clock: clock.clone(),
+        broker,
     })
     .context("lifecycle")?;
     let scheduler =

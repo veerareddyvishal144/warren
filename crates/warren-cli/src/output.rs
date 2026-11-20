@@ -276,6 +276,7 @@ pub const INSTANCE_KEYS: &[&str] = &[
     "region",
     "runtime",
     "network",
+    "allowed_domains",
     "auto_sleep",
     "idle_timeout_seconds",
     "default_port",

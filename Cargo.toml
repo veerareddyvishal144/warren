@@ -23,6 +23,7 @@ warren-api = { path = "crates/warren-api" }
 warren-cron = { path = "crates/warren-cron" }
 warren-dashboard = { path = "crates/warren-dashboard" }
 warren-sdk = { path = "crates/warren-sdk" }
+warren-broker = { path = "crates/warren-broker" }
 
 tokio = { version = "1.54", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt", "io"] }

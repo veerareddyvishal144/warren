@@ -3,8 +3,7 @@
 
 use async_trait::async_trait;
 use warren_core::{
-    ApiKey, Backup, Cron, Instance, InstanceSecret, MetricPoint, Result, Store, Template,
-    Workspace,
+    ApiKey, Backup, Cron, Instance, InstanceSecret, MetricPoint, Result, Store, Template, Workspace,
 };
 
 use crate::{

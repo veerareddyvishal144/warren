@@ -219,7 +219,8 @@ ALTER TABLE instances DROP COLUMN meter_carry_micros;
 /// row) and the write-only secrets the host-side broker injects, one row per
 /// instance and name. Values are stored in plaintext like `env`; at-rest
 /// encryption is a follow-up.
-const V3_ALLOWLIST_AND_SECRETS: &str = "ALTER TABLE instances ADD COLUMN allowed_domains TEXT NOT NULL DEFAULT '[]';
+const V3_ALLOWLIST_AND_SECRETS: &str =
+    "ALTER TABLE instances ADD COLUMN allowed_domains TEXT NOT NULL DEFAULT '[]';
 CREATE TABLE instance_secrets (
     instance_id TEXT    NOT NULL,
     name        TEXT    NOT NULL,
