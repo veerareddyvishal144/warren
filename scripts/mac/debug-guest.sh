@@ -144,7 +144,9 @@ echo "===== guest: installed files (plists, launcher, pf anchor, pf.conf lines, 
 echo
 echo "===== guest: agent CLIs (present only in an image built with --with-agents) ====="
 # shellcheck disable=SC2016  # expanded by the guest's shell
-"${SSH[@]}" 'for c in node npm claude codex opencode; do printf "%-9s " "$c"; command -v "$c" >/dev/null 2>&1 && "$c" --version 2>&1 | head -n 1 || echo "(not installed)"; done' || true
+"${SSH[@]}" 'export PATH=/usr/local/bin:$PATH; for c in node npm claude codex opencode; do printf "%-9s " "$c"; command -v "$c" >/dev/null 2>&1 && "$c" --version 2>&1 | head -n 1 || echo "(not installed)"; done' || true
+# A plain `ssh host cmd` runs zsh without the login PATH, so /usr/local/bin is
+# added by hand above; exec through the gateway uses `sh -lc` and sees it anyway.
 echo
 echo "===== guest: launchd disabled list and loaded services mentioning warren ====="
 guest 'sudo_ launchctl print-disabled system 2>/dev/null | grep -i warren || echo "(not in the disabled list)"; echo ---; sudo_ launchctl list 2>/dev/null | grep -i warren || echo "(no warren service loaded)"' || true
