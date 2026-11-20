@@ -14,8 +14,8 @@ use warren_cli::config::Settings;
 use warren_cli::output::list_envelope;
 use warren_core::agentapi::ResponsesRequest;
 use warren_core::{
-    CreateInstanceRequest, Error, ExecRequest, ExecResult, ForkRequest, RegisterTemplateRequest,
-    ShapeRequest,
+    CreateInstanceRequest, Error, ExecRequest, ExecResult, ForkRequest, PatchInstanceRequest,
+    RegisterTemplateRequest, ShapeRequest,
 };
 use warren_sdk::{AgentClient, Client, CronRequest, SdkError};
 
@@ -137,6 +137,10 @@ impl Api {
 
     pub async fn get_instance(&self, id: &str) -> R {
         call!(self.client.instance(id))
+    }
+
+    pub async fn patch_instance(&self, id: &str, req: &PatchInstanceRequest) -> R {
+        call!(self.client.patch_instance(id, req))
     }
 
     pub async fn delete_instance(&self, id: &str) -> R {

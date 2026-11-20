@@ -478,6 +478,14 @@
     };
     const name = el('create-name').value.trim();
     if (name) body.name = name;
+    // Secrets are deliberately not offered here: the dashboard keeps the API
+    // key in the browser already and should not hold provider keys too; use
+    // the CLI, the MCP server or an SDK for brokered secrets.
+    const domains = el('create-domains')
+      .value.split(',')
+      .map((d) => d.trim())
+      .filter(Boolean);
+    if (domains.length) body.allowed_domains = domains;
     const submit = el('create-submit');
     submit.disabled = true;
     try {

@@ -11,13 +11,13 @@ use tokio_util::sync::CancellationToken;
 use warren_core::{
     Backup, Config, CreateInstanceRequest, Cron, ExecRequest, ForkRequest, GATEWAY_PORT, Instance,
     InstanceStatus, InstanceType, Lifecycle, LogsOptions, MAX_BACKUP_BYTES_PER_WORKSPACE,
-    MAX_BACKUPS_PER_INSTANCE, MetricPoint, NetworkMode, PatchInstanceRequest, Runtime, Shape,
-    ShapeRequest, Store, Template, Workspace, errors, ids,
+    MAX_BACKUPS_PER_INSTANCE, MetricPoint, NetworkMode, PatchInstanceRequest, Runtime, SecretSpec,
+    Shape, ShapeRequest, Store, Template, Workspace, broker::SECRET_PLACEHOLDER, errors, ids,
 };
 
 use crate::{
     Deps, Manager,
-    fakes::{FakeClock, FakeRuntime, FakeStore, FakeTemplates},
+    fakes::{FakeBroker, FakeClock, FakeRuntime, FakeStore, FakeTemplates},
 };
 
 const NOW: i64 = 1_800_000_000;
@@ -31,6 +31,7 @@ const BASE_SHAPE: Shape = Shape {
 struct Env {
     store: Arc<FakeStore>,
     runtime: Arc<FakeRuntime>,
+    broker: Arc<FakeBroker>,
     templates: Arc<FakeTemplates>,
     clock: Arc<FakeClock>,
     mgr: Arc<Manager>,
@@ -53,6 +54,7 @@ impl Env {
         };
         tweak(&mut cfg);
         let templates = FakeTemplates::new(cfg.system_templates());
+        let broker = FakeBroker::new();
         let mut runtimes: HashMap<InstanceType, Arc<dyn Runtime>> = HashMap::new();
         runtimes.insert(InstanceType::Default, runtime.clone());
         // The same fake serves `mac`, so a template that implies the type can
@@ -70,11 +72,13 @@ impl Env {
             templates: templates.clone(),
             config: cfg.clone(),
             clock: clock.clone(),
+            broker: Some(broker.clone()),
         })
         .expect("manager");
         Env {
             store,
             runtime,
+            broker,
             templates,
             clock,
             mgr,
@@ -239,6 +243,8 @@ async fn create_honours_every_option() {
         auto_sleep: Some(true),
         idle_timeout_seconds: Some(600),
         network: Some(NetworkMode::DenyAll),
+        allowed_domains: None,
+        secrets: None,
     };
     let inst = env.create(req).await;
     assert_eq!(inst.template_name, "warren-agent");
@@ -847,6 +853,8 @@ async fn patch_fields_and_network_change() {
                 auto_sleep: Some(true),
                 idle_timeout_seconds: Some(1200),
                 network: None,
+                allowed_domains: None,
+                secrets: None,
             },
         )
         .await
@@ -1943,6 +1951,7 @@ async fn manager_new_validates_deps() {
         templates: env.templates.clone(),
         config: Config::default(),
         clock: env.clock.clone(),
+        broker: None,
     })
     .err()
     .expect("no runtimes is an error");
@@ -2439,5 +2448,461 @@ async fn host_capacity_refusals_do_not_fail_the_instance() {
     assert_eq!(
         env.mgr.start(WS, &inst.id).await.unwrap().status,
         InstanceStatus::Running
+    );
+}
+
+// ------------------------------------------------------------------ broker
+
+fn secret(name: &str, env: &str) -> SecretSpec {
+    SecretSpec {
+        name: name.into(),
+        upstream: "https://api.example.com".into(),
+        header: "x-api-key".into(),
+        value: "sk-real".into(),
+        env: env.into(),
+    }
+}
+
+fn allowlist(domains: &[&str], secrets: Vec<SecretSpec>) -> CreateInstanceRequest {
+    CreateInstanceRequest {
+        network: Some(NetworkMode::Allowlist),
+        allowed_domains: Some(domains.iter().map(|d| d.to_string()).collect()),
+        secrets: Some(secrets),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn allowlist_instance_gets_proxy_env_and_is_registered_while_running() {
+    let env = Env::new();
+    let inst = env
+        .create(allowlist(
+            &["API.Anthropic.com.", "*.npmjs.org", "api.anthropic.com"],
+            vec![secret("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")],
+        ))
+        .await;
+    assert_eq!(inst.allowed_domains, ["api.anthropic.com", "*.npmjs.org"]);
+    let running = env.wait_for(&inst.id, InstanceStatus::Running).await;
+
+    // The runtime saw the proxy variables and the route, never the value.
+    let seen = env.runtime.env_of(&inst.id);
+    assert_eq!(seen["WARREN_NETWORK"], "allowlist");
+    assert_eq!(seen["WARREN_BROKER"], "10.0.0.1:7349");
+    for var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+        assert_eq!(seen[var], "http://10.0.0.1:7349", "{var}");
+    }
+    assert_eq!(seen["NO_PROXY"], "localhost,127.0.0.1,10.0.0.1");
+    let stored = env.store.secrets_for(&inst.id);
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].route_token.len(), 32);
+    assert_eq!(
+        seen["ANTHROPIC_BASE_URL"],
+        format!("http://10.0.0.1:7349/r/{}", stored[0].route_token)
+    );
+    assert_eq!(seen["ANTHROPIC_API_KEY"], SECRET_PLACEHOLDER);
+    assert!(
+        !seen.values().any(|v| v.contains("sk-real")),
+        "the secret value never reaches the runtime"
+    );
+
+    // Registered under its address with the allowlist and one route.
+    let entry = env.broker.entry(&inst.id).expect("registered once running");
+    assert_eq!(entry.ip.to_string(), running.ip);
+    assert_eq!(entry.mode, NetworkMode::Allowlist);
+    assert_eq!(entry.allowed_domains, inst.allowed_domains);
+    assert_eq!(entry.routes.len(), 1);
+    assert_eq!(entry.routes[0].token, stored[0].route_token);
+    assert_eq!(entry.routes[0].upstream, "https://api.example.com");
+    assert_eq!(entry.routes[0].header, "x-api-key");
+    assert_eq!(entry.routes[0].value, "sk-real");
+
+    // Stop, start, sleep, wake and delete move the registration with the runtime.
+    env.mgr.stop(WS, &inst.id).await.unwrap();
+    assert!(
+        env.broker.entry(&inst.id).is_none(),
+        "stopped: unregistered"
+    );
+    let started = env.mgr.start(WS, &inst.id).await.unwrap();
+    assert_eq!(
+        env.broker.entry(&inst.id).unwrap().ip.to_string(),
+        started.ip,
+        "re-registered under the new address"
+    );
+    env.mgr.sleep(WS, &inst.id).await.unwrap();
+    assert!(
+        env.broker.entry(&inst.id).is_none(),
+        "sleeping: unregistered"
+    );
+    env.mgr.start(WS, &inst.id).await.unwrap();
+    assert!(env.broker.entry(&inst.id).is_some());
+    env.mgr.restart(WS, &inst.id).await.unwrap();
+    assert!(env.broker.entry(&inst.id).is_some());
+    env.mgr.delete(WS, &inst.id).await.unwrap();
+    assert!(
+        env.broker.entry(&inst.id).is_none(),
+        "deleted: unregistered"
+    );
+    assert!(
+        env.store.secrets_for(&inst.id).is_empty(),
+        "secrets go with the instance"
+    );
+}
+
+#[tokio::test]
+async fn deny_all_with_secrets_proxies_and_allow_all_does_not_use_the_broker() {
+    let env = Env::new();
+    let inst = env
+        .create(CreateInstanceRequest {
+            network: Some(NetworkMode::DenyAll),
+            secrets: Some(vec![secret("K", "K_URL")]),
+            ..Default::default()
+        })
+        .await;
+    env.wait_for(&inst.id, InstanceStatus::Running).await;
+    let seen = env.runtime.env_of(&inst.id);
+    assert_eq!(seen["WARREN_NETWORK"], "deny-all");
+    assert_eq!(seen["HTTPS_PROXY"], "http://10.0.0.1:7349");
+    assert!(seen["K_URL"].starts_with("http://10.0.0.1:7349/r/"));
+    assert_eq!(
+        env.broker.entry(&inst.id).unwrap().mode,
+        NetworkMode::DenyAll
+    );
+
+    let plain = env.create_running().await;
+    let seen = env.runtime.env_of(&plain.id);
+    assert_eq!(seen["WARREN_NETWORK"], "allow-all");
+    assert_eq!(seen["WARREN_BROKER"], "10.0.0.1:7349");
+    assert!(!seen.contains_key("HTTPS_PROXY"));
+    assert!(
+        env.broker.entry(&plain.id).is_none(),
+        "allow-all without secrets is not registered"
+    );
+    // A secret on an allow-all instance registers it for its routes only.
+    env.mgr
+        .patch(
+            WS,
+            &plain.id,
+            &PatchInstanceRequest {
+                secrets: Some(vec![secret("K", "K_URL")]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let entry = env
+        .broker
+        .entry(&plain.id)
+        .expect("registered for its route");
+    assert_eq!(entry.mode, NetworkMode::AllowAll);
+    assert_eq!(entry.routes.len(), 1);
+}
+
+#[tokio::test]
+async fn broker_policy_validation() {
+    let env = Env::new();
+    let invalid = |req: CreateInstanceRequest| {
+        let env = &env;
+        async move {
+            let err = env.mgr.create(&env.ws, &req).await.unwrap_err();
+            assert_eq!(err.code, errors::CODE_INVALID_REQUEST, "{req:?}");
+            err.message
+        }
+    };
+    let msg = invalid(allowlist(&["localhost"], vec![])).await;
+    assert!(msg.contains("allowed_domains"), "{msg}");
+    let msg = invalid(allowlist(
+        &[],
+        vec![SecretSpec {
+            upstream: "http://api.example.com".into(),
+            ..secret("K", "K_URL")
+        }],
+    ))
+    .await;
+    assert!(msg.contains("https://"), "{msg}");
+    let msg = invalid(allowlist(&[], vec![secret("lower", "K_URL")])).await;
+    assert!(msg.contains("lower"), "{msg}");
+    let msg = invalid(CreateInstanceRequest {
+        env: Some(env_of(&[("K", "mine")])),
+        secrets: Some(vec![secret("K", "K_URL")]),
+        ..Default::default()
+    })
+    .await;
+    assert!(msg.contains("also set in env"), "{msg}");
+    let msg = invalid(CreateInstanceRequest {
+        env: Some(env_of(&[("WARREN_BROKER", "x")])),
+        ..Default::default()
+    })
+    .await;
+    assert!(msg.contains("set by the platform"), "{msg}");
+    assert!(
+        env.store.list_all_instances().await.unwrap().is_empty(),
+        "nothing is stored for a refused create"
+    );
+
+    // Without a broker: allowlist and secrets are refused, deny-all works
+    // and carries no broker variables.
+    let off = Env::with_config(|c| c.broker_listen = "none".into());
+    for req in [
+        allowlist(&["api.example.com"], vec![]),
+        CreateInstanceRequest {
+            secrets: Some(vec![secret("K", "K_URL")]),
+            ..Default::default()
+        },
+    ] {
+        let err = off.mgr.create(&off.ws, &req).await.unwrap_err();
+        assert_eq!(err.code, errors::CODE_NOT_SUPPORTED, "{req:?}");
+        assert!(err.message.contains("--broker-listen"), "{}", err.message);
+    }
+    let inst = off
+        .create(CreateInstanceRequest {
+            network: Some(NetworkMode::DenyAll),
+            ..Default::default()
+        })
+        .await;
+    off.wait_for(&inst.id, InstanceStatus::Running).await;
+    let seen = off.runtime.env_of(&inst.id);
+    assert_eq!(seen["WARREN_NETWORK"], "deny-all");
+    assert!(!seen.contains_key("WARREN_BROKER") && !seen.contains_key("HTTPS_PROXY"));
+    assert!(off.broker.is_empty());
+    let err = off
+        .mgr
+        .patch(
+            WS,
+            &inst.id,
+            &PatchInstanceRequest {
+                network: Some(NetworkMode::Allowlist),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, errors::CODE_NOT_SUPPORTED);
+    assert_eq!(off.store.instance(&inst.id).network, NetworkMode::DenyAll);
+
+    // A broker but a runtime that cannot name its address: the start fails
+    // with a hint instead of leaving the instance without a route out.
+    let blind = Env::new();
+    *blind.runtime.broker_host.lock() = None;
+    let inst = blind.create(allowlist(&["api.example.com"], vec![])).await;
+    let failed = blind.wait_for(&inst.id, InstanceStatus::Failed).await;
+    assert!(
+        failed.status_reason.contains("--broker-advertise"),
+        "{}",
+        failed.status_reason
+    );
+    // The configured advertise address fixes it.
+    let fixed = Env::with_config(|c| c.broker_advertise_addr = Some("broker.lan:40001".into()));
+    *fixed.runtime.broker_host.lock() = None;
+    let inst = fixed.create(allowlist(&["api.example.com"], vec![])).await;
+    fixed.wait_for(&inst.id, InstanceStatus::Running).await;
+    let seen = fixed.runtime.env_of(&inst.id);
+    assert_eq!(seen["WARREN_BROKER"], "broker.lan:40001");
+    assert_eq!(seen["HTTPS_PROXY"], "http://broker.lan:40001");
+    assert_eq!(seen["NO_PROXY"], "localhost,127.0.0.1,broker.lan");
+}
+
+#[tokio::test]
+async fn patch_allowed_domains_and_secrets_apply_live_and_keep_tokens() {
+    let env = Env::new();
+    let inst = env
+        .create(allowlist(
+            &["a.example.com"],
+            vec![secret("A_KEY", "A_URL")],
+        ))
+        .await;
+    env.wait_for(&inst.id, InstanceStatus::Running).await;
+    let token_a = env.store.secrets_for(&inst.id)[0].route_token.clone();
+
+    let patched = env
+        .mgr
+        .patch(
+            WS,
+            &inst.id,
+            &PatchInstanceRequest {
+                allowed_domains: Some(vec!["B.example.com".into()]),
+                secrets: Some(vec![
+                    SecretSpec {
+                        value: "sk-new".into(),
+                        ..secret("A_KEY", "A_URL")
+                    },
+                    secret("B_KEY", "B_URL"),
+                ]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(patched.allowed_domains, ["b.example.com"]);
+    assert_eq!(patched.status, InstanceStatus::Running);
+    assert_eq!(
+        env.runtime.ops_for(&inst.id),
+        ["create", "start"],
+        "a live patch touches no runtime"
+    );
+    let entry = env.broker.entry(&inst.id).unwrap();
+    assert_eq!(entry.allowed_domains, ["b.example.com"]);
+    assert_eq!(entry.routes.len(), 2);
+    let a = entry
+        .routes
+        .iter()
+        .find(|r| r.token == token_a)
+        .expect("a secret that keeps its name keeps its token");
+    assert_eq!(a.value, "sk-new");
+    let stored = env.store.secrets_for(&inst.id);
+    assert_eq!(stored.len(), 2);
+    let b = stored.iter().find(|s| s.name == "B_KEY").unwrap();
+    assert_ne!(b.route_token, token_a);
+    assert_eq!(
+        env.store.instance(&inst.id).allowed_domains,
+        ["b.example.com"]
+    );
+
+    // Invalid patches change nothing.
+    let err = env
+        .mgr
+        .patch(
+            WS,
+            &inst.id,
+            &PatchInstanceRequest {
+                allowed_domains: Some(vec!["*.com".into()]),
+                secrets: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, errors::CODE_INVALID_REQUEST);
+    assert_eq!(env.store.secrets_for(&inst.id).len(), 2);
+    assert_eq!(env.broker.entry(&inst.id).unwrap().routes.len(), 2);
+
+    // Removing every secret keeps the allowlist registration.
+    env.mgr
+        .patch(
+            WS,
+            &inst.id,
+            &PatchInstanceRequest {
+                secrets: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(env.store.secrets_for(&inst.id).is_empty());
+    let entry = env.broker.entry(&inst.id).unwrap();
+    assert!(entry.routes.is_empty());
+    assert_eq!(entry.mode, NetworkMode::Allowlist);
+
+    // Switching to allow-all recreates the runtime object with the new
+    // variables and drops the registration.
+    let open = env
+        .mgr
+        .patch(
+            WS,
+            &inst.id,
+            &PatchInstanceRequest {
+                network: Some(NetworkMode::AllowAll),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(open.network, NetworkMode::AllowAll);
+    assert_eq!(open.status, InstanceStatus::Running);
+    assert!(env.broker.entry(&inst.id).is_none());
+    let seen = env.runtime.env_of(&inst.id);
+    assert_eq!(seen["WARREN_NETWORK"], "allow-all");
+    assert!(!seen.contains_key("HTTPS_PROXY"));
+    // And back: the allowlist is still stored and applies again.
+    let back = env
+        .mgr
+        .patch(
+            WS,
+            &inst.id,
+            &PatchInstanceRequest {
+                network: Some(NetworkMode::Allowlist),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(back.allowed_domains, ["b.example.com"]);
+    assert_eq!(
+        env.broker.entry(&inst.id).unwrap().allowed_domains,
+        ["b.example.com"]
+    );
+    assert_eq!(env.runtime.env_of(&inst.id)["WARREN_NETWORK"], "allowlist");
+}
+
+#[tokio::test]
+async fn fork_copies_allowlist_and_secrets_with_fresh_tokens() {
+    let env = Env::new();
+    let src = env
+        .create(allowlist(
+            &["a.example.com"],
+            vec![secret("A_KEY", "A_URL")],
+        ))
+        .await;
+    env.wait_for(&src.id, InstanceStatus::Running).await;
+    let dst = env
+        .mgr
+        .fork(&env.ws, &src.id, &ForkRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(dst.network, NetworkMode::Allowlist);
+    assert_eq!(dst.allowed_domains, src.allowed_domains);
+    let s = env.store.secrets_for(&src.id);
+    let d = env.store.secrets_for(&dst.id);
+    assert_eq!(d.len(), 1);
+    assert_eq!(
+        (d[0].name.as_str(), d[0].value.as_str()),
+        ("A_KEY", "sk-real")
+    );
+    assert_eq!(d[0].instance_id, dst.id);
+    assert_ne!(
+        d[0].route_token, s[0].route_token,
+        "the copy gets its own token"
+    );
+    let seen = env.runtime.env_of(&dst.id);
+    assert_eq!(
+        seen["A_URL"],
+        format!("http://10.0.0.1:7349/r/{}", d[0].route_token)
+    );
+    assert!(env.broker.entry(&dst.id).is_some());
+    assert!(env.broker.entry(&src.id).is_some(), "the source woke again");
+    assert_eq!(env.broker.len(), 2);
+}
+
+#[tokio::test]
+async fn reconcile_and_repair_track_registrations() {
+    let env = Env::new();
+    let mut adopted = env.seed(InstanceStatus::Running);
+    adopted.network = NetworkMode::Allowlist;
+    adopted.allowed_domains = vec!["a.example.com".into()];
+    adopted.ip = "10.0.0.7".into();
+    env.store.put_instance(adopted.clone());
+    env.runtime.set_running(&adopted.id, true);
+    let gone = env.seed(InstanceStatus::Running);
+    env.mgr.reconcile().await.unwrap();
+    let entry = env
+        .broker
+        .entry(&adopted.id)
+        .expect("adopted instance registered");
+    assert_eq!(entry.ip.to_string(), "10.0.0.7");
+    assert_eq!(entry.allowed_domains, ["a.example.com"]);
+    assert!(env.broker.entry(&gone.id).is_none());
+    assert_eq!(env.store.instance(&gone.id).status, InstanceStatus::Stopped);
+
+    // The runtime dies behind the running instance: the repair pass drops it.
+    env.runtime.set_running(&adopted.id, false);
+    env.mgr.repair().await;
+    assert_eq!(
+        env.store.instance(&adopted.id).status,
+        InstanceStatus::Stopped
+    );
+    assert!(env.broker.entry(&adopted.id).is_none());
+    assert!(
+        env.broker
+            .calls()
+            .contains(&format!("unregister:{}", adopted.id))
     );
 }

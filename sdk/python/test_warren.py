@@ -112,6 +112,24 @@ class SandboxApiTests(unittest.TestCase):
             {"template": "warren-agent", "type": "vm", "resources": {"cpu": 2, "disk": 8}, "auto_sleep": True},
         )
 
+    def test_create_instance_sends_allowlist_and_secrets(self):
+        self.recorder.answers = [json_response({"id": "ab12cd34ef", "status": "provisioning"})]
+        secret = {
+            "name": "ANTHROPIC_API_KEY",
+            "upstream": "https://api.anthropic.com",
+            "header": "x-api-key",
+            "value": "sk-ant-real",
+            "env": "ANTHROPIC_BASE_URL",
+        }
+        self.w.create_instance(network="allowlist", allowed_domains=["api.anthropic.com"], secrets=[secret])
+        self.assertEqual(
+            json.loads(self.recorder.last.data.decode()),
+            {"network": "allowlist", "allowed_domains": ["api.anthropic.com"], "secrets": [secret]},
+        )
+        self.recorder.answers = [json_response({"id": "ab12cd34ef", "status": "running"})]
+        self.w.patch_instance("ab12cd34ef", allowed_domains=[], secrets=[])
+        self.assertEqual(json.loads(self.recorder.last.data.decode()), {"allowed_domains": [], "secrets": []})
+
     def test_action_endpoints_post_without_body(self):
         for method, suffix in (
             (self.w.stop_instance, "stop"),

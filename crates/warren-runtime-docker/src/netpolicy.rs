@@ -20,6 +20,11 @@
 //!   `-C` before they are inserted, so repeated `ready` calls add nothing. They
 //!   are not removed on shutdown. Without root the rules are skipped with one
 //!   warning.
+//! - With the egress broker enabled, an `INPUT` rule per bridge accepts new TCP
+//!   connections to the bridge gateway on the broker port ([`broker_rules`]),
+//!   inserted after the drops so it is evaluated first: that is the only way
+//!   an `allowlist` or `deny-all` instance (on the internal bridge) reaches
+//!   anything, and how an `allow-all` instance reaches its secret routes.
 //!
 //! The pure parts (rule composition, bridge naming, address parsing) are plain
 //! functions so they can be unit-tested without Docker or root.
@@ -56,10 +61,18 @@ pub(crate) struct Rule {
 }
 
 impl Rule {
-    fn drop(chain: &'static str, matches: &[&str]) -> Rule {
+    fn with_target(chain: &'static str, matches: &[&str], target: &str) -> Rule {
         let mut args: Vec<String> = matches.iter().map(|s| s.to_string()).collect();
-        args.extend(["-j".to_string(), "DROP".to_string()]);
+        args.extend(["-j".to_string(), target.to_string()]);
         Rule { chain, args }
+    }
+
+    fn drop(chain: &'static str, matches: &[&str]) -> Rule {
+        Self::with_target(chain, matches, "DROP")
+    }
+
+    fn accept(chain: &'static str, matches: &[&str]) -> Rule {
+        Self::with_target(chain, matches, "ACCEPT")
     }
 
     /// `[op, chain, args...]`, e.g. `-C DOCKER-USER -i br-x -d 169.254.0.0/16 -j DROP`.
@@ -133,6 +146,38 @@ pub(crate) fn egress_rules(
         ));
     }
     rules
+}
+
+/// The rule letting instances on `bridge` reach the daemon's egress broker:
+/// new TCP connections to the bridge gateway (the host's address on that
+/// bridge) on `port` are accepted in `INPUT`. Installed after
+/// [`egress_rules`], so `-I` places it ahead of the host-address drops.
+pub(crate) fn broker_rules(bridge: &str, gateway: Ipv4Addr, port: u16) -> Vec<Rule> {
+    let dest = format!("{gateway}/32");
+    let port = port.to_string();
+    vec![Rule::accept(
+        CHAIN_INPUT,
+        &[
+            "-i",
+            bridge,
+            "-d",
+            &dest,
+            "-p",
+            "tcp",
+            "--dport",
+            &port,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "NEW",
+        ],
+    )]
+}
+
+/// An IPv4 gateway as Docker reports it in a network's IPAM config
+/// (`172.18.0.1`, sometimes with a prefix length).
+pub(crate) fn parse_gateway(s: &str) -> Option<Ipv4Addr> {
+    s.trim().split('/').next()?.parse().ok()
 }
 
 /// Hint logged and returned when a network exists with ICC on and containers attached.
@@ -404,6 +449,44 @@ mod tests {
         let open = egress_rules("br-abc", true, &host);
         assert_eq!(open.len(), 1);
         assert!(open[0].args.contains(&LINK_LOCAL.to_string()));
+    }
+
+    #[test]
+    fn broker_rule_accepts_the_gateway_port_only() {
+        let rules = broker_rules("br-abc", Ipv4Addr::new(172, 18, 0, 1), 7349);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].chain, CHAIN_INPUT);
+        assert_eq!(
+            rules[0].argv("-I"),
+            [
+                "-I",
+                "INPUT",
+                "-i",
+                "br-abc",
+                "-d",
+                "172.18.0.1/32",
+                "-p",
+                "tcp",
+                "--dport",
+                "7349",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "NEW",
+                "-j",
+                "ACCEPT"
+            ]
+        );
+        assert_eq!(
+            parse_gateway("172.18.0.1"),
+            Some(Ipv4Addr::new(172, 18, 0, 1))
+        );
+        assert_eq!(
+            parse_gateway(" 172.18.0.1/16 "),
+            Some(Ipv4Addr::new(172, 18, 0, 1))
+        );
+        assert_eq!(parse_gateway("fd00::1"), None);
+        assert_eq!(parse_gateway(""), None);
     }
 
     #[test]

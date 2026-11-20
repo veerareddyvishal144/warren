@@ -417,6 +417,26 @@ pub enum InstancesCmd {
         #[arg(long)]
         template: Option<String>,
     },
+    /// Change the network policy, the allowed domains or the secrets of an instance.
+    Network {
+        id: String,
+        /// New policy: allow-all, deny-all or allowlist. A running instance is recreated.
+        #[arg(long, value_name = "allow-all|deny-all|allowlist", value_parser = parse_network)]
+        mode: Option<NetworkMode>,
+        /// Replace the allowlist with these hosts (repeatable); applies live.
+        #[arg(long = "allow-domain", value_name = "DOMAIN")]
+        allow_domains: Vec<String>,
+        /// Replace the allowlist with an empty one.
+        #[arg(long, conflicts_with = "allow_domains")]
+        clear_domains: bool,
+        /// Replace the secrets (repeatable; same syntax as `create --secret`).
+        /// Values of secrets that keep their NAME apply live; new names at the next start.
+        #[arg(long = "secret", value_name = "NAME=VALUE@UPSTREAM#HEADER#ENV")]
+        secrets: Vec<String>,
+        /// Remove every secret.
+        #[arg(long, conflicts_with = "secrets")]
+        clear_secrets: bool,
+    },
     /// Copy an instance (disk, template and env) into a new one.
     Fork {
         id: String,
@@ -516,9 +536,24 @@ pub struct CreateArgs {
     /// Idle timeout in seconds (300..86400, default 900).
     #[arg(long, value_name = "SECS")]
     pub idle: Option<u32>,
-    /// Outbound network policy.
-    #[arg(long, value_name = "allow-all|deny-all", value_parser = parse_network)]
+    /// Outbound network policy: allow-all (default), deny-all (no route out) or
+    /// allowlist (HTTP and HTTPS to the --allow-domain hosts only, through the
+    /// host-side broker).
+    #[arg(long, value_name = "allow-all|deny-all|allowlist", value_parser = parse_network)]
     pub network: Option<NetworkMode>,
+    /// Host an allowlist instance may reach: a name (api.anthropic.com) or a
+    /// wildcard (*.npmjs.org). Repeatable, at most 64.
+    #[arg(long = "allow-domain", value_name = "DOMAIN")]
+    pub allow_domains: Vec<String>,
+    /// Credential the broker injects for the instance; the value never enters
+    /// it. Repeatable, at most 16. Syntax NAME=VALUE@UPSTREAM#HEADER#ENV: NAME is
+    /// the variable the instance sees (with a placeholder value), VALUE the
+    /// credential (no `#`), UPSTREAM the https:// base URL, HEADER the header to
+    /// add (x-api-key; Authorization gets "Bearer VALUE"), ENV the variable that
+    /// receives the broker route URL. Example:
+    /// 'ANTHROPIC_API_KEY=sk-ant-...@https://api.anthropic.com#x-api-key#ANTHROPIC_BASE_URL'
+    #[arg(long = "secret", value_name = "NAME=VALUE@UPSTREAM#HEADER#ENV")]
+    pub secrets: Vec<String>,
     /// Block until the instance is running.
     #[arg(long)]
     pub wait: bool,
@@ -628,7 +663,7 @@ pub fn parse_instance_type(s: &str) -> Result<InstanceType, String> {
 /// clap value parser for `--network`.
 pub fn parse_network(s: &str) -> Result<NetworkMode, String> {
     NetworkMode::parse(s.trim())
-        .ok_or_else(|| format!("unknown network mode {s:?}; use allow-all or deny-all"))
+        .ok_or_else(|| format!("unknown network mode {s:?}; use allow-all, deny-all or allowlist"))
 }
 
 /// Verify the clap definitions are consistent (duplicate ids, bad settings).
@@ -782,7 +817,13 @@ mod tests {
             "--idle",
             "600",
             "--network",
-            "deny-all",
+            "allowlist",
+            "--allow-domain",
+            "api.anthropic.com",
+            "--allow-domain",
+            "*.npmjs.org",
+            "--secret",
+            "ANTHROPIC_API_KEY=sk-ant-x@https://api.anthropic.com#x-api-key#ANTHROPIC_BASE_URL",
             "--wait",
         ]);
         let Command::Instances {
@@ -799,7 +840,9 @@ mod tests {
         assert_eq!(a.metadata, vec!["plan=pro"]);
         assert!(a.auto_sleep);
         assert_eq!(a.idle, Some(600));
-        assert_eq!(a.network, Some(NetworkMode::DenyAll));
+        assert_eq!(a.network, Some(NetworkMode::Allowlist));
+        assert_eq!(a.allow_domains, vec!["api.anthropic.com", "*.npmjs.org"]);
+        assert_eq!(a.secrets.len(), 1);
         assert!(a.wait);
         let Command::Instances {
             cmd: InstancesCmd::Create(a),
@@ -824,6 +867,54 @@ mod tests {
         );
         assert_eq!(
             fails(&["instances", "create", "--cpu", "two"]).kind(),
+            ErrorKind::ValueValidation
+        );
+    }
+
+    #[test]
+    fn instances_network() {
+        let Command::Instances {
+            cmd:
+                InstancesCmd::Network {
+                    id,
+                    mode,
+                    allow_domains,
+                    clear_domains,
+                    secrets,
+                    clear_secrets,
+                },
+        } = parse(&[
+            "instances",
+            "network",
+            "ab12cd34ef",
+            "--mode",
+            "allowlist",
+            "--allow-domain",
+            "api.anthropic.com",
+            "--clear-secrets",
+        ])
+        .command
+        else {
+            panic!()
+        };
+        assert_eq!(id, "ab12cd34ef");
+        assert_eq!(mode, Some(NetworkMode::Allowlist));
+        assert_eq!(allow_domains, vec!["api.anthropic.com"]);
+        assert!(!clear_domains && secrets.is_empty() && clear_secrets);
+        assert_eq!(
+            fails(&[
+                "instances",
+                "network",
+                "ab12cd34ef",
+                "--allow-domain",
+                "a.example.com",
+                "--clear-domains"
+            ])
+            .kind(),
+            ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            fails(&["instances", "network", "ab12cd34ef", "--mode", "open"]).kind(),
             ErrorKind::ValueValidation
         );
     }

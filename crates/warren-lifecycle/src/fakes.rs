@@ -14,9 +14,9 @@ use std::{
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use warren_core::{
-    ApiKey, Backup, Clock, Cron, Error, ExecRequest, ExecResult, Instance, LogsOptions,
-    MetricPoint, RegisterTemplateRequest, Result, RunInfo, Runtime, Shape, Stats, Store, Template,
-    TemplateService, Workspace, errors,
+    ApiKey, Backup, BrokerEntry, BrokerRegistry, Clock, Cron, Error, ExecRequest, ExecResult,
+    Instance, InstanceSecret, LogsOptions, MetricPoint, RegisterTemplateRequest, Result, RunInfo,
+    Runtime, Shape, Stats, Store, Template, TemplateService, Workspace, errors,
 };
 
 // ---------------------------------------------------------------- clock
@@ -50,6 +50,7 @@ struct State {
     metrics: Vec<(String, MetricPoint)>,
     backups: Vec<Backup>,
     crons: Vec<Cron>,
+    secrets: Vec<InstanceSecret>,
 }
 
 /// In-memory `Store`.
@@ -121,6 +122,15 @@ impl FakeStore {
     }
     pub fn put_cron(&self, c: Cron) {
         self.state.lock().crons.push(c);
+    }
+    pub fn secrets_for(&self, id: &str) -> Vec<InstanceSecret> {
+        self.state
+            .lock()
+            .secrets
+            .iter()
+            .filter(|s| s.instance_id == id)
+            .cloned()
+            .collect()
     }
 }
 
@@ -298,9 +308,9 @@ impl Store for FakeStore {
         Ok(())
     }
     async fn delete_instance(&self, id: &str) -> Result<()> {
-        self.state
-            .lock()
-            .instances
+        let mut st = self.state.lock();
+        st.secrets.retain(|s| s.instance_id != id);
+        st.instances
             .remove(id)
             .map(|_| ())
             .ok_or_else(|| Error::not_found("instance"))
@@ -327,6 +337,20 @@ impl Store for FakeStore {
             .values()
             .filter(|i| i.workspace_id == workspace_id && i.template_name == name)
             .count() as u32)
+    }
+
+    async fn replace_instance_secrets(
+        &self,
+        instance_id: &str,
+        secrets: &[InstanceSecret],
+    ) -> Result<()> {
+        let mut st = self.state.lock();
+        st.secrets.retain(|s| s.instance_id != instance_id);
+        st.secrets.extend(secrets.iter().cloned());
+        Ok(())
+    }
+    async fn list_instance_secrets(&self, instance_id: &str) -> Result<Vec<InstanceSecret>> {
+        Ok(self.secrets_for(instance_id))
     }
 
     async fn insert_metric(&self, instance_id: &str, p: MetricPoint) -> Result<()> {
@@ -453,11 +477,28 @@ pub struct FakeRuntime {
     pub disk_usage: AtomicI64,
     pub starts: AtomicUsize,
     pub recreates: AtomicUsize,
+    /// The effective env seen at the last `create`, `recreate` or `start` of
+    /// each instance (what a real runtime would inject).
+    pub envs: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
+    /// What `broker_host` answers; `None` makes the runtime unable to tell.
+    pub broker_host: Mutex<Option<String>>,
 }
 
 impl FakeRuntime {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Arc::new(FakeRuntime {
+            broker_host: Mutex::new(Some("10.0.0.1".to_string())),
+            ..Default::default()
+        })
+    }
+    /// The env the runtime last saw for `id`.
+    pub fn env_of(&self, id: &str) -> BTreeMap<String, String> {
+        self.envs.lock().get(id).cloned().unwrap_or_default()
+    }
+    fn see_env(&self, inst: &Instance, tpl_env: &BTreeMap<String, String>) {
+        self.envs
+            .lock()
+            .insert(inst.id.clone(), inst.effective_env(tpl_env));
     }
     fn record(&self, op: &str, id: &str) {
         self.calls.lock().push(format!("{op}:{id}"));
@@ -510,9 +551,13 @@ impl Runtime for FakeRuntime {
         }
         Ok(())
     }
+    async fn broker_host(&self, _inst: &Instance) -> Result<Option<String>> {
+        Ok(self.broker_host.lock().clone())
+    }
     async fn create(&self, inst: &mut Instance, tpl: &Template) -> Result<()> {
         self.record("create", &inst.id);
         Self::failing(&self.fail_create, "create")?;
+        self.see_env(inst, &tpl.env);
         if inst.storage_path.is_empty() {
             inst.storage_path = format!("/fake/instances/{}/home", inst.id);
         }
@@ -531,6 +576,7 @@ impl Runtime for FakeRuntime {
         }
         self.starts.fetch_add(1, Ordering::SeqCst);
         self.set_running(&inst.id, true);
+        self.see_env(inst, &BTreeMap::new());
         Ok(RunInfo {
             ip: format!("10.0.0.{}", self.starts.load(Ordering::SeqCst)),
             runtime_ref: inst.runtime_ref.clone(),
@@ -607,6 +653,7 @@ impl Runtime for FakeRuntime {
         Self::failing(&self.fail_recreate, "recreate")?;
         let n = self.recreates.fetch_add(1, Ordering::SeqCst) + 1;
         inst.runtime_ref = format!("ctr-{}-{}-v{n}", inst.id, tpl.image_ref);
+        self.see_env(inst, &tpl.env);
         Ok(())
     }
     async fn clone_storage(&self, src: &Instance, dst: &mut Instance) -> Result<()> {
@@ -699,5 +746,46 @@ impl TemplateService for FakeTemplates {
     }
     async fn ensure_system_templates(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------- broker registry
+
+/// A `BrokerRegistry` that keeps the entries by instance id and logs every call.
+#[derive(Default)]
+pub struct FakeBroker {
+    entries: Mutex<BTreeMap<String, BrokerEntry>>,
+    pub calls: Mutex<Vec<String>>,
+}
+
+impl FakeBroker {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+    pub fn entry(&self, id: &str) -> Option<BrokerEntry> {
+        self.entries.lock().get(id).cloned()
+    }
+    pub fn len(&self) -> usize {
+        self.entries.lock().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// `register:<id>` and `unregister:<id>` in order.
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.lock().clone()
+    }
+}
+
+impl BrokerRegistry for FakeBroker {
+    fn register(&self, entry: BrokerEntry) {
+        self.calls
+            .lock()
+            .push(format!("register:{}", entry.instance_id));
+        self.entries.lock().insert(entry.instance_id.clone(), entry);
+    }
+    fn unregister(&self, instance_id: &str) {
+        self.calls.lock().push(format!("unregister:{instance_id}"));
+        self.entries.lock().remove(instance_id);
     }
 }

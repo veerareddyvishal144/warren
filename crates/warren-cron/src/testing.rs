@@ -161,6 +161,16 @@ impl Store for FakeStore {
     ) -> Result<u32> {
         unsupported("count_instances_using_template")
     }
+    async fn replace_instance_secrets(
+        &self,
+        _instance_id: &str,
+        _secrets: &[InstanceSecret],
+    ) -> Result<()> {
+        unsupported("replace_instance_secrets")
+    }
+    async fn list_instance_secrets(&self, _instance_id: &str) -> Result<Vec<InstanceSecret>> {
+        unsupported("list_instance_secrets")
+    }
     async fn insert_metric(&self, _instance_id: &str, _p: MetricPoint) -> Result<()> {
         unsupported("insert_metric")
     }

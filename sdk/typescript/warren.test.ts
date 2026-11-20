@@ -278,6 +278,10 @@ test("createInstance drops undefined fields; actions send no body; optional bodi
   assert.equal(call.headers.get("content-type"), "application/json");
   assert.deepEqual(JSON.parse(call.body as string), { template: "warren-agent", type: "vm", resources: { cpu: 2, disk: 8 }, auto_sleep: true });
 
+  const secret = { name: "ANTHROPIC_API_KEY", upstream: "https://api.anthropic.com", header: "x-api-key", value: "sk-ant-real", env: "ANTHROPIC_BASE_URL" };
+  await w.createInstance({ network: "allowlist", allowed_domains: ["api.anthropic.com"], secrets: [secret] });
+  assert.deepEqual(JSON.parse(r.last().body as string), { network: "allowlist", allowed_domains: ["api.anthropic.com"], secrets: [secret] });
+
   await w.stopInstance("ab12cd34ef");
   call = r.last();
   assert.equal(call.url, `${API_URL}/v1/instances/ab12cd34ef/stop`);

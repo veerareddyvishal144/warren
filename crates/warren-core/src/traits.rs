@@ -73,6 +73,17 @@ pub trait Store: Send + Sync {
     async fn count_awake_instances(&self, workspace_id: &str) -> Result<u32>;
     async fn count_instances_using_template(&self, workspace_id: &str, name: &str) -> Result<u32>;
 
+    /// Replace every secret of an instance with `secrets` (all of them must
+    /// carry `instance_id`); an empty slice removes them all. Secrets are
+    /// write-only on the API and go with `delete_instance`.
+    async fn replace_instance_secrets(
+        &self,
+        instance_id: &str,
+        secrets: &[InstanceSecret],
+    ) -> Result<()>;
+    /// The secrets of an instance, by name.
+    async fn list_instance_secrets(&self, instance_id: &str) -> Result<Vec<InstanceSecret>>;
+
     async fn insert_metric(&self, instance_id: &str, p: MetricPoint) -> Result<()>;
     async fn list_metrics(&self, instance_id: &str, since: i64) -> Result<Vec<MetricPoint>>;
     async fn prune_metrics(&self, before: i64) -> Result<()>;
@@ -106,6 +117,13 @@ pub trait Runtime: Send + Sync {
     /// itself. Unlimited by default.
     async fn check_capacity(&self) -> Result<()> {
         Ok(())
+    }
+    /// The host address at which an instance of this runtime reaches the
+    /// daemon's broker (the bridge gateway of its network), without a port.
+    /// `None` when the runtime cannot tell; the operator then sets
+    /// `Config::broker_advertise_addr`. Nothing is sent to the address here.
+    async fn broker_host(&self, _inst: &Instance) -> Result<Option<String>> {
+        Ok(None)
     }
     /// Prepare persistent storage and the runtime object without starting it.
     /// Must set `inst.storage_path` and `inst.runtime_ref`.
@@ -169,10 +187,18 @@ pub struct CreateInstanceRequest {
     pub idle_timeout_seconds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkMode>,
+    /// Hosts an `allowlist` instance may reach through the broker (exact names
+    /// or `*.suffix`); at most `MAX_ALLOWED_DOMAINS`. Ignored by other modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+    /// Write-only credentials the broker injects (at most `MAX_SECRETS`); never
+    /// returned by any read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<Vec<SecretSpec>>,
 }
 
-/// Body of `PATCH /v1/instances/{id}`. Absent fields are unchanged; `metadata`
-/// and `env` replace the whole map when present.
+/// Body of `PATCH /v1/instances/{id}`. Absent fields are unchanged; `metadata`,
+/// `env`, `allowed_domains` and `secrets` replace the whole set when present.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PatchInstanceRequest {
@@ -188,6 +214,14 @@ pub struct PatchInstanceRequest {
     pub idle_timeout_seconds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkMode>,
+    /// Replaces the allowlist; applies live to a running `allowlist` instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+    /// Replaces the secrets. Values, upstreams and headers of secrets that keep
+    /// their `name` apply live; new names and changed `env` names apply at the
+    /// next start, like `env`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<Vec<SecretSpec>>,
 }
 
 /// Body of `POST /v1/instances/{id}/fork`.
@@ -300,4 +334,45 @@ pub trait Signer: Send + Sync {
 #[async_trait]
 pub trait Authenticator: Send + Sync {
     async fn authenticate(&self, raw_key: &str) -> Result<(Workspace, ApiKey)>;
+}
+
+/// One provider route the broker serves for an instance: requests to
+/// `/r/<token>/...` from the instance's address go to `upstream` with
+/// `header: value` added. `value` is redacted from `Debug` output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BrokerRoute {
+    pub token: String,
+    pub upstream: String,
+    pub header: String,
+    pub value: String,
+}
+
+impl std::fmt::Debug for BrokerRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrokerRoute")
+            .field("token", &"<redacted>")
+            .field("upstream", &self.upstream)
+            .field("header", &self.header)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+/// What the broker needs to know about one running instance, keyed by the
+/// address its requests arrive from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerEntry {
+    pub instance_id: String,
+    pub ip: std::net::IpAddr,
+    pub mode: NetworkMode,
+    pub allowed_domains: Vec<String>,
+    pub routes: Vec<BrokerRoute>,
+}
+
+/// The broker's view of running instances. The lifecycle registers an
+/// instance once its runtime reports an address and removes it on stop,
+/// sleep, failure and delete; registering again replaces the entry.
+pub trait BrokerRegistry: Send + Sync {
+    fn register(&self, entry: BrokerEntry);
+    fn unregister(&self, instance_id: &str);
 }

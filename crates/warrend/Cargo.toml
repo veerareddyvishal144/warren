@@ -21,6 +21,7 @@ warren-edge.workspace = true
 warren-api.workspace = true
 warren-cron.workspace = true
 warren-dashboard.workspace = true
+warren-broker.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 axum.workspace = true

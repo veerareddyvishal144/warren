@@ -23,6 +23,8 @@ pub const RESERVED_ENV_KEYS: &[&str] = &[
     warren_core::ENV_WORKSPACE_ID,
     warren_core::ENV_HOME,
     warren_core::ENV_GATEWAY_PORT,
+    warren_core::ENV_NETWORK,
+    warren_core::ENV_BROKER,
 ];
 
 /// An instance name is at most [`MAX_NAME_CHARS`] characters.

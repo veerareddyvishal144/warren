@@ -28,6 +28,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "drop_billing",
         sql: V2_DROP_BILLING,
     },
+    Migration {
+        version: 3,
+        name: "egress_allowlist_and_secrets",
+        sql: V3_ALLOWLIST_AND_SECRETS,
+    },
 ];
 
 const BOOTSTRAP: &str = "CREATE TABLE IF NOT EXISTS migrations (
@@ -208,6 +213,25 @@ ALTER TABLE instances DROP COLUMN budget_credit_micros;
 ALTER TABLE instances DROP COLUMN meter_started_at;
 ALTER TABLE instances DROP COLUMN metered_through;
 ALTER TABLE instances DROP COLUMN meter_carry_micros;
+";
+
+/// Per-instance egress allowlist (a JSON array of patterns on the instance
+/// row) and the write-only secrets the host-side broker injects, one row per
+/// instance and name. Values are stored in plaintext like `env`; at-rest
+/// encryption is a follow-up.
+const V3_ALLOWLIST_AND_SECRETS: &str =
+    "ALTER TABLE instances ADD COLUMN allowed_domains TEXT NOT NULL DEFAULT '[]';
+CREATE TABLE instance_secrets (
+    instance_id TEXT    NOT NULL,
+    name        TEXT    NOT NULL,
+    upstream    TEXT    NOT NULL DEFAULT '',
+    header      TEXT    NOT NULL DEFAULT '',
+    value       TEXT    NOT NULL DEFAULT '',
+    env         TEXT    NOT NULL DEFAULT '',
+    route_token TEXT    NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (instance_id, name)
+);
 ";
 
 /// Highest schema version recorded in the database (0 when fresh).

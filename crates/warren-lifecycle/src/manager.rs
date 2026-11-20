@@ -14,8 +14,8 @@ use std::{
 use parking_lot::Mutex;
 use tokio::sync::OwnedMutexGuard;
 use warren_core::{
-    Clock, Config, Error, Instance, InstanceStatus, InstanceType, MAX_IDLE_TIMEOUT_SEC, Result,
-    Runtime, Runtimes, Store, Template, TemplateService,
+    BrokerRegistry, Clock, Config, Error, Instance, InstanceStatus, InstanceType,
+    MAX_IDLE_TIMEOUT_SEC, Result, Runtime, Runtimes, Store, Template, TemplateService,
 };
 
 /// Everything the lifecycle needs from the rest of the daemon.
@@ -25,6 +25,9 @@ pub struct Deps {
     pub templates: Arc<dyn TemplateService>,
     pub config: Config,
     pub clock: Arc<dyn Clock>,
+    /// The egress broker's table of running instances; `None` when the daemon
+    /// runs without a broker, which refuses `allowlist` instances and secrets.
+    pub broker: Option<Arc<dyn BrokerRegistry>>,
 }
 
 /// Orchestrates instances. Construct with [`Manager::new`], drive the
@@ -243,6 +246,7 @@ impl Manager {
     /// Errors while saving are logged, never surfaced, because the caller is
     /// already returning the original error.
     pub(crate) async fn fail(&self, inst: &mut Instance, err: &Error, what: &str) {
+        self.broker_unregister(&inst.id);
         let reason = describe(err);
         tracing::error!(instance = %inst.id, op = what, error = %reason, "operation failed");
         if let Err(e) = self.transition(inst, InstanceStatus::Failed, &reason).await {
@@ -255,6 +259,7 @@ impl Manager {
     /// `destroy(remove_storage = false)` (the disk stays), then record both the
     /// original error and the outcome of the forced destroy as the reason.
     pub(crate) async fn fail_force(&self, inst: &mut Instance, err: &Error, what: &str) {
+        self.broker_unregister(&inst.id);
         let outcome = match self.runtime_for(inst) {
             Ok(rt) => match rt.destroy(inst, false).await {
                 Ok(()) => {

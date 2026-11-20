@@ -305,6 +305,16 @@ before Lume's own 409 is hit.
   that blocks `192.168.64.0/24` except the host gateway (`192.168.64.1`) and
   DNS, so one tenant's VM cannot reach another's gateway port. The e2e script
   verifies this from inside a guest.
+- The instance's network policy is enforced inside the guest: the gateway
+  launcher reads `WARREN_NETWORK` from `warren.env` and loads the `pf`
+  sub-anchor `dev.warren/instance`, which for `deny-all` and `allowlist`
+  blocks every outbound packet except to the host gateway, where warrend's
+  egress broker (`WARREN_BROKER`, default `192.168.64.1:7349`) proxies an
+  allowlist instance's HTTP(S) to its `allowed_domains` and serves its secret
+  routes. `allow-all` flushes the sub-anchor. Base images built before this
+  release lack the `anchor "instance"` line; rebuild with
+  `scripts/mac/build-base.sh` (the launcher logs a warning until then).
+  `scripts/mac/debug-guest.sh` prints both anchors.
 - The gateway requires the instance token on every route except health and
   version, as on Linux. The edge still strips the `sk_live_` bearer key.
 - Guest credentials, as `scripts/mac/build-base.sh` and the guest-side

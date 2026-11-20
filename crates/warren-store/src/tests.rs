@@ -5,9 +5,9 @@ use std::{collections::BTreeMap, sync::Arc};
 use rusqlite::ffi;
 use tempfile::TempDir;
 use warren_core::{
-    ApiKey, Backup, Cron, Instance, InstanceStatus, InstanceType, MetricPoint, NetworkMode, Shape,
-    Store, Template, TemplateScope, Workspace,
-    errors::{CODE_CONFLICT, CODE_INTERNAL, CODE_NOT_FOUND},
+    ApiKey, Backup, Cron, Instance, InstanceSecret, InstanceStatus, InstanceType, MetricPoint,
+    NetworkMode, Shape, Store, Template, TemplateScope, Workspace,
+    errors::{CODE_CONFLICT, CODE_INTERNAL, CODE_INVALID_REQUEST, CODE_NOT_FOUND},
 };
 
 use crate::{
@@ -93,6 +93,7 @@ fn inst(id: &str, workspace_id: &str, status: InstanceStatus, created_at: i64) -
         metadata: BTreeMap::from([("plan".to_string(), "pro".to_string())]),
         env: BTreeMap::from([("APP_ENV".to_string(), "production".to_string())]),
         network: NetworkMode::DenyAll,
+        allowed_domains: vec!["api.anthropic.com".into(), "*.npmjs.org".into()],
         auto_sleep: true,
         idle_timeout_seconds: 900,
         url: String::new(),
@@ -111,7 +112,21 @@ fn inst(id: &str, workspace_id: &str, status: InstanceStatus, created_at: i64) -
         ip: "172.30.0.7".into(),
         storage_path: format!("/var/lib/warren/instances/{id}"),
         instance_token: "tok3n".into(),
+        broker_env: BTreeMap::new(),
         disk_used_bytes: 123_456,
+    }
+}
+
+fn secret(instance_id: &str, name: &str, created_at: i64) -> InstanceSecret {
+    InstanceSecret {
+        instance_id: instance_id.into(),
+        name: name.into(),
+        upstream: "https://api.example.com/v1".into(),
+        header: "x-api-key".into(),
+        value: format!("sk-{name}"),
+        env: format!("{name}_BASE_URL"),
+        route_token: format!("token-{instance_id}-{name}"),
+        created_at,
     }
 }
 
@@ -418,7 +433,11 @@ async fn version_1_database_upgrades_to_version_2_and_round_trips() {
         })
         .await
         .unwrap();
-    assert_eq!(versions, vec![1, 2], "version 1 kept, version 2 recorded");
+    assert_eq!(
+        versions,
+        vec![1, 2, 3],
+        "version 1 kept, versions 2 and 3 recorded"
+    );
 
     let ledger_tables: i64 = store
         .run(|c| {
@@ -445,11 +464,20 @@ async fn version_1_database_upgrades_to_version_2_and_round_trips() {
         "instances columns equal the store's column list"
     );
 
-    // Rows written by the old schema read back without their billing fields.
+    // Rows written by the old schema read back without their billing fields
+    // and with an empty allowlist (the version 3 column default).
     let old_ws = ws("ws_old", 100);
     assert_eq!(store.get_workspace("ws_old").await.unwrap(), old_ws);
-    let old_inst = inst("oldinst001", "ws_old", InstanceStatus::Running, 100);
+    let mut old_inst = inst("oldinst001", "ws_old", InstanceStatus::Running, 100);
+    old_inst.allowed_domains.clear();
     assert_eq!(store.get_instance("oldinst001").await.unwrap(), old_inst);
+    assert!(
+        store
+            .list_instance_secrets("oldinst001")
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(store.count_awake_instances("ws_old").await.unwrap(), 1);
 
     // Updates and inserts work against the upgraded tables.
@@ -481,8 +509,117 @@ async fn version_1_database_upgrades_to_version_2_and_round_trips() {
     let again = SqliteStore::open(&path).expect("reopen");
     assert_eq!(
         again.run(|c| migrations::current_version(c)).await.unwrap(),
-        2
+        3
     );
+}
+
+#[tokio::test]
+async fn instance_secrets_round_trip_replace_and_delete() {
+    let (_dir, store) = open();
+    let a = inst("aaaaaaaaaa", "ws_a", InstanceStatus::Running, 100);
+    let b = inst("bbbbbbbbbb", "ws_a", InstanceStatus::Running, 200);
+    store.create_instance(&a).await.unwrap();
+    store.create_instance(&b).await.unwrap();
+    assert!(
+        store
+            .list_instance_secrets("aaaaaaaaaa")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let first = [
+        secret("aaaaaaaaaa", "OPENAI_API_KEY", 1),
+        secret("aaaaaaaaaa", "ANTHROPIC_API_KEY", 2),
+    ];
+    store
+        .replace_instance_secrets("aaaaaaaaaa", &first)
+        .await
+        .unwrap();
+    store
+        .replace_instance_secrets("bbbbbbbbbb", &[secret("bbbbbbbbbb", "GITHUB_TOKEN", 3)])
+        .await
+        .unwrap();
+    let listed = store.list_instance_secrets("aaaaaaaaaa").await.unwrap();
+    assert_eq!(listed, vec![first[1].clone(), first[0].clone()], "by name");
+    assert_eq!(listed[0].value, "sk-ANTHROPIC_API_KEY");
+    assert_eq!(listed[0].route_token, "token-aaaaaaaaaa-ANTHROPIC_API_KEY");
+
+    // Replacing swaps the whole set; the other instance is untouched.
+    let second = [secret("aaaaaaaaaa", "OPENAI_API_KEY", 4)];
+    store
+        .replace_instance_secrets("aaaaaaaaaa", &second)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.list_instance_secrets("aaaaaaaaaa").await.unwrap(),
+        second.to_vec()
+    );
+    assert_eq!(
+        store
+            .list_instance_secrets("bbbbbbbbbb")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // A secret of another instance or a duplicate name is refused and the
+    // transaction leaves the previous set in place.
+    let err = store
+        .replace_instance_secrets("aaaaaaaaaa", &[secret("bbbbbbbbbb", "X_KEY", 5)])
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, CODE_INVALID_REQUEST);
+    let err = store
+        .replace_instance_secrets(
+            "aaaaaaaaaa",
+            &[
+                secret("aaaaaaaaaa", "DUP_KEY", 5),
+                secret("aaaaaaaaaa", "DUP_KEY", 6),
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, CODE_INVALID_REQUEST);
+    assert_eq!(
+        store.list_instance_secrets("aaaaaaaaaa").await.unwrap(),
+        second.to_vec()
+    );
+
+    // An empty set clears; the instance row never carries the secrets.
+    store
+        .replace_instance_secrets("aaaaaaaaaa", &[])
+        .await
+        .unwrap();
+    assert!(
+        store
+            .list_instance_secrets("aaaaaaaaaa")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let json = serde_json::to_string(&store.get_instance("bbbbbbbbbb").await.unwrap()).unwrap();
+    assert!(!json.contains("GITHUB_TOKEN") && !json.contains("sk-"));
+    assert!(json.contains("\"allowed_domains\":[\"api.anthropic.com\",\"*.npmjs.org\"]"));
+
+    // Deleting the instance deletes its secrets.
+    store.delete_instance("bbbbbbbbbb").await.unwrap();
+    assert!(
+        store
+            .list_instance_secrets("bbbbbbbbbb")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let rows: i64 = store
+        .run(|c| {
+            c.query_row("SELECT COUNT(*) FROM instance_secrets", [], |r| r.get(0))
+                .map_err(map_err)
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
 }
 
 #[tokio::test]

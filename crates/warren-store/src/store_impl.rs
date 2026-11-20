@@ -3,10 +3,12 @@
 
 use async_trait::async_trait;
 use warren_core::{
-    ApiKey, Backup, Cron, Instance, MetricPoint, Result, Store, Template, Workspace,
+    ApiKey, Backup, Cron, Instance, InstanceSecret, MetricPoint, Result, Store, Template, Workspace,
 };
 
-use crate::{SqliteStore, api_keys, backups, crons, instances, metrics, templates, workspaces};
+use crate::{
+    SqliteStore, api_keys, backups, crons, instances, metrics, secrets, templates, workspaces,
+};
 
 #[async_trait]
 impl Store for SqliteStore {
@@ -133,6 +135,21 @@ impl Store for SqliteStore {
         let (workspace_id, name) = (workspace_id.to_owned(), name.to_owned());
         self.run(move |c| templates::count_instances_using(c, &workspace_id, &name))
             .await
+    }
+
+    async fn replace_instance_secrets(
+        &self,
+        instance_id: &str,
+        secrets: &[InstanceSecret],
+    ) -> Result<()> {
+        let (instance_id, secrets) = (instance_id.to_owned(), secrets.to_vec());
+        self.run(move |c| secrets::replace(c, &instance_id, &secrets))
+            .await
+    }
+
+    async fn list_instance_secrets(&self, instance_id: &str) -> Result<Vec<InstanceSecret>> {
+        let instance_id = instance_id.to_owned();
+        self.run(move |c| secrets::list(c, &instance_id)).await
     }
 
     async fn insert_metric(&self, instance_id: &str, p: MetricPoint) -> Result<()> {

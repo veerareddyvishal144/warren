@@ -36,6 +36,9 @@ use warren_core::{
 use lume::{GIB, LumeClient, MIN_LUME_VERSION, RunRequest, SetRequest, SharedDirectory, VmDetails};
 
 pub const RUNTIME_NAME: &str = "lume";
+/// The Mac's address on Lume's NAT network: where guests reach the daemon and
+/// its egress broker, and the one address the guest's `pf` rules always allow.
+pub const HOST_GATEWAY: &str = "192.168.64.1";
 /// Prefix of every VM this runtime owns.
 pub const VM_PREFIX: &str = "warren-";
 /// Clone-boot to a healthy gateway: 11 s boot plus the launcher's copy on a
@@ -105,7 +108,11 @@ impl MacRuntime {
     }
 
     fn write_share(&self, inst: &Instance, tpl: &Template) -> Result<()> {
-        let env = inst.effective_env(&tpl.env);
+        let mut env = inst.effective_env(&tpl.env);
+        // The launcher inside the guest enforces the policy with pf and needs
+        // the mode even when the lifecycle computed no broker variables.
+        env.entry(warren_core::ENV_NETWORK.to_string())
+            .or_insert_with(|| inst.network.as_str().to_string());
         share::write_share(&self.share_dir(inst), self.gateway_bin()?, &env)
     }
 
@@ -330,6 +337,10 @@ fn file_len(p: &Path) -> i64 {
 impl Runtime for MacRuntime {
     fn name(&self) -> &'static str {
         RUNTIME_NAME
+    }
+
+    async fn broker_host(&self, _inst: &Instance) -> Result<Option<String>> {
+        Ok(Some(HOST_GATEWAY.to_string()))
     }
 
     async fn ready(&self) -> Result<()> {

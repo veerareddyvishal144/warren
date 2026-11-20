@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
 use warren_core::{
-    CreateInstanceRequest, Error, ExecRequest, InstanceType, Result, ShapeRequest,
-    agentapi::ResponsesRequest, ids,
+    CreateInstanceRequest, Error, ExecRequest, InstanceType, NetworkMode, Result, SecretSpec,
+    ShapeRequest, agentapi::ResponsesRequest, broker, ids,
 };
 
 /// Lowest signed-URL lifetime the API accepts, in seconds.
@@ -83,8 +83,54 @@ pub struct CreateInstanceArgs {
     pub auto_sleep: Option<bool>,
     /// Idle timeout for auto_sleep in seconds, 300..86400. Default 900.
     pub idle_timeout_seconds: Option<u32>,
-    /// Environment variables injected into the instance. Keys match [A-Z_][A-Z0-9_]*, at most 64 entries, values up to 4 KiB.
+    /// Environment variables injected into the instance. Keys match [A-Z_][A-Z0-9_]*, at most 64 entries, values up to 4 KiB. Anything running inside can read them; use `secrets` for provider keys.
     pub env: Option<BTreeMap<String, String>>,
+    /// Outbound network policy: "allow-all" (default: the internet, minus the host-wide blocks of private and metadata ranges), "deny-all" (no route out) or "allowlist" (no route out except HTTP and HTTPS to the hosts in `allowed_domains`, through a proxy on the host; the instance gets HTTP_PROXY/HTTPS_PROXY pointing at it, so curl, pip, npm, git and the provider SDKs work unchanged).
+    pub network: Option<String>,
+    /// Hosts an "allowlist" instance may reach: exact names ("api.anthropic.com") or wildcards ("*.npmjs.org" matches every name below the suffix, not the suffix itself). At most 64. IP addresses, localhost and private ranges are never allowed. Ignored by the other modes.
+    pub allowed_domains: Option<Vec<String>>,
+    /// Credentials the host-side broker injects on the instance's behalf, so the value never enters the instance and is never returned by any read. At most 16. For each secret the instance receives `env` = a private route URL to use as the provider's base URL and `name` = the placeholder "warren-broker"; a request to the route is forwarded to `upstream` with `header: value` added. Works in every network mode.
+    pub secrets: Option<Vec<SecretArg>>,
+}
+
+/// One brokered credential of `create_instance`.
+#[derive(Clone, Default, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct SecretArg {
+    /// Variable the instance sees with a placeholder value, so tools find a non-empty key: [A-Z_][A-Z0-9_]*, e.g. "ANTHROPIC_API_KEY".
+    pub name: String,
+    /// https:// base URL requests are forwarded to, optionally with a path prefix, e.g. "https://api.anthropic.com".
+    pub upstream: String,
+    /// Header the broker adds: "x-api-key", or "Authorization" (sent as "Bearer <value>" unless the value already carries a scheme).
+    pub header: String,
+    /// The credential itself, up to 8 KiB. Write-only.
+    pub value: String,
+    /// Variable that receives the route URL (http://<broker>/r/<token>) the tool must use instead of the provider's address, e.g. "ANTHROPIC_BASE_URL" or "OPENAI_BASE_URL".
+    pub env: String,
+}
+
+impl std::fmt::Debug for SecretArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretArg")
+            .field("name", &self.name)
+            .field("upstream", &self.upstream)
+            .field("header", &self.header)
+            .field("value", &"<redacted>")
+            .field("env", &self.env)
+            .finish()
+    }
+}
+
+impl From<SecretArg> for SecretSpec {
+    fn from(s: SecretArg) -> SecretSpec {
+        SecretSpec {
+            name: s.name,
+            upstream: s.upstream,
+            header: s.header,
+            value: s.value,
+            env: s.env,
+        }
+    }
 }
 
 impl CreateInstanceArgs {
@@ -117,6 +163,29 @@ impl CreateInstanceArgs {
                 "invalid env key {bad:?}: keys match [A-Z_][A-Z0-9_]*"
             )));
         }
+        let network = match self
+            .network
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => None,
+            Some(s) => Some(NetworkMode::parse(s).ok_or_else(|| {
+                Error::invalid(format!(
+                    "unknown network mode {s:?}; use \"allow-all\", \"deny-all\" or \"allowlist\""
+                ))
+            })?),
+        };
+        let allowed_domains = match self.allowed_domains {
+            Some(domains) => Some(broker::normalize_allowed_domains(&domains)?),
+            None => None,
+        };
+        let secrets: Option<Vec<SecretSpec>> = self
+            .secrets
+            .map(|s| s.into_iter().map(SecretSpec::from).collect());
+        if let Some(s) = &secrets {
+            broker::validate_secrets(s)?;
+        }
         let template = self
             .template
             .map(|t| t.trim().to_string())
@@ -133,6 +202,9 @@ impl CreateInstanceArgs {
             env: self.env,
             auto_sleep: self.auto_sleep,
             idle_timeout_seconds: self.idle_timeout_seconds,
+            network,
+            allowed_domains,
+            secrets,
             ..Default::default()
         })
     }
@@ -317,6 +389,56 @@ mod tests {
         assert!(req.template.is_none() && req.shape.is_none() && req.kind.is_none());
         let body = serde_json::to_value(&req).unwrap();
         assert_eq!(body, json!({}), "absent fields must not be sent");
+    }
+
+    #[test]
+    fn create_args_carry_network_allowlist_and_secrets() {
+        let args: CreateInstanceArgs = serde_json::from_value(json!({
+            "network": "allowlist",
+            "allowed_domains": ["API.Anthropic.com", "*.npmjs.org"],
+            "secrets": [{
+                "name": "ANTHROPIC_API_KEY", "upstream": "https://api.anthropic.com",
+                "header": "x-api-key", "value": "sk-ant-real", "env": "ANTHROPIC_BASE_URL"
+            }]
+        }))
+        .unwrap();
+        assert!(
+            !format!("{args:?}").contains("sk-ant-real"),
+            "debug output redacts the value"
+        );
+        let req = args.into_request().unwrap();
+        assert_eq!(req.network, Some(NetworkMode::Allowlist));
+        assert_eq!(
+            req.allowed_domains.as_deref(),
+            Some(&["api.anthropic.com".to_string(), "*.npmjs.org".to_string()][..])
+        );
+        let secrets = req.secrets.unwrap();
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].name, "ANTHROPIC_API_KEY");
+        assert_eq!(secrets[0].value, "sk-ant-real");
+        assert_eq!(secrets[0].env, "ANTHROPIC_BASE_URL");
+
+        for (bad, want) in [
+            (json!({ "network": "open" }), "allowlist"),
+            (
+                json!({ "allowed_domains": ["localhost"] }),
+                "allowed_domains",
+            ),
+            (
+                json!({ "secrets": [{ "name": "K", "upstream": "http://a.example.com", "header": "x-api-key", "value": "v", "env": "K_URL" }] }),
+                "https://",
+            ),
+            (
+                json!({ "secrets": [{ "name": "K", "upstream": "https://a.example.com", "header": "x-api-key", "value": "v" }] }),
+                "missing field",
+            ),
+        ] {
+            let msg = match serde_json::from_value::<CreateInstanceArgs>(bad.clone()) {
+                Ok(args) => args.into_request().unwrap_err().message,
+                Err(e) => e.to_string(),
+            };
+            assert!(msg.contains(want), "{bad}: {msg}");
+        }
     }
 
     #[test]

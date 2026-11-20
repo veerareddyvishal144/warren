@@ -161,7 +161,7 @@ echo "===== guest: processes and listeners ====="
 guest 'ps aux | grep -E "[w]arren-gateway|[l]auncher" || echo "(no gateway process)"; echo ---; sudo_ lsof -nP -iTCP:3737 -sTCP:LISTEN 2>/dev/null || echo "(nothing listens on 3737)"' || true
 echo
 echo "===== guest: pf status ====="
-guest 'sudo_ pfctl -s info 2>/dev/null | head -3; sudo_ pfctl -a dev.warren -s rules 2>/dev/null' || true
+guest 'sudo_ pfctl -s info 2>/dev/null | head -3; sudo_ pfctl -a dev.warren -s rules 2>/dev/null; echo "--- dev.warren/instance (per-instance network policy)"; sudo_ pfctl -a dev.warren/instance -s rules 2>/dev/null || echo "(empty: allow-all, or not loaded)"' || true
 echo
 echo "===== guest: effective sshd authentication settings ====="
 guest 'sudo_ /usr/sbin/sshd -T 2>/dev/null | grep -iE "^(passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication) " || echo "(sshd -T printed nothing)"' || true

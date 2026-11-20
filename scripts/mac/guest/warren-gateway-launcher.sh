@@ -8,7 +8,8 @@
 # of `export KEY='value'` lines (instance id, token, driver, model, ...).
 #
 # This script waits for both files, copies the binary into the home when it
-# differs from the installed one, sources the environment and starts the
+# differs from the installed one, sources the environment, applies the
+# instance's network policy with pf (see apply_egress_policy) and starts the
 # gateway as the guest user, inside that user's own launchd domain:
 #
 #   launchctl asuser <uid> sudo -n -E -u lume -H warren-gateway --serve
@@ -90,6 +91,63 @@ set -u
 export WARREN_HOME="${WARREN_HOME:-$HOME_DIR}"
 export HOME="$HOME_DIR"
 cd "$HOME_DIR"
+
+# --- network policy (pf) -----------------------------------------------------------
+# WARREN_NETWORK in warren.env is the instance's policy: allow-all, deny-all or
+# allowlist. The base image's anchor "dev.warren" (pf.anchor.template) passes
+# loopback and the host gateway, then evaluates the sub-anchor
+# "dev.warren/instance", then blocks the rest of the NAT subnet. This loads
+# the sub-anchor: for deny-all and allowlist a block of every other outbound
+# packet (DHCP renewals excepted), so the guest reaches the host, where
+# warrend and its egress broker live, and nothing else; an allowlist instance
+# reaches the internet only through the broker its proxy variables point at
+# (WARREN_BROKER, HTTPS_PROXY). allow-all flushes the sub-anchor. Needs root;
+# a policy that cannot be loaded is fatal, so a restricted instance never
+# runs open.
+PF_PARENT_ANCHOR="dev.warren"
+PF_INSTANCE_ANCHOR="dev.warren/instance"
+apply_egress_policy() {
+    local mode="${WARREN_NETWORK:-allow-all}"
+    if [ "$AS_ROOT" != 1 ]; then
+        log "not root: network policy $mode is not applied (pf needs root)"
+        return 0
+    fi
+    if ! /sbin/pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; then
+        log "warning: pf is not enabled; network policy $mode is not enforced until dev.warren.pf enables it"
+    fi
+    if ! /sbin/pfctl -a "$PF_PARENT_ANCHOR" -s rules 2>/dev/null | grep -q 'anchor "instance"'; then
+        log "warning: anchor $PF_PARENT_ANCHOR does not evaluate \"instance\"; rebuild the base image with scripts/mac/build-base.sh for network policy $mode to take effect"
+    fi
+    case "$mode" in
+        allow-all)
+            if ! out="$(/sbin/pfctl -a "$PF_INSTANCE_ANCHOR" -F rules 2>&1)"; then
+                log "warning: could not flush $PF_INSTANCE_ANCHOR: $out"
+            fi
+            log "network policy allow-all: pf sub-anchor $PF_INSTANCE_ANCHOR flushed"
+            ;;
+        deny-all|allowlist)
+            local rules
+            rules="$(mktemp /tmp/warren-pf.XXXXXX)"
+            {
+                printf '# warren network policy %s, written by warren-gateway-launcher.sh\n' "$mode"
+                printf '# loopback and the host gateway are passed by anchor %s before this one\n' "$PF_PARENT_ANCHOR"
+                printf 'pass out quick proto udp from any port 68 to any port 67 flags any no state\n'
+                printf 'block out quick from any to any\n'
+            } >"$rules"
+            if ! out="$(/sbin/pfctl -a "$PF_INSTANCE_ANCHOR" -f "$rules" 2>&1)"; then
+                log "error: pfctl could not load $PF_INSTANCE_ANCHOR for network policy $mode: $out"
+                rm -f "$rules"
+                exit 1
+            fi
+            rm -f "$rules"
+            log "network policy $mode: outbound blocked except the host gateway (broker ${WARREN_BROKER:-unset}) via pf sub-anchor $PF_INSTANCE_ANCHOR"
+            ;;
+        *)
+            log "warning: unknown WARREN_NETWORK=$mode; pf left as is"
+            ;;
+    esac
+}
+apply_egress_policy
 
 if [ "$AS_ROOT" = 1 ]; then
     log "starting $INSTALL_BIN --serve as $GUEST_USER (uid $GUEST_UID) in launchd domain user/$GUEST_UID (instance ${WARREN_INSTANCE_ID:-unknown}, WARREN_HOME=$WARREN_HOME)"

@@ -4,7 +4,8 @@
 # talk to the host gateway (@GATEWAY@: NAT, DNS, DHCP and warrend reaching the
 # gateway port) but to nothing else on that subnet, so one tenant's VM cannot
 # reach another tenant's gateway or SSH port. Everything else (loopback, the
-# internet through the NAT) is untouched. Rendered by install.sh into
+# internet through the NAT) is untouched unless the instance's network policy
+# (sub-anchor "instance" below) says otherwise. Rendered by install.sh into
 # /etc/pf.anchors/dev.warren; rules are evaluated in order and `quick` stops
 # evaluation at the first match.
 
@@ -25,6 +26,13 @@ pass quick on lo0 all flags any no state
 # The host is always reachable in both directions.
 pass in quick from $host_gateway to any flags any no state
 pass out quick from any to $host_gateway flags any no state
+
+# Per-instance network policy, loaded into the nested anchor by
+# warren-gateway-launcher.sh from the WARREN_NETWORK the daemon hands the
+# guest: empty for allow-all; for deny-all and allowlist a block of every
+# other outbound packet, so the guest reaches the host (warrend and its egress
+# broker, which proxies an allowlist instance's HTTP(S)) and nothing else.
+anchor "instance"
 
 # Every other address on the NAT subnet is another VM: drop both directions.
 block in quick from $vm_subnet to any

@@ -19,7 +19,7 @@ Environment
 
 Instances
 - Create: POST /instances with any of {"template":"warren-base"|"warren-agent"|"warren-opencode"|"warren-claude"|"warren-macos", "name", "resources":{"cpu","memory","disk"},
-  "env":{...}, "auto_sleep":true, "idle_timeout_seconds":900, "network":"allow-all"|"deny-all"}. Shapes: 2/4, 4/8, 4/16, 4/32 (vCPU/GB).
+  "env":{...}, "auto_sleep":true, "idle_timeout_seconds":900, "network":"allow-all"|"deny-all"|"allowlist", "allowed_domains":["api.example.com","*.npmjs.org"], "secrets":[{"name","upstream","header","value","env"}] (write-only; the instance gets a route URL in `env` instead of the value)}. Shapes: 2/4, 4/8, 4/16, 4/32 (vCPU/GB).
   The response has "id" (10 chars) and "url". Status starts at "provisioning"; poll GET /instances/{id} until "running" before using it.
 - Run a command: POST /instances/{id}/exec {"command":"...", "user":"root"?, "timeout_seconds":600?} -> {"exit_code","stdout","stderr","duration_ms","truncated"}.
   The command runs through a shell as user agent (uid 1000, passwordless sudo) in /home/agent. A non-zero exit_code is normal data. Output is capped at 1 MiB per stream.

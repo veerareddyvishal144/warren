@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use warren_core::{Error, Result, ids};
+use warren_core::{Error, Result, SecretSpec, ids};
 
 /// Split `K=V` at the first `=`; the key must be non-empty.
 pub fn parse_kv(s: &str) -> Result<(String, String)> {
@@ -35,6 +35,46 @@ pub fn parse_env_pairs(items: &[String]) -> Result<BTreeMap<String, String>> {
 /// Parse repeated `K=V` flags without key validation (metadata).
 pub fn parse_pairs(items: &[String]) -> Result<BTreeMap<String, String>> {
     items.iter().map(|s| parse_kv(s)).collect()
+}
+
+/// One `--secret` flag: `NAME=VALUE@UPSTREAM#HEADER#ENV`. Parsed from the
+/// right (`ENV`, then `HEADER`, then the last `@https://`), so a value may
+/// hold `=` and `@` but not `#`. The daemon validates the parts again.
+pub fn parse_secret_spec(s: &str) -> Result<SecretSpec> {
+    let usage = || {
+        Error::invalid(format!(
+            "secret {s:?} does not match NAME=VALUE@UPSTREAM#HEADER#ENV, e.g. \
+             ANTHROPIC_API_KEY=sk-ant-...@https://api.anthropic.com#x-api-key#ANTHROPIC_BASE_URL"
+        ))
+    };
+    let (name, rest) = s.split_once('=').ok_or_else(usage)?;
+    let (rest, env) = rest.rsplit_once('#').ok_or_else(usage)?;
+    let (rest, header) = rest.rsplit_once('#').ok_or_else(usage)?;
+    let at = rest.rfind("@https://").ok_or_else(usage)?;
+    let (value, upstream) = (&rest[..at], &rest[at + 1..]);
+    let spec = SecretSpec {
+        name: name.trim().to_string(),
+        upstream: upstream.trim().to_string(),
+        header: header.trim().to_string(),
+        value: value.to_string(),
+        env: env.trim().to_string(),
+    };
+    for (what, var) in [("NAME", &spec.name), ("ENV", &spec.env)] {
+        if !ids::valid_env_key(var) {
+            return Err(Error::invalid(format!(
+                "secret {what} {var:?} is not a variable name ([A-Z_][A-Z0-9_]*)"
+            )));
+        }
+    }
+    if spec.value.is_empty() || spec.header.is_empty() {
+        return Err(usage());
+    }
+    Ok(spec)
+}
+
+/// Parse every `--secret` flag.
+pub fn parse_secret_specs(items: &[String]) -> Result<Vec<SecretSpec>> {
+    items.iter().map(|s| parse_secret_spec(s)).collect()
 }
 
 /// Quote one word for POSIX `sh`.
@@ -143,6 +183,39 @@ pub fn find_in_path(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_specs() {
+        let s = parse_secret_spec(
+            "ANTHROPIC_API_KEY=sk-ant-a=b@c@https://api.anthropic.com/v1#x-api-key#ANTHROPIC_BASE_URL",
+        )
+        .unwrap();
+        assert_eq!(s.name, "ANTHROPIC_API_KEY");
+        assert_eq!(s.value, "sk-ant-a=b@c");
+        assert_eq!(s.upstream, "https://api.anthropic.com/v1");
+        assert_eq!(s.header, "x-api-key");
+        assert_eq!(s.env, "ANTHROPIC_BASE_URL");
+        let s = parse_secret_spec("GH_TOKEN=ghp_x@https://api.github.com#Authorization#GH_API")
+            .unwrap();
+        assert_eq!(
+            (s.header.as_str(), s.env.as_str()),
+            ("Authorization", "GH_API")
+        );
+        for bad in [
+            "NAME",
+            "NAME=value",
+            "NAME=value@https://x.example.com",
+            "NAME=value@https://x.example.com#hdr",
+            "NAME=value@http://x.example.com#hdr#ENV",
+            "lower=value@https://x.example.com#hdr#ENV",
+            "NAME=value@https://x.example.com#hdr#bad env",
+            "NAME=@https://x.example.com#hdr#ENV",
+            "NAME=value@https://x.example.com##ENV",
+        ] {
+            assert!(parse_secret_spec(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse_secret_specs(&[]).unwrap().len(), 0);
+    }
 
     #[test]
     fn kv_pairs() {

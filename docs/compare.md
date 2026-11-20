@@ -41,7 +41,7 @@ In plain terms, as of this release:
 - **Two macOS guests per Mac, and no cloud.** Daytona rents you as many Macs as you pay for, in their region, with an SLA. Warren runs on the Mac you have: two guests, your uptime, no regions, no elasticity. More capacity means more Macs and, until multi-node lands, one daemon per Mac.
 - **Unreleased, single node, one maintainer.** No tagged release yet, no published binaries at the time of writing (see [install.md](install.md) for the current state), no community to speak of. The cloud providers are companies with support contracts.
 - **Depends on Lume**, which hosts every VM in one process and exposes an unauthenticated local API ([limits.md](limits.md)). The DIY route has the same dependency with the same properties; the cloud providers hide theirs.
-- **`deny-all` is not enforced on macOS instances** and the daemon installs no host-wide egress drops on a Mac. On Linux both work.
+- **Egress policy on macOS instances is enforced inside the guest** by `pf` rules the gateway launcher loads from the daemon's policy (base images from this release), not by the host, and the daemon installs no host-wide egress drops on a Mac. On Linux the host enforces `deny-all` and `allowlist`.
 - **No TLS built in, no audit log, no per-workspace CPU/RAM totals**, no disk quota on the Linux home directory. The cloud providers have all of these because they must.
 - **The three-command path is new.** `warren up`, `warren connect claude` and `warren run -- claude` were added in this release ([run.md](run.md)); `sbx run claude` and `/sandbox` have had more hands on them.
 

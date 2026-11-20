@@ -4,6 +4,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     sync::{
         Mutex, OnceLock,
@@ -20,8 +21,8 @@ use warren_core::{
 };
 
 use crate::{
-    CONTAINER_PREFIX, HOME_DIR, NETWORK_INTERNAL, NETWORK_PUBLIC, error, netpolicy,
-    observe::CpuSample,
+    CONTAINER_PREFIX, HOME_DIR, NETWORK_INTERNAL, NETWORK_PUBLIC, container::network_for, error,
+    netpolicy, observe::CpuSample,
 };
 
 /// Default-type instances as Docker containers.
@@ -341,9 +342,28 @@ impl DockerRuntime {
         )
     }
 
+    /// IPv4 gateway of the Docker network `name`: the host's address on that
+    /// bridge, where instances reach the daemon's broker.
+    pub(crate) async fn network_gateway(&self, name: &str) -> Result<Option<Ipv4Addr>> {
+        let net = self
+            .docker
+            .inspect_network(name, None)
+            .await
+            .map_err(|e| error::map(e, "network"))?;
+        Ok(net
+            .ipam
+            .and_then(|i| i.config)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|c| c.gateway.as_deref())
+            .find_map(netpolicy::parse_gateway))
+    }
+
     /// Install the egress firewall rules for both Warren bridges when running as
     /// root; otherwise warn once and leave them out. Idempotent. As root a
     /// failure is an error: the daemon must not silently run without them.
+    /// With a broker, each bridge also gets the accept for the broker port on
+    /// its gateway, inserted last so it is evaluated first.
     async fn install_egress_rules(&self) -> Result<()> {
         if !netpolicy::is_root() {
             if !self.egress_warned.swap(true, Ordering::Relaxed) {
@@ -365,6 +385,7 @@ impl DockerRuntime {
                 "no host addresses found; instances are not kept from reaching the host"
             );
         }
+        let broker_port = self.cfg.broker_enabled().then(|| self.cfg.broker_port());
         let mut added = 0usize;
         for name in [NETWORK_PUBLIC, NETWORK_INTERNAL] {
             let bridge = self.bridge_interface(name).await?;
@@ -374,11 +395,27 @@ impl DockerRuntime {
                     added += 1;
                 }
             }
+            if let Some(port) = broker_port {
+                match self.network_gateway(name).await? {
+                    Some(gateway) => {
+                        for rule in netpolicy::broker_rules(&bridge, gateway, port) {
+                            if netpolicy::ensure_rule(&iptables, &rule).await? {
+                                added += 1;
+                            }
+                        }
+                    }
+                    None => tracing::warn!(
+                        network = name,
+                        "network has no IPv4 gateway; its instances cannot reach the broker"
+                    ),
+                }
+            }
         }
         self.egress_installed.store(true, Ordering::Relaxed);
         tracing::info!(
             added,
             allow_private_egress = self.cfg.allow_private_egress,
+            broker_port,
             host_addrs = ?host_addrs,
             "egress rules in place for the warren bridges"
         );
@@ -398,6 +435,13 @@ impl Runtime for DockerRuntime {
 
     async fn ensure_image(&self, image_ref: &str) -> Result<String> {
         self.ensure_image_impl(image_ref).await
+    }
+
+    async fn broker_host(&self, inst: &Instance) -> Result<Option<String>> {
+        Ok(self
+            .network_gateway(network_for(inst.network))
+            .await?
+            .map(|ip| ip.to_string()))
     }
 
     async fn create(&self, inst: &mut Instance, tpl: &Template) -> Result<()> {

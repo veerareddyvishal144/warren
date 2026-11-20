@@ -46,7 +46,7 @@ export type InstanceStatus =
   | "deleted";
 
 export type InstanceType = "default" | "vm" | "mac" | "performance";
-export type NetworkMode = "allow-all" | "deny-all";
+export type NetworkMode = "allow-all" | "deny-all" | "allowlist";
 export type TemplateScope = "system" | "workspace";
 
 /** CPU count, memory in GB and disk in GB. */
@@ -124,6 +124,8 @@ export interface Instance {
   metadata?: Record<string, string>;
   env?: Record<string, string>;
   network: NetworkMode;
+  /** Hosts an `allowlist` instance may reach (exact names or `*.suffix`); absent when empty. */
+  allowed_domains?: string[];
   auto_sleep: boolean;
   idle_timeout_seconds: number;
   url: string;
@@ -223,6 +225,26 @@ export interface RegisterTemplateRequest {
   env?: Record<string, string>;
 }
 
+/**
+ * A credential the host-side broker injects for an instance (write-only).
+ * The instance receives `env` = a private route URL to use as the provider's
+ * base URL and `name` = the placeholder `warren-broker`; the broker forwards
+ * requests to `upstream` with `header: value` added. `value` never enters the
+ * instance and is never returned by any read.
+ */
+export interface SecretSpec {
+  /** Variable the instance sees with a placeholder value, e.g. `ANTHROPIC_API_KEY`. */
+  name: string;
+  /** `https://` base URL, optionally with a path prefix. */
+  upstream: string;
+  /** Header to add: `x-api-key`, or `Authorization` (sent as `Bearer <value>`). */
+  header: string;
+  /** The credential, up to 8 KiB. */
+  value: string;
+  /** Variable that receives the route URL, e.g. `ANTHROPIC_BASE_URL`. */
+  env: string;
+}
+
 /** Body of `POST /v1/instances`; every field is optional. */
 export interface CreateInstanceRequest {
   template?: string;
@@ -235,9 +257,17 @@ export interface CreateInstanceRequest {
   auto_sleep?: boolean;
   idle_timeout_seconds?: number;
   network?: NetworkMode;
+  /** Hosts an `allowlist` instance may reach: exact names or `*.suffix`, at most 64. */
+  allowed_domains?: string[];
+  /** Write-only brokered credentials, at most 16. */
+  secrets?: SecretSpec[];
 }
 
-/** Body of `PATCH /v1/instances/{id}`; absent fields stay, maps are replaced whole. */
+/**
+ * Body of `PATCH /v1/instances/{id}`; absent fields stay, maps and lists are
+ * replaced whole. `allowed_domains` and the values of secrets that keep their
+ * name apply live; `env` and new secret names apply at the next start.
+ */
 export interface PatchInstanceRequest {
   name?: string;
   metadata?: Record<string, string>;
@@ -245,6 +275,8 @@ export interface PatchInstanceRequest {
   auto_sleep?: boolean;
   idle_timeout_seconds?: number;
   network?: NetworkMode;
+  allowed_domains?: string[];
+  secrets?: SecretSpec[];
 }
 
 /** Body of `POST /v1/instances/{id}/fork`. */

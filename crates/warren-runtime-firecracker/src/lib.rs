@@ -369,10 +369,21 @@ impl FirecrackerRuntime {
     }
 }
 
+impl FirecrackerRuntime {
+    /// The broker port guests may reach on the bridge address, when the daemon runs one.
+    fn broker_port(&self) -> Option<u16> {
+        self.cfg.broker_enabled().then(|| self.cfg.broker_port())
+    }
+}
+
 #[async_trait]
 impl Runtime for FirecrackerRuntime {
     fn name(&self) -> &'static str {
         RUNTIME_NAME
+    }
+
+    async fn broker_host(&self, _inst: &Instance) -> Result<Option<String>> {
+        Ok(Some(net::HOST_IP.to_string()))
     }
 
     async fn ready(&self) -> Result<()> {
@@ -427,7 +438,7 @@ impl Runtime for FirecrackerRuntime {
         let dir = self.cfg.instances_dir();
         std::fs::create_dir_all(&dir)
             .map_err(|e| Error::internal(format!("mkdir {}: {e}", dir.display())))?;
-        host::ensure_network(self.cfg.allow_private_egress).await?;
+        host::ensure_network(self.cfg.allow_private_egress, self.broker_port()).await?;
         tracing::info!(firecracker = %bin.display(), kernel = %kernel.display(), bridge = BRIDGE, "firecracker runtime ready");
         Ok(())
     }
@@ -506,7 +517,7 @@ impl Runtime for FirecrackerRuntime {
         }
 
         self.write_config(inst, &p, ip)?;
-        host::ensure_network(self.cfg.allow_private_egress).await?;
+        host::ensure_network(self.cfg.allow_private_egress, self.broker_port()).await?;
         let tap = net::tap_name(&inst.id);
         host::tap_create(&tap).await?;
         if let Err(e) = host::set_egress(ip, inst.network == NetworkMode::AllowAll).await {

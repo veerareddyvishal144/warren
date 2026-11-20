@@ -12,8 +12,8 @@ use std::{
 
 use async_trait::async_trait;
 use warren_core::{
-    ApiKey, Backup, Clock, Cron, Error, ExecRequest, ExecResult, Instance, LogsOptions,
-    MetricPoint, Result, RunInfo, Runtime, Shape, Stats, Store, Template, Workspace,
+    ApiKey, Backup, Clock, Cron, Error, ExecRequest, ExecResult, Instance, InstanceSecret,
+    LogsOptions, MetricPoint, Result, RunInfo, Runtime, Shape, Stats, Store, Template, Workspace,
 };
 
 /// (workspace_id, name); system templates use an empty workspace id.
@@ -215,6 +215,17 @@ impl Store for FakeStore {
             .get(&key(workspace_id, name))
             .copied()
             .unwrap_or(0))
+    }
+
+    async fn replace_instance_secrets(
+        &self,
+        _instance_id: &str,
+        _secrets: &[InstanceSecret],
+    ) -> Result<()> {
+        unused()
+    }
+    async fn list_instance_secrets(&self, _instance_id: &str) -> Result<Vec<InstanceSecret>> {
+        unused()
     }
 
     async fn insert_metric(&self, _instance_id: &str, _p: MetricPoint) -> Result<()> {

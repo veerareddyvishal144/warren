@@ -8,10 +8,13 @@ use warren_cli::cli::{BackupsCmd, CreateArgs, CronsCmd, InstancesCmd};
 use warren_cli::output::{
     INSTANCE_KEYS, Kind, items_of, render_list, render_object, to_json_pretty,
 };
-use warren_cli::util::{find_in_path, parse_env_pairs, parse_pairs, shell_join};
+use warren_cli::util::{
+    find_in_path, parse_env_pairs, parse_pairs, parse_secret_specs, shell_join,
+};
 use warren_cli::{EXIT_OK, Failure};
 use warren_core::{
-    CreateInstanceRequest, Error, ExecRequest, ForkRequest, InstanceStatus, ShapeRequest,
+    CreateInstanceRequest, Error, ExecRequest, ForkRequest, InstanceStatus, NetworkMode,
+    PatchInstanceRequest, SecretSpec, ShapeRequest,
 };
 
 use super::api::Api;
@@ -53,6 +56,19 @@ pub async fn run(ctx: &Ctx, cmd: InstancesCmd) -> Result<i32, Failure> {
         InstancesCmd::Restart { id } => {
             let v = api.restart_instance(&id).await?;
             ctx.emit(&v, || status_line(&v))
+        }
+        InstancesCmd::Network {
+            id,
+            mode,
+            allow_domains,
+            clear_domains,
+            secrets,
+            clear_secrets,
+        } => {
+            let req =
+                network_request(mode, &allow_domains, clear_domains, &secrets, clear_secrets)?;
+            let v = api.patch_instance(&id, &req).await?;
+            ctx.emit(&v, || render_object(&v, INSTANCE_KEYS))
         }
         InstancesCmd::Resize {
             id,
@@ -133,6 +149,7 @@ pub fn create_request(args: &CreateArgs) -> Result<CreateInstanceRequest, Failur
     );
     let env = parse_env_pairs(&args.env).map_err(usage)?;
     let metadata = parse_pairs(&args.metadata).map_err(usage)?;
+    let secrets = parse_secret_specs(&args.secrets).map_err(usage)?;
     if let Some(idle) = args.idle
         && !(warren_core::MIN_IDLE_TIMEOUT_SEC..=warren_core::MAX_IDLE_TIMEOUT_SEC).contains(&idle)
     {
@@ -153,6 +170,41 @@ pub fn create_request(args: &CreateArgs) -> Result<CreateInstanceRequest, Failur
         auto_sleep: args.auto_sleep.then_some(true),
         idle_timeout_seconds: args.idle,
         network: args.network,
+        allowed_domains: (!args.allow_domains.is_empty()).then(|| args.allow_domains.clone()),
+        secrets: (!secrets.is_empty()).then_some(secrets),
+    })
+}
+
+/// The patch body of `warren instances network`: only the parts given.
+pub fn network_request(
+    mode: Option<NetworkMode>,
+    allow_domains: &[String],
+    clear_domains: bool,
+    secrets: &[String],
+    clear_secrets: bool,
+) -> Result<PatchInstanceRequest, Failure> {
+    let allowed_domains = if clear_domains {
+        Some(Vec::new())
+    } else {
+        (!allow_domains.is_empty()).then(|| allow_domains.to_vec())
+    };
+    let secrets: Option<Vec<SecretSpec>> = if clear_secrets {
+        Some(Vec::new())
+    } else if secrets.is_empty() {
+        None
+    } else {
+        Some(parse_secret_specs(secrets).map_err(usage)?)
+    };
+    if mode.is_none() && allowed_domains.is_none() && secrets.is_none() {
+        return Err(Failure::usage(
+            "give at least one of --mode, --allow-domain, --clear-domains, --secret or --clear-secrets",
+        ));
+    }
+    Ok(PatchInstanceRequest {
+        network: mode,
+        allowed_domains,
+        secrets,
+        ..Default::default()
     })
 }
 
