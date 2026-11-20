@@ -1,0 +1,76 @@
+# Warren daemon as a systemd system service (Linux).
+#
+# Install by hand:
+#   sudo install -m 0644 packaging/systemd/warrend.service /etc/systemd/system/warrend.service
+#   sudo install -d -m 0750 /etc/warren
+#   sudo install -m 0640 packaging/systemd/warrend.env.example /etc/warren/warrend.env   # then edit it
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now warrend
+#   sudo journalctl -u warrend -f
+#
+# Assumes the binaries from a release tarball (or scripts/install.sh run as root)
+# in /usr/local/bin: warrend finds warren-gateway next to itself. Change
+# ExecStart if they live elsewhere (Homebrew on Linux: /home/linuxbrew/.linuxbrew/bin).
+# Configuration is WARREN_* variables in /etc/warren/warrend.env; every flag
+# and its default is listed in docs/self-hosting.md.
+
+[Unit]
+Description=Warren daemon (sandbox API, edge, lifecycle, cron)
+Documentation=https://github.com/veerareddyvishal144/warren/blob/main/docs/self-hosting.md
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+# Defaults that the environment file may override (later assignments win).
+Environment=WARREN_DATA_DIR=/var/lib/warren
+Environment=WARREN_LOG=info
+EnvironmentFile=/etc/warren/warrend.env
+ExecStart=/usr/local/bin/warrend
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+KillSignal=SIGTERM
+# On SIGTERM the daemon stops its loops and listener; instances keep running
+# under Docker and are adopted again at the next start.
+TimeoutStopSec=30
+
+# Runs as root on purpose: the daemon installs the instance egress rules
+# (iptables, DOCKER-USER chain) and vm instances need /dev/kvm and tap devices.
+# A non-root daemon starts, logs a warning and installs no egress rules; it then
+# needs membership of the docker group. Do not add User= without reading
+# docs/self-hosting.md section 2 and 8.
+
+# systemd creates these with the given modes and keeps them across upgrades.
+StateDirectory=warren
+StateDirectoryMode=0700
+ConfigurationDirectory=warren
+ConfigurationDirectoryMode=0750
+
+# Hardening. Everything here keeps /run/docker.sock reachable (the daemon talks
+# to dockerd over it, which needs the socket on a writable mount), leaves the
+# network namespace alone (the edge binds the listen address and reaches
+# instances through their bridge IPs) and keeps /var/lib/warren writable.
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+NoNewPrivileges=true
+
+# Not set, with the reason; enable the ones that do not apply to your setup.
+#ProtectKernelTunables=true   # the Firecracker runtime enables net.ipv4.ip_forward
+#ProtectKernelModules=true    # iptables autoloads netfilter modules on a fresh host; safe once Docker has loaded them
+#RestrictSUIDSGID=true        # the vm rootfs export recreates setuid binaries (sudo) from the image
+#PrivateDevices=true          # vm instances open /dev/kvm and /dev/net/tun
+#RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK   # correct today; listed so a future need shows up here
+#ReadWritePaths=/srv/warren   # needed when WARREN_DATA_DIR is not under /var (ProtectSystem=full keeps /var writable)
+
+[Install]
+WantedBy=multi-user.target
