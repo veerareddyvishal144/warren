@@ -51,7 +51,7 @@ jobs:
       tag: ${{ steps.v.outputs.tag }}
       publish: ${{ steps.v.outputs.publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Read the Cargo workspace version and check the tag against it
         id: v
         run: |
@@ -111,7 +111,7 @@ jobs:
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
             ca-certificates curl git build-essential pkg-config musl-tools file
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Add the musl target for the static gateway
         if: runner.os == 'Linux'
@@ -141,7 +141,7 @@ jobs:
       VERSION: ${{ needs.version.outputs.version }}
       TAG: ${{ needs.version.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # The annotated tag message is the fallback source of the notes.
           fetch-depth: 0
