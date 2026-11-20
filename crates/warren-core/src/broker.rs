@@ -608,7 +608,7 @@ mod tests {
         let env = instance_env(
             NetworkMode::Allowlist,
             Some("172.18.0.1:7349"),
-            &[stored.clone()],
+            std::slice::from_ref(&stored),
         );
         assert_eq!(env["WARREN_NETWORK"], "allowlist");
         assert_eq!(env["WARREN_BROKER"], "172.18.0.1:7349");
@@ -624,7 +624,11 @@ mod tests {
             "the value never reaches the instance"
         );
 
-        let env = instance_env(NetworkMode::DenyAll, Some("b:1"), &[stored.clone()]);
+        let env = instance_env(
+            NetworkMode::DenyAll,
+            Some("b:1"),
+            std::slice::from_ref(&stored),
+        );
         assert_eq!(env["HTTPS_PROXY"], "http://b:1");
         let env = instance_env(NetworkMode::DenyAll, Some("b:1"), &[]);
         assert!(!env.contains_key("HTTPS_PROXY"));
