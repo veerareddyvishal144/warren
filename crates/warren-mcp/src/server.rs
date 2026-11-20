@@ -310,7 +310,7 @@ impl<B: Backend> WarrenServer<B> {
     }
 
     #[tool(
-        description = "Create a persistent instance (Linux, or macOS with type mac) and wait up to 120 seconds for it to be running, then return the instance object. All arguments are optional: template (default warren-base; warren-agent for chat), type default|vm|mac, cpu/memory/disk, name, auto_sleep, idle_timeout_seconds, env. The workspace's awake-instance limit applies (instance_limit_reached); a mac host that already runs two macOS VMs answers host_capacity_reached. If the instance is not running after the wait it is still returned with its current status; poll get_instance.",
+        description = "Create a persistent instance (Linux, or macOS with type mac) and wait up to 120 seconds for it to be running, then return the instance object. All arguments are optional: template (default warren-base; warren-agent for chat), type default|vm|mac, cpu/memory/disk, name, auto_sleep, idle_timeout_seconds, env, network (allow-all|deny-all|allowlist), allowed_domains (hosts an allowlist instance may reach) and secrets (provider keys the host injects on the instance's behalf: the instance gets a route URL in the secret's env variable and never sees the value). The workspace's awake-instance limit applies (instance_limit_reached); a mac host that already runs two macOS VMs answers host_capacity_reached. If the instance is not running after the wait it is still returned with its current status; poll get_instance.",
         annotations(
             title = "Create instance",
             read_only_hint = false,
@@ -844,6 +844,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "allowed_domains",
                 "auto_sleep",
                 "cpu",
                 "disk",
@@ -851,6 +852,8 @@ mod tests {
                 "idle_timeout_seconds",
                 "memory",
                 "name",
+                "network",
+                "secrets",
                 "template",
                 "type"
             ]

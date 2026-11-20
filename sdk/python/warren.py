@@ -132,6 +132,22 @@ class Template(TypedDict, total=False):
     updated_at: int
 
 
+class SecretSpec(TypedDict):
+    """A credential the host-side broker injects for an instance (write-only).
+
+    The instance receives ``env`` = a private route URL to use as the
+    provider's base URL and ``name`` = the placeholder ``warren-broker``; the
+    broker forwards requests to ``upstream`` with ``header: value`` added.
+    ``value`` never enters the instance and is never returned by any read.
+    """
+
+    name: str
+    upstream: str
+    header: str
+    value: str
+    env: str
+
+
 class Instance(TypedDict, total=False):
     """The instance object of ``docs/API.md``."""
 
@@ -150,6 +166,7 @@ class Instance(TypedDict, total=False):
     metadata: Dict[str, str]
     env: Dict[str, str]
     network: str
+    allowed_domains: List[str]
     auto_sleep: bool
     idle_timeout_seconds: int
     url: str
@@ -737,13 +754,18 @@ class Warren(_Http):
         auto_sleep: Optional[bool] = None,
         idle_timeout_seconds: Optional[int] = None,
         network: Optional[str] = None,
+        allowed_domains: Optional[List[str]] = None,
+        secrets: Optional[List[SecretSpec]] = None,
     ) -> Instance:
         """``POST /v1/instances`` -> the new instance in status ``provisioning``.
 
         Every field is optional: template ``warren-base``, type ``default``,
-        ``auto_sleep=False``, ``idle_timeout_seconds=900``, ``network="allow-all"``.
-        ``resources`` is ``{"cpu", "memory", "disk"}`` (each optional). Use
-        :meth:`wait_for` to block until it is ``running``.
+        ``auto_sleep=False``, ``idle_timeout_seconds=900``, ``network="allow-all"``
+        (``"deny-all"`` or ``"allowlist"``: HTTP(S) to ``allowed_domains`` only,
+        exact names or ``*.suffix``, through the host-side proxy). ``secrets``
+        are write-only :class:`SecretSpec` entries the broker injects for the
+        instance. ``resources`` is ``{"cpu", "memory", "disk"}`` (each
+        optional). Use :meth:`wait_for` to block until it is ``running``.
         """
         body = _compact(
             {
@@ -757,6 +779,8 @@ class Warren(_Http):
                 "auto_sleep": auto_sleep,
                 "idle_timeout_seconds": idle_timeout_seconds,
                 "network": network,
+                "allowed_domains": allowed_domains,
+                "secrets": secrets,
             }
         )
         return self._request("POST", "/v1/instances", json_body=body)
@@ -778,9 +802,13 @@ class Warren(_Http):
         auto_sleep: Optional[bool] = None,
         idle_timeout_seconds: Optional[int] = None,
         network: Optional[str] = None,
+        allowed_domains: Optional[List[str]] = None,
+        secrets: Optional[List[SecretSpec]] = None,
     ) -> Instance:
         """``PATCH /v1/instances/{id}`` -> the instance. Absent fields stay;
-        ``metadata`` and ``env`` replace the whole map; env applies at next start."""
+        ``metadata``, ``env``, ``allowed_domains`` and ``secrets`` replace the
+        whole set. ``allowed_domains`` and the values of secrets that keep
+        their name apply live; env and new secret names apply at next start."""
         body = _compact(
             {
                 "name": name,
@@ -789,6 +817,8 @@ class Warren(_Http):
                 "auto_sleep": auto_sleep,
                 "idle_timeout_seconds": idle_timeout_seconds,
                 "network": network,
+                "allowed_domains": allowed_domains,
+                "secrets": secrets,
             }
         )
         return self._request("PATCH", _inst(instance_id), json_body=body)

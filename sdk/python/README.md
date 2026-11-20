@@ -81,7 +81,7 @@ edge's `502` for a port nothing listens on) is mapped from its status.
 | `workspace()` | `GET /v1/workspace` (adds `awake_limit`, `None` = unlimited, and `awake_count`) |
 | `list_api_keys()`, `create_api_key(name, expires_at)`, `delete_api_key(id)` | `/v1/api-keys` |
 | `list_templates()`, `get_template(name)`, `register_template(name, image_ref, ...)`, `delete_template(name)` | `/v1/templates` |
-| `create_instance(template, resources, type, region, name, metadata, env, auto_sleep, idle_timeout_seconds, network)` | `POST /v1/instances` |
+| `create_instance(template, resources, type, region, name, metadata, env, auto_sleep, idle_timeout_seconds, network, allowed_domains, secrets)` | `POST /v1/instances` (`network="allowlist"` with `allowed_domains`; `secrets` are write-only `SecretSpec` dicts the host-side broker injects) |
 | `list_instances()`, `get_instance(id)`, `patch_instance(id, ...)`, `delete_instance(id)` | `/v1/instances[/{id}]` |
 | `stop_instance`, `start_instance`, `sleep_instance`, `restart_instance` | `POST /v1/instances/{id}/{stop,start,sleep,restart}` |
 | `resize_instance(id, cpu, memory, disk)`, `update_instance(id, template)`, `fork_instance(id, ...)` | `POST .../{resize,update,fork}` |

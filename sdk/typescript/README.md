@@ -91,7 +91,7 @@ an optional trailing `{ signal, timeoutMs }`.
 | `workspace()` | `GET /v1/workspace` (adds `awake_limit`, `null` = unlimited, and `awake_count`) |
 | `listApiKeys()`, `createApiKey({ name, expires_at })`, `deleteApiKey(id)` | `/v1/api-keys` |
 | `listTemplates()`, `getTemplate(name)`, `registerTemplate(req)`, `deleteTemplate(name)` | `/v1/templates` |
-| `createInstance(req)`, `listInstances()`, `getInstance(id)`, `patchInstance(id, req)`, `deleteInstance(id)` | `/v1/instances[/{id}]` |
+| `createInstance(req)`, `listInstances()`, `getInstance(id)`, `patchInstance(id, req)`, `deleteInstance(id)` | `/v1/instances[/{id}]` (`network: "allowlist"` with `allowed_domains`; `secrets` are write-only `SecretSpec` entries the host-side broker injects) |
 | `stopInstance`, `startInstance`, `sleepInstance`, `restartInstance` | `POST /v1/instances/{id}/{stop,start,sleep,restart}` |
 | `resizeInstance(id, { cpu, memory, disk })`, `updateInstance(id, { template })`, `forkInstance(id, req)` | `POST .../{resize,update,fork}` |
 | `exec(id, command \| ExecRequest)` | `POST /v1/instances/{id}/exec` |
