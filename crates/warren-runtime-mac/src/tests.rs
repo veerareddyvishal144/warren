@@ -462,6 +462,60 @@ async fn ready_checks_lume_version_base_vm_and_gateway() {
 }
 
 #[tokio::test]
+async fn ready_reports_warren_named_vms_this_daemon_did_not_create() {
+    let mut m = base_mock();
+    // Named like instances, but no share directory under this daemon's mac dir.
+    m.vms.insert("warren-zz12cd34ef".into(), Vm::default());
+    m.vms.insert(
+        "warren-yy12cd34ef".into(),
+        Vm {
+            running: true,
+            ..Vm::default()
+        },
+    );
+    // Not instance ids: a different prefix, a short suffix, an uppercase one.
+    m.vms.insert("other-ab12cd34ef".into(), Vm::default());
+    m.vms.insert("warren-short".into(), Vm::default());
+    m.vms.insert("warren-AB12CD34EF".into(), Vm::default());
+    let e = env_with(m).await;
+    e.rt.ready().await.unwrap();
+    assert_eq!(
+        e.rt.foreign_vms().await.unwrap(),
+        vec!["warren-yy12cd34ef", "warren-zz12cd34ef"]
+    );
+
+    // An instance this daemon creates has its share and is not reported.
+    let mut inst = instance("ab12cd34ef");
+    e.rt.create(&mut inst, &template()).await.unwrap();
+    assert_eq!(
+        e.rt.foreign_vms().await.unwrap(),
+        vec!["warren-yy12cd34ef", "warren-zz12cd34ef"]
+    );
+    // Once its share is gone (destroyed with storage) the VM would count as
+    // foreign if Lume still had it; here delete removes both.
+    e.rt.destroy(&inst, true).await.unwrap();
+    assert_eq!(
+        e.rt.foreign_vms().await.unwrap(),
+        vec!["warren-yy12cd34ef", "warren-zz12cd34ef"]
+    );
+
+    // A base VM whose name matches the pattern is excluded.
+    let mut m = base_mock();
+    m.vms.insert("warren-ba5e000000".into(), Vm::default());
+    let e = env_with(m).await;
+    let cfg = Config {
+        mac_base_vm: Some("warren-ba5e000000".into()),
+        lume_api_url: e.rt.lume().base_url().to_string(),
+        data_dir: e.root.join("data2"),
+        gateway_bin: e.rt.cfg.gateway_bin.clone(),
+        ..Config::default()
+    };
+    let rt = MacRuntime::new(cfg).unwrap();
+    rt.ready().await.unwrap();
+    assert!(rt.foreign_vms().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn create_clones_the_base_applies_the_shape_and_writes_the_share() {
     let e = env_with(base_mock()).await;
     let tpl = template();

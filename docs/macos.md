@@ -24,8 +24,17 @@ On the Mac (Apple silicon, macOS 14 or newer, [Lume](https://github.com/trycua/c
    enable Remote Login, `lume stop base`.
 2. Turn it into Warren's base image: `bash scripts/mac/build-base.sh
    --source base --target warren-macos-26`. This clones the VM, installs the
-   gateway LaunchDaemon and launcher, the `pf` isolation rules, your SSH key,
-   disables sleep and automatic updates, and stops the clone.
+   gateway LaunchDaemon and launcher, the `pf` isolation rules and your SSH
+   key, replaces the guest user's stock password (`lume`) with a random one
+   and restricts SSH to keys, disables sleep and automatic updates, and
+   stops the clone. The new password is written to
+   `~/.warren/mac/warren-macos-26.password` (`$WARREN_MAC_DIR` to move it,
+   mode 600); it is the `sudo` password inside every instance cloned from
+   the image and `scripts/mac/debug-guest.sh` reads it from there. Add
+   `--with-agents` to also install Node LTS and the `claude`, `codex` and
+   `opencode` CLIs in the image (the guest downloads them through the NAT;
+   several minutes and about 1 GB), the macOS counterpart of the Linux
+   `warren-claude` template.
 3. Build and run the daemon natively:
    `cargo build --release -p warrend -p warren-gateway` then
    `target/release/warrend --runtime none --mac-base-vm warren-macos-26 --dev`.
@@ -59,9 +68,11 @@ a few seconds and changes nothing inside the VM.
 Known limits in this phase: template updates that change the base VM are
 refused (`not_supported`); backups are APFS clones that share blocks with
 the VM until either side writes, so their reported size is small and real
-usage grows as the disk diverges; the guest user is `lume` with Lume's
-default password (reachable only from the Mac itself and blocked between
-guests by `pf`); screen access is not exposed yet.
+usage grows as the disk diverges; the guest user is `lume`, its password the
+one `build-base.sh` generated (SSH takes keys only, the VM is reachable only
+from the Mac itself and blocked between guests by `pf`), and Lume's own
+`lume ssh`, `lume shutdown` and `lume restart`, which assume the stock
+password, do not work on instances; screen access is not exposed yet.
 
 ## Constraints that shape everything
 
@@ -272,9 +283,32 @@ before Lume's own 409 is hit.
   verifies this from inside a guest.
 - The gateway requires the instance token on every route except health and
   version, as on Linux. The edge still strips the `sk_live_` bearer key.
-- The base image disables SSH password authentication and installs a
-  per-host Warren key; the default `lume`/`lume` credentials are rotated by
-  `scripts/mac/build-base.sh`.
+- Guest credentials, as `scripts/mac/build-base.sh` and the guest-side
+  `install.sh` really set them: the host's public key (`--ssh-key`, default
+  `~/.ssh/id_ed25519.pub`) goes into `/Users/lume/.ssh/authorized_keys`;
+  `/etc/ssh/sshd_config.d/100-warren.conf` sets `PasswordAuthentication no`,
+  `KbdInteractiveAuthentication no` and `PubkeyAuthentication yes` (the
+  stock `sshd_config` on macOS 13 and newer starts with `Include
+  /etc/ssh/sshd_config.d/*`; the installer adds the line at the top when it
+  is missing and checks the result with `sshd -T`; macOS starts `sshd` per
+  connection, so no restart is needed); the `lume` user's stock password is
+  replaced with a random one (`openssl rand -base64 18`, or `--new-password`)
+  through `dscl . -passwd`, verified with `dscl . -authonly`, and autologin,
+  which stores the password in `/etc/kcpassword`, is re-armed with
+  `sysadminctl -autologin set` so the console still logs in. The password
+  is stored on the host only, at `$WARREN_MAC_DIR/<target>.password`
+  (default `~/.warren/mac`, mode 600); it is what `sudo` inside an instance
+  wants and what `debug-guest.sh` uses. The sshd hardening is skipped, with
+  a warning, when no key could be installed, so a guest is never left
+  reachable through its console only.
+- Lume's API server takes requests from any process on the Mac, without
+  authentication: anything that can reach `127.0.0.1:7777` can create,
+  start, stop or delete VMs, including ones named like Warren instances. At
+  startup the runtime lists the VMs named `warren-<instance id>` and warns
+  about every one that has no share directory under `<data-dir>/mac/<id>/`,
+  which means this daemon did not create it (`lume get <name>` to inspect,
+  `lume delete <name>` to remove). Keep the port on loopback and the Mac
+  single-tenant.
 - VNC stays off unless `--mac-vnc` is set; Lume generates a random password
   per run. Exposing the screen through the edge is Phase 2.
 
