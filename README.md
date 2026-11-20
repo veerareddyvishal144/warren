@@ -92,7 +92,7 @@ Every crate depends on `warren-core` and nothing else in the workspace; `warrend
 - **Linux `default` type** is exercised end to end in CI under Docker. **`vm` (Firecracker)** is experimental and tested on one machine.
 - **macOS Phase 1 is verified on one Mac**: a MacBook Pro (Apple silicon, 16 GiB) running `scripts/mac/e2e.sh` on 2026-11-19, twice in a row: create, exec, sleep and wake with processes intact, daemon restart with the VM adopted, fork, guest isolation, host capacity, delete. The numbers and their method are in [docs/benchmarks.md](docs/benchmarks.md). It has not run on a second Mac, a Mac mini, or any other macOS host version.
 - **New in this release and not yet exercised beyond the development machines**: `warren up`, `warren connect` and `warren run`; the egress allowlist and secret broker; the install path in [docs/install.md](docs/install.md). Treat them as fresh.
-- **Not done**: a screen for macOS instances, `deny-all` on macOS guests, memory checkpoints for Linux, TLS in the daemon (use a proxy), an audit log. The complete list is [docs/limits.md](docs/limits.md).
+- **Not done**: a screen for macOS instances, host-side egress enforcement for macOS guests (the guest applies its own policy with `pf`), memory checkpoints for Linux, TLS in the daemon (use a proxy), an audit log. The complete list is [docs/limits.md](docs/limits.md).
 
 ## Documentation
 
@@ -103,7 +103,7 @@ Every crate depends on `warren-core` and nothing else in the workspace; `warrend
 - **Screen for macOS instances**: noVNC through the edge, then a screenshot and input API for agents that need to see.
 - **Memory checkpoints for Linux**: gVisor checkpoint/restore and Firecracker snapshots so sleep keeps processes and memory on every type (`mac` already does through Lume suspend). The API does not change.
 - **Linux guests on Mac hosts**, outside the two-guest limit, as cheap extra capacity on the same machine.
-- **Harden the Mac host**: `deny-all` and host-wide egress drops with `pf`, one `lume serve` per instance, and in time a runtime on Virtualization.framework without Lume.
+- **Harden the Mac host**: host-side `pf` egress drops for the NAT subnet (today each guest enforces its own policy), one `lume serve` per instance, and in time a runtime on Virtualization.framework without Lume.
 - **Secrets at rest**: encrypt instance env and brokered secrets with a key kept outside the data directory.
 - **Multi-node scheduler**: place instances across hosts; the `region` field is already on every instance.
 - **Cloudflare edge**: terminate TLS and authenticate at the edge, with the daemon as origin.

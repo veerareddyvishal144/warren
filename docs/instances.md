@@ -97,7 +97,7 @@ curl -s -X PATCH $WARREN_API/instances/$ID -H "$AUTH" -H "$JSON" -d '{
 }'
 ```
 
-Absent fields are unchanged; `metadata` and `env` replace the whole map. Auto-sleep, idle timeout, name, metadata and network change live. `env` changes apply at the next start (restart, wake or start). Unknown fields are rejected with `400 invalid_request`.
+Absent fields are unchanged; `metadata`, `env`, `allowed_domains` and `secrets` replace the whole set. Auto-sleep, idle timeout, name, metadata, `allowed_domains` and the values of secrets that keep their name change live; a `network` change recreates the runtime object (a running instance is stopped and started again); `env` and new secret names apply at the next recreate. Unknown fields are rejected with `400 invalid_request`.
 
 ## Stop, start, restart
 
@@ -201,7 +201,7 @@ The runtime object and the disk are destroyed, the backups removed, and the inst
 
 ## Network modes
 
-`allow-all` (default) attaches the container to a bridge with egress; `deny-all` attaches it to an internal bridge with no route out. Switching with `PATCH` applies live. Inbound traffic always comes through the edge; instances never get public IPs. Allowlist egress is a roadmap item.
+`allow-all` (default) attaches the container to a bridge with egress; `deny-all` attaches it to an internal bridge with no route out. `allowlist` attaches it to the internal bridge too and routes its HTTP(S) through the daemon's egress broker to `allowed_domains` only; `secrets` give it brokered credentials in any mode (see [API.md](API.md#egress-allowlist-and-secrets) and [security.md](security.md)). Switching with `PATCH` recreates the runtime object. Inbound traffic always comes through the edge; instances never get public IPs.
 
 ## What survives what
 

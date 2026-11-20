@@ -63,7 +63,7 @@ Everything else works the same: URLs, signed URLs, the files API, exec, sleep an
 ## How it is built
 
 1. The template image is exported from Docker into a directory and packed into a sized ext4 image with `mkfs.ext4 -d` under `<data>/instances/<id>/vm/rootfs.ext4` (built as `rootfs.ext4.tmp` and renamed when complete).
-2. A tap device with a deterministic name and MAC is attached to the `warren-fc0` bridge; the guest's address on `172.30.0.0/24` is passed on the kernel command line with `ip=`, and NAT gives it egress (`deny-all` removes it).
+2. A tap device with a deterministic name and MAC is attached to the `warren-fc0` bridge; the guest's address on `172.30.0.0/24` is passed on the kernel command line with `ip=`, and NAT gives it egress (`deny-all` and `allowlist` drop the guest's forwarded traffic; an `allowlist` guest reaches the daemon's egress broker on `172.30.0.1` and nothing else directly).
 3. Firecracker boots the configured kernel with the rootfs; `warren-gateway` runs as PID 1 (`--init`), mounts what it needs, starts `ttyd` and serves the API on 3737. The daemon waits for `GET /v1/health` before reporting `running`, exactly as for containers.
 4. The VM's socket, pid and console log live next to the rootfs; `GET /v1/instances/{id}/logs` returns the console.
 
