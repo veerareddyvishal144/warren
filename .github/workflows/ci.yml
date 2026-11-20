@@ -76,11 +76,11 @@ jobs:
       - name: Prepare the paths scripts/env.sh expects
         # build-images.sh sources scripts/env.sh, which creates /data/tmp; the runner has no /data.
         run: sudo mkdir -p /data/tmp && sudo chmod 1777 /data/tmp
-      - name: Build warren/base, warren/agent and warren/opencode
+      - name: Build warren/base, warren/agent, warren/opencode and warren/claude
         run: |
           WARREN_GATEWAY_BIN=target/x86_64-unknown-linux-musl/release/warren-gateway scripts/build-images.sh
       - name: Save the images
-        run: docker save "warren/base:$WARREN_IMAGE_TAG" "warren/agent:$WARREN_IMAGE_TAG" "warren/opencode:$WARREN_IMAGE_TAG" | gzip -1 > warren-images.tar.gz
+        run: docker save "warren/base:$WARREN_IMAGE_TAG" "warren/agent:$WARREN_IMAGE_TAG" "warren/opencode:$WARREN_IMAGE_TAG" "warren/claude:$WARREN_IMAGE_TAG" | gzip -1 > warren-images.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: warren-images

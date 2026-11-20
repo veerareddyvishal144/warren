@@ -63,7 +63,7 @@ images `warren/base:dev` and `warren/agent:dev`:
 
 ```bash
 make build                     # warrend, warren, warren-mcp and the static musl gateway (once: make musl-setup)
-make images                    # warren/base, warren/agent, warren/opencode carrying that gateway
+make images                    # warren/base, warren/agent, warren/opencode, warren/claude carrying that gateway
 cargo test -p warren-e2e -- --ignored --test-threads=1 --nocapture
 ```
 
@@ -246,7 +246,7 @@ curl -s $API/workspace -H "x-warren-key: $KEY" | jq .awake_limit       # X-Warre
 ### Templates
 
 ```bash
-curl -s $API/templates -H "authorization: bearer $KEY" | jq '.data[].name'    # warren-base, warren-agent, warren-opencode
+curl -s $API/templates -H "authorization: bearer $KEY" | jq '.data[].name'    # warren-base, warren-agent, warren-opencode, warren-claude
 curl -s $API/templates/warren-agent -H "authorization: bearer $KEY" | jq .
 curl -s -X POST $API/templates -H "authorization: bearer $KEY" -H 'content-type: application/json' \
   -d '{"name":"my-alpine","image_ref":"alpine:3.20","mount_path":"/home","default_port":0}' | jq .   # 201, revision 1

@@ -13,9 +13,10 @@ towards the daemon, the edge and the gateway.
 | `warren/base:<tag>` | `warren-base` | none | A plain Linux computer: Node, Python, git, build tools, a browser terminal and the files API. No agent. |
 | `warren/agent:<tag>` | `warren-agent` | `openai` | The built-in agent: chat, shell and file tools on any OpenAI-compatible model. |
 | `warren/opencode:<tag>` | `warren-opencode` | `command` | OpenCode, the open-source coding agent, behind the Agent API. |
+| `warren/claude:<tag>` | `warren-claude` | none | Claude Code, Codex CLI and OpenCode preinstalled for the `agent` user; drive them over exec or `warren run`. |
 
 `<tag>` is `WARREN_IMAGE_TAG` (default `dev`); the daemon's `image_tag` config
-must match. `warren/agent` and `warren/opencode` derive from `warren/base` of
+must match. `warren/agent`, `warren/opencode` and `warren/claude` derive from `warren/base` of
 the same tag. Build all three with `scripts/build-images.sh` (see below).
 
 ## The contract

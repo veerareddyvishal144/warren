@@ -19,7 +19,7 @@ musl-setup: ## One-time: the musl C compiler and Rust target the gateway build n
 	sudo apt-get install -y musl-tools
 	rustup target add $(MUSL)
 
-images: gateway ## Build the built-in template images (warren/base, warren/agent, warren/opencode)
+images: gateway ## Build the built-in template images (warren/base, warren/agent, warren/opencode, warren/claude)
 	./scripts/build-images.sh
 
 test: ## Unit tests for every crate
