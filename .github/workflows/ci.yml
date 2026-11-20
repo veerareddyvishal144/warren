@@ -81,7 +81,7 @@ jobs:
           WARREN_GATEWAY_BIN=target/x86_64-unknown-linux-musl/release/warren-gateway scripts/build-images.sh
       - name: Save the images
         run: docker save "warren/base:$WARREN_IMAGE_TAG" "warren/agent:$WARREN_IMAGE_TAG" "warren/opencode:$WARREN_IMAGE_TAG" "warren/claude:$WARREN_IMAGE_TAG" | gzip -1 > warren-images.tar.gz
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: warren-images
           path: warren-images.tar.gz
