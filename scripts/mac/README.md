@@ -14,9 +14,13 @@ on an Apple silicon Mac. The design, Lume facts and acceptance criteria are in
   natively for `aarch64-apple-darwin`.
 - A base VM created from Apple's IPSW, as described in docs/macos.md
   (`lume create ... --ipsw ...`, user `lume`, password `lume`, SSH enabled).
-  Below it is called `base`; it must be stopped.
+  Below it is called `base`; it must be stopped. The stock password is only
+  used to log in during the build; `build-base.sh` replaces it in the image.
 - An SSH key pair at `~/.ssh/id_ed25519` (`ssh-keygen -t ed25519`). The public
-  key is installed in the guest.
+  key is installed in the guest, and it is the only way in afterwards.
+- `openssl` (macOS ships LibreSSL's) to generate the guest password.
+- For `--with-agents`: internet access from the VM (Lume's NAT), to fetch
+  Node from nodejs.org and the CLIs from the npm registry.
 
 ## The three commands, in order
 
@@ -39,13 +43,37 @@ Clones `base` to `warren-macos-26`, boots the clone headless, copies
   domain; restarted by launchd on exit),
 - the pf anchor `dev.warren` (blocks the NAT subnet except the host) and the
   LaunchDaemon `dev.warren.pf` that enables pf at boot,
-- your SSH public key for `lume`, no system sleep, no automatic updates.
+- your SSH public key for `lume`, no system sleep, no automatic updates,
+- a new password for `lume`: random (`openssl rand -base64 18`) unless
+  `--new-password` is given, set with `dscl . -passwd` and verified with
+  `dscl . -authonly`; autologin is re-armed with it (`sysadminctl -autologin
+  set`). The script writes it to `$WARREN_MAC_DIR/<target>.password`
+  (default `~/.warren/mac/warren-macos-26.password`, mode 600) before the
+  install starts, uses it for the final `sudo shutdown`, and prints where it
+  is. It is the `sudo` password inside every clone; `lume ssh`, `lume
+  shutdown` and `lume restart`, which assume `lume`/`lume`, no longer work
+  on the image,
+- `/etc/ssh/sshd_config.d/100-warren.conf`: `PasswordAuthentication no`,
+  `KbdInteractiveAuthentication no`, `PubkeyAuthentication yes`, checked with
+  `sshd -T` inside the guest (the `Include` line is added to `sshd_config`
+  if missing). The script then confirms from the host that the guest offers
+  `publickey` only and that `sudo` takes the new password,
+- with `--with-agents`: Node LTS (the newest LTS line listed in
+  `https://nodejs.org/dist/index.tab`, or `--node-version vX.Y.Z`) from the
+  official `darwin-arm64` tarball, its SHA256 checked against the release's
+  `SHASUMS256.txt`, unpacked into `/usr/local`; then `npm install -g
+  @anthropic-ai/claude-code @openai/codex opencode-ai` and `claude
+  --version`, `codex --version`, `opencode --version` run as `lume` (with a
+  scratch `HOME`, so nothing lands in `/Users/lume`). About 1 GB and several
+  minutes through the NAT.
 
 If the key is not in the guest yet, ssh asks for the guest password once
-(default `lume`). The script then stops the VM and prints a summary ending in
+(`--password`, default `lume`). The script then stops the VM and prints a
+summary (guest user, password file, pf anchor, daemons, agents) ending in
 the `warrend --runtime none --mac-base-vm warren-macos-26 ...` command. Flags:
-`--source`, `--target`, `--user`, `--password`, `--ssh-key`, `--subnet`,
-`--gateway`, `--force` (replace an existing target).
+`--source`, `--target`, `--user`, `--password` (the current one),
+`--new-password`, `--ssh-key`, `--subnet`, `--gateway`, `--with-agents`,
+`--node-version`, `--force` (replace an existing target).
 
 In the base image the launcher cannot find the share, so
 `launchctl print system/dev.warren.gateway` shows it restarting every few
@@ -80,7 +108,13 @@ resolver does not resolve `*.localhost` for `curl`.
 Boots a throwaway clone of the base VM with a `share` folder attached the way
 warrend does, waits for the launcher, and prints what the guest sees: the
 virtiofs mount, the launcher's log, the LaunchDaemon state, the pf rules,
-the gateway's health from the host, which launchd domain exec runs in and
-whether `nohup` works there, and whether background processes started
-through exec survive (plain `nohup &`, own session, own process group).
-`--keep` leaves the clone running for manual probing over `ssh lume@<ip>`.
+the sshd drop-in and `sshd -T`'s authentication settings, which agent CLIs
+are installed, the gateway's health from the host, which launchd domain exec
+runs in and whether `nohup` works there, and whether background processes
+started through exec survive (plain `nohup &`, own session, own process
+group). The root-only probes use `sudo` inside the guest with the password
+`build-base.sh` stored in `$WARREN_MAC_DIR/<base vm>.password` (`--password`
+or `--password-file` to override; an image built before the rotation still
+answers to `lume`, which the script falls back to with a warning). `--keep`
+leaves the clone running for manual probing over `ssh -i ~/.ssh/id_ed25519
+lume@<ip>`.

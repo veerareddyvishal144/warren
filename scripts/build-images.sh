@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# Build the built-in template images: warren/base, warren/agent, warren/opencode.
+# Build the built-in template images: warren/base, warren/agent, warren/opencode, warren/claude.
 #
 # Usage:
-#   scripts/build-images.sh [base|agent|opencode ...]     (default: all three, in that order)
+#   scripts/build-images.sh [base|agent|opencode|claude ...]     (default: all four, in that order)
 #
 # Environment:
 #   WARREN_IMAGE_TAG            tag for every image (default: dev); the daemon's image_tag must match
 #   WARREN_GATEWAY_BIN          stage this prebuilt gateway binary instead of running cargo build
 #   WARREN_SKIP_GATEWAY_BUILD=1 reuse the binary already staged at images/.build/warren-gateway
 #   WARREN_TTYD_VERSION         ttyd release for the base image (default: latest)
-#   WARREN_OPENCODE_VERSION     opencode-ai npm version or dist-tag for the opencode image (default: latest)
+#   WARREN_OPENCODE_VERSION     opencode-ai npm version or dist-tag for the opencode and claude images (default: latest)
+#   WARREN_CLAUDE_CODE_VERSION  @anthropic-ai/claude-code npm version or dist-tag for the claude image (default: latest)
+#   WARREN_CODEX_VERSION        @openai/codex npm version or dist-tag for the claude image (default: latest)
 #   WARREN_DOCKER_BUILD_ARGS    extra flags for every docker build, e.g. "--pull --no-cache"
 #   WARREN_BASE_SIZE_LIMIT_MB   size budget of warren/base (default: 700); exceeding it prints a warning
 #
@@ -18,8 +20,8 @@
 # images/ directory, so the base Dockerfile copies .build/warren-gateway, i.e.
 # images/.build/warren-gateway in the repository (git-ignored).
 #
-# Docker caches the "latest" downloads (ttyd, opencode-ai) in image layers;
-# pass WARREN_DOCKER_BUILD_ARGS=--no-cache to refresh them.
+# Docker caches the "latest" downloads (ttyd, the npm packages) in image
+# layers; pass WARREN_DOCKER_BUILD_ARGS=--no-cache to refresh them.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,7 +32,7 @@ TAG="${WARREN_IMAGE_TAG:-dev}"
 IMAGES_DIR="$ROOT/images"
 STAGED="$IMAGES_DIR/.build/warren-gateway"
 SIZE_LIMIT_MB="${WARREN_BASE_SIZE_LIMIT_MB:-700}"
-ALL_IMAGES=(base agent opencode)
+ALL_IMAGES=(base agent opencode claude)
 
 log() { printf '[build-images] %s\n' "$*" >&2; }
 die() { log "error: $*"; exit 1; }
@@ -43,7 +45,7 @@ else
 fi
 for name in "${SELECTED[@]}"; do
     case "$name" in
-        base|agent|opencode) [ -f "$IMAGES_DIR/$name/Dockerfile" ] || die "missing $IMAGES_DIR/$name/Dockerfile" ;;
+        base|agent|opencode|claude) [ -f "$IMAGES_DIR/$name/Dockerfile" ] || die "missing $IMAGES_DIR/$name/Dockerfile" ;;
         *) die "unknown image '$name' (expected: ${ALL_IMAGES[*]})" ;;
     esac
 done
@@ -99,11 +101,15 @@ build_one() {
         base)
             [ -n "${WARREN_TTYD_VERSION:-}" ] && args+=(--build-arg "TTYD_VERSION=$WARREN_TTYD_VERSION")
             ;;
-        agent|opencode)
+        agent|opencode|claude)
             docker image inspect "warren/base:$TAG" >/dev/null 2>&1 \
                 || die "warren/base:$TAG is not available locally; build it first (scripts/build-images.sh base)"
-            if [ "$name" = opencode ] && [ -n "${WARREN_OPENCODE_VERSION:-}" ]; then
+            if [ "$name" != agent ] && [ -n "${WARREN_OPENCODE_VERSION:-}" ]; then
                 args+=(--build-arg "OPENCODE_VERSION=$WARREN_OPENCODE_VERSION")
+            fi
+            if [ "$name" = claude ]; then
+                [ -n "${WARREN_CLAUDE_CODE_VERSION:-}" ] && args+=(--build-arg "CLAUDE_CODE_VERSION=$WARREN_CLAUDE_CODE_VERSION")
+                [ -n "${WARREN_CODEX_VERSION:-}" ] && args+=(--build-arg "CODEX_VERSION=$WARREN_CODEX_VERSION")
             fi
             ;;
     esac

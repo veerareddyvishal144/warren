@@ -42,7 +42,12 @@ async fn templates_catalog_register_pin_and_delete() {
         .collect();
     assert_eq!(
         names,
-        vec!["warren-agent", "warren-base", "warren-opencode"]
+        vec![
+            "warren-agent",
+            "warren-base",
+            "warren-claude",
+            "warren-opencode"
+        ]
     );
     let (status, v) = h
         .call("GET", "/v1/templates/warren-base", Some(&acct.key), None)
@@ -109,7 +114,13 @@ async fn templates_catalog_register_pin_and_delete() {
         .collect();
     assert_eq!(
         names,
-        vec!["warren-agent", "warren-base", "warren-opencode", "my-tool"],
+        vec![
+            "warren-agent",
+            "warren-base",
+            "warren-claude",
+            "warren-opencode",
+            "my-tool"
+        ],
         "system first, then workspace"
     );
     // Other workspaces do not see it.

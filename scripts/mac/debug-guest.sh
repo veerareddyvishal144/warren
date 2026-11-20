@@ -7,20 +7,29 @@
 # For diagnosing "the gateway inside the VM did not come up" or "background
 # processes die".
 #
-# Usage: scripts/mac/debug-guest.sh [--base-vm NAME] [--gateway-bin PATH] [--ssh-key PATH] [--keep]
+# Usage: scripts/mac/debug-guest.sh [--base-vm NAME] [--gateway-bin PATH] [--ssh-key PATH]
+#                                   [--password PASS | --password-file FILE] [--keep]
+#
+# The root-only probes use sudo inside the guest. The guest password is the one
+# build-base.sh generated, read from $WARREN_MAC_DIR/<base vm>.password
+# (default ~/.warren/mac) unless --password or --password-file is given. SSH
+# itself is by key: the image refuses password logins.
 set -euo pipefail
 
 BASE_VM=warren-macos-26
 GW=""
 SSH_KEY="$HOME/.ssh/id_ed25519"
+PASSWORD="" PASSWORD_FILE=""
 KEEP=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --base-vm) BASE_VM="${2:-}"; shift ;;
         --gateway-bin) GW="${2:-}"; shift ;;
         --ssh-key) SSH_KEY="${2:-}"; shift ;;
+        --password) PASSWORD="${2:-}"; shift ;;
+        --password-file) PASSWORD_FILE="${2:-}"; shift ;;
         --keep) KEEP=1 ;;
-        -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -32,6 +41,20 @@ CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(pwd)/target}"
 GW="${GW:-$CARGO_TARGET_DIR/release/warren-gateway}"
 [ -x "$GW" ] || die "$GW not found; run cargo build --release -p warren-gateway or pass --gateway-bin"
 command -v jq >/dev/null 2>&1 || die "jq is required (brew install jq)"
+
+# --- the guest's sudo password --------------------------------------------------------
+MAC_DIR="${WARREN_MAC_DIR:-$HOME/.warren/mac}"
+if [ -z "$PASSWORD" ]; then
+    PASSWORD_FILE="${PASSWORD_FILE:-$MAC_DIR/$BASE_VM.password}"
+    if [ -f "$PASSWORD_FILE" ]; then
+        PASSWORD="$(head -n 1 "$PASSWORD_FILE")"
+        [ -n "$PASSWORD" ] || die "$PASSWORD_FILE is empty"
+        log "guest sudo password read from $PASSWORD_FILE"
+    else
+        log "warning: $PASSWORD_FILE not found (build-base.sh writes it); trying Lume's stock password for an image built before the rotation"
+        PASSWORD=lume
+    fi
+fi
 
 VM="dbg-$(date +%s | tail -c 5)$RANDOM"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/warren-debug.XXXXXX")"
@@ -51,7 +74,7 @@ log "share prepared at $SHARE"
 
 cleanup() {
     if [ "$KEEP" = 1 ]; then
-        log "--keep: leaving $VM running (share $SHARE); remove with: lume stop $VM; lume delete $VM --force"
+        log "--keep: leaving $VM running (share $SHARE); probe it with: ssh -i $SSH_KEY lume@$IP (sudo password: ${PASSWORD_FILE:-given on the command line}); remove with: lume stop $VM; lume delete $VM --force"
         return
     fi
     log "stopping and deleting $VM"
@@ -59,6 +82,7 @@ cleanup() {
     lume delete "$VM" --force >/dev/null 2>&1 || true
     rm -rf "$WORK"
 }
+IP=""
 trap cleanup EXIT
 
 log "cloning $BASE_VM -> $VM"
@@ -66,7 +90,6 @@ lume clone "$BASE_VM" "$VM" >/dev/null
 log "starting $VM headless with the share attached read-only"
 lume run "$VM" --detach --display none --vnc disabled --shared-dir "$SHARE:ro" >/dev/null
 
-IP=""
 for _ in $(seq 1 90); do
     IP="$(lume get "$VM" -f json 2>/dev/null | jq -r '(if type=="array" then .[0] else . end) | .ipAddress // empty')"
     [ -n "$IP" ] && break
@@ -80,6 +103,25 @@ for _ in $(seq 1 60); do
     sleep 2
 done
 "${SSH[@]}" true 2>/dev/null || die "cannot ssh to lume@$IP with $SSH_KEY (is the key installed in the base VM?)"
+
+# guest SCRIPT: run SCRIPT with bash inside the guest. `sudo_ CMD...` in the
+# script runs CMD as root; the password travels as the second line of bash's
+# stdin (bash reads a piped script line by line, so `read` takes it and the
+# rest is the script) and never appears on a command line.
+guest() {
+    {
+        echo 'IFS= read -r PW'
+        printf '%s\n' "$PASSWORD"
+        # shellcheck disable=SC2016  # a function definition for the guest's shell, sent verbatim
+        printf '%s\n' 'sudo_() { printf "%s\n" "$PW" | sudo -S -p "" "$@"; }'
+        printf '%s\n' "$1"
+    } | "${SSH[@]}" bash -s
+}
+if guest 'sudo_ -k true 2>/dev/null'; then
+    log "sudo inside the guest accepts the password"
+else
+    log "warning: sudo inside the guest refuses the password; the root-only probes below will print nothing"
+fi
 
 log "giving the launcher 45 s to find the share and start the gateway"
 sleep 45
@@ -97,23 +139,30 @@ echo
 echo "===== guest: launcher and gateway log (last 40 lines) ====="
 "${SSH[@]}" 'tail -n 40 /Users/lume/Library/Logs/warren-gateway.log 2>&1 || echo "(no log file)"' || true
 echo
-echo "===== guest: installed files (plists, launcher, pf anchor, pf.conf lines) ====="
-"${SSH[@]}" 'ls -la /Library/LaunchDaemons/ 2>&1 | grep -i -E "warren|total" ; echo ---; ls -la /usr/local/libexec/ 2>&1; echo ---; ls -la /etc/pf.anchors/ 2>&1; echo ---; grep -n "dev.warren" /etc/pf.conf 2>&1 || echo "(no dev.warren lines in /etc/pf.conf)"' || true
+echo "===== guest: installed files (plists, launcher, pf anchor, pf.conf lines, sshd drop-in) ====="
+"${SSH[@]}" 'ls -la /Library/LaunchDaemons/ 2>&1 | grep -i -E "warren|total" ; echo ---; ls -la /usr/local/libexec/ 2>&1; echo ---; ls -la /etc/pf.anchors/ 2>&1; echo ---; grep -n "dev.warren" /etc/pf.conf 2>&1 || echo "(no dev.warren lines in /etc/pf.conf)"; echo ---; cat /etc/ssh/sshd_config.d/100-warren.conf 2>&1 || echo "(no sshd drop-in: password logins are still allowed)"' || true
+echo
+echo "===== guest: agent CLIs (present only in an image built with --with-agents) ====="
+# shellcheck disable=SC2016  # expanded by the guest's shell
+"${SSH[@]}" 'for c in node npm claude codex opencode; do printf "%-9s " "$c"; command -v "$c" >/dev/null 2>&1 && "$c" --version 2>&1 | head -n 1 || echo "(not installed)"; done' || true
 echo
 echo "===== guest: launchd disabled list and loaded services mentioning warren ====="
-"${SSH[@]}" 'echo lume | sudo -S -p "" launchctl print-disabled system 2>/dev/null | grep -i warren || echo "(not in the disabled list)"; echo ---; echo lume | sudo -S -p "" launchctl list 2>/dev/null | grep -i warren || echo "(no warren service loaded)"' || true
+guest 'sudo_ launchctl print-disabled system 2>/dev/null | grep -i warren || echo "(not in the disabled list)"; echo ---; sudo_ launchctl list 2>/dev/null | grep -i warren || echo "(no warren service loaded)"' || true
 echo
 echo "===== guest: bootstrapping dev.warren.gateway by hand (shows the error if the plist is there but refused) ====="
-"${SSH[@]}" 'if [ -f /Library/LaunchDaemons/dev.warren.gateway.plist ]; then echo lume | sudo -S -p "" launchctl bootstrap system /Library/LaunchDaemons/dev.warren.gateway.plist 2>&1 && echo "bootstrap ok"; sleep 15; tail -n 20 /Users/lume/Library/Logs/warren-gateway.log 2>&1 || echo "(still no log file)"; echo lume | sudo -S -p "" lsof -nP -iTCP:3737 -sTCP:LISTEN 2>/dev/null || echo "(nothing listens on 3737 after the manual bootstrap)"; else echo "plist missing: the base image lost the installed files"; fi' || true
+guest 'if [ -f /Library/LaunchDaemons/dev.warren.gateway.plist ]; then sudo_ launchctl bootstrap system /Library/LaunchDaemons/dev.warren.gateway.plist 2>&1 && echo "bootstrap ok"; sleep 15; tail -n 20 /Users/lume/Library/Logs/warren-gateway.log 2>&1 || echo "(still no log file)"; sudo_ lsof -nP -iTCP:3737 -sTCP:LISTEN 2>/dev/null || echo "(nothing listens on 3737 after the manual bootstrap)"; else echo "plist missing: the base image lost the installed files"; fi' || true
 echo
 echo "===== guest: LaunchDaemon state ====="
-"${SSH[@]}" 'echo lume | sudo -S -p "" launchctl print system/dev.warren.gateway 2>&1 | head -40' || true
+guest 'sudo_ launchctl print system/dev.warren.gateway 2>&1 | head -40' || true
 echo
 echo "===== guest: processes and listeners ====="
-"${SSH[@]}" 'ps aux | grep -E "[w]arren-gateway|[l]auncher" || echo "(no gateway process)"; echo ---; echo lume | sudo -S -p "" lsof -nP -iTCP:3737 -sTCP:LISTEN 2>/dev/null || echo "(nothing listens on 3737)"' || true
+guest 'ps aux | grep -E "[w]arren-gateway|[l]auncher" || echo "(no gateway process)"; echo ---; sudo_ lsof -nP -iTCP:3737 -sTCP:LISTEN 2>/dev/null || echo "(nothing listens on 3737)"' || true
 echo
 echo "===== guest: pf status ====="
-"${SSH[@]}" 'echo lume | sudo -S -p "" pfctl -s info 2>/dev/null | head -3; echo lume | sudo -S -p "" pfctl -a dev.warren -s rules 2>/dev/null' || true
+guest 'sudo_ pfctl -s info 2>/dev/null | head -3; sudo_ pfctl -a dev.warren -s rules 2>/dev/null' || true
+echo
+echo "===== guest: effective sshd authentication settings ====="
+guest 'sudo_ /usr/sbin/sshd -T 2>/dev/null | grep -iE "^(passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication) " || echo "(sshd -T printed nothing)"' || true
 echo
 echo "===== host: gateway health over the network ====="
 curl -s -m 5 "http://$IP:3737/v1/health" && echo || echo "(no answer from $IP:3737)"

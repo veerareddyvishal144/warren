@@ -224,6 +224,34 @@ impl MacRuntime {
             .unwrap_or(0)
     }
 
+    /// Lume VMs that carry this runtime's name pattern (`warren-<instance
+    /// id>`) but have no share directory under `<mac_dir>/<id>/share`, so
+    /// this daemon did not create them. The configured base VM is never
+    /// one of them. Lume's local API takes requests from any process on
+    /// the host without authentication, so such VMs are worth a look: a
+    /// stale data directory, another daemon, or something impersonating
+    /// an instance.
+    pub async fn foreign_vms(&self) -> Result<Vec<String>> {
+        let base = self.cfg.mac_base_vm.as_deref();
+        let mac_dir = self.cfg.mac_dir();
+        let mut out: Vec<String> = self
+            .lume
+            .list()
+            .await?
+            .into_iter()
+            .filter(|vm| Some(vm.name.as_str()) != base)
+            .filter(|vm| {
+                vm.name.strip_prefix(VM_PREFIX).is_some_and(|id| {
+                    warren_core::ids::valid_instance_id(id)
+                        && !share::share_dir(&mac_dir, id).is_dir()
+                })
+            })
+            .map(|vm| vm.name)
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
     /// Apply CPU, memory and (growth-only) disk to a stopped VM.
     async fn apply_shape(&self, vm: &str, current: &VmDetails, shape: Shape) -> Result<u32> {
         let mut req = SetRequest::default();
@@ -345,6 +373,18 @@ impl Runtime for MacRuntime {
                 base,
                 "the base VM is running; stop it so clones start from a quiescent disk"
             );
+        }
+        match self.foreign_vms().await {
+            Ok(foreign) => {
+                for name in &foreign {
+                    tracing::warn!(
+                        vm = %name,
+                        mac_dir = %self.cfg.mac_dir().display(),
+                        "a Lume VM is named like a Warren instance but has no share directory here: this daemon did not create it (Lume's API is unauthenticated); inspect it with `lume get` and delete it if it is not yours"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not list Lume VMs to audit them"),
         }
         tracing::info!(
             lume = %host.version,
