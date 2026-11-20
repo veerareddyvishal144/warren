@@ -82,3 +82,9 @@ over the PTY returned the remote exit code. On Linux (Azure VM, 32 cores,
 Docker with gVisor) the ten-scenario e2e suite took 90 s and an allowlist
 `warren-claude` instance reached an allowed host through the broker with a
 `CONNECT 200` while an unlisted host was refused.
+
+On macOS, after allowing `warrend` through the Application Firewall, an
+allowlist `mac` instance reached `example.com` through the broker in 0.2 to
+0.3 s (HTTP 200) and `api.anthropic.com` (HTTP 401 without a key, so the
+route works), an unlisted host got the broker's 403, and a request that
+bypassed the proxy was dropped by the guest's pf rules.
