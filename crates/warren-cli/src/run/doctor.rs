@@ -314,6 +314,7 @@ pub async fn doctor(ctx: &Ctx) -> Result<i32, Failure> {
     // Platform specifics.
     if cfg!(target_os = "macos") {
         mac_checks(&mut checks, state.as_ref(), &runtimes).await;
+        firewall_check(&mut checks);
     } else if cfg!(target_os = "linux") {
         linux_checks(&mut checks);
     }
@@ -539,6 +540,36 @@ pub fn free_space(path: &Path) -> Option<u64> {
     }
     let s = nix::sys::statvfs::statvfs(&p).ok()?;
     Some(s.blocks_available() as u64 * s.fragment_size() as u64)
+}
+
+/// The macOS Application Firewall must let `warrend` accept connections from
+/// the guests' NAT network, or the egress broker is unreachable from inside
+/// `allowlist` instances (loopback is exempt, so the daemon itself looks fine).
+fn firewall_check(checks: &mut Vec<Check>) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let Ok(bin) = setup::find_warrend(None) else {
+        return;
+    };
+    match setup::firewall_allows(&bin) {
+        None => checks.push(Check::ok(
+            "firewall",
+            "Application Firewall off or not queryable; guests can reach the egress broker",
+        )),
+        Some((true, _)) => checks.push(Check::ok(
+            "firewall",
+            format!("Application Firewall allows incoming connections for {}", bin.display()),
+        )),
+        Some((false, fix)) => checks.push(Check::warn(
+            "firewall",
+            format!(
+                "Application Firewall blocks incoming connections for {} (macOS guests cannot reach the egress broker, so `--network allowlist` and secrets fail there)",
+                bin.display()
+            ),
+            fix,
+        )),
+    }
 }
 
 #[cfg(test)]

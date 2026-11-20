@@ -12,3 +12,4 @@ __pycache__/
 /target/
 /target-*/
 /data-mac*/
+/.claude/worktrees/

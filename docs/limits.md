@@ -49,3 +49,7 @@ Apple's macOS software licence allows up to two additional copies of macOS to ru
 - **No audit log** beyond the daemon's own logs.
 - **Rate limits** exist on signup only.
 - **Shapes** are the four CPU/RAM pairs (2/4, 4/8, 4/16, 4/32); a CPU count above 4 is clamped to 4.
+
+## macOS host firewall
+
+The Application Firewall blocks incoming connections to an ad-hoc-signed `warrend` by default, which cuts guests off from the egress broker (`192.168.64.1:7349`) while loopback keeps working. Allow it once with `sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$(command -v warrend)"`; `warren doctor` reports the state. See [macos.md](macos.md).

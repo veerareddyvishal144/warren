@@ -398,6 +398,14 @@ pub async fn up(ctx: &Ctx, args: UpArgs) -> Result<i32, Failure> {
     }
     println!("Next:");
     if cfg!(target_os = "macos")
+        && let Some((false, fix)) = firewall_allows(&plan.warrend)
+        && !try_unblock_firewall(&plan.warrend)
+    {
+        println!(
+            "  {fix}\n      # allow incoming connections for warrend: macOS guests reach the egress broker through the host firewall (needed by `allowlist` instances and secrets)"
+        );
+    }
+    if cfg!(target_os = "macos")
         && !runtimes.iter().any(|r| r == "lume")
         && plan.mac_base_vm.is_some()
     {
@@ -1270,6 +1278,63 @@ pub fn find_tool(name: &str) -> Option<PathBuf> {
 }
 
 /// The warrend binary: the flag (or `WARREN_WARREND`), else [`find_tool`].
+/// macOS Application Firewall tool.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const SOCKETFILTERFW: &str = "/usr/libexec/ApplicationFirewall/socketfilterfw";
+
+/// What the macOS Application Firewall says about `bin`: `None` when the
+/// firewall is off or cannot be asked; otherwise whether incoming connections
+/// are allowed (`true`) or blocked or unlisted (`false`), with the command
+/// that allows them. Matters because macOS guests reach the egress broker at
+/// the host's NAT address, and the firewall resets those connections for a
+/// program it has not been told about while loopback keeps working.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn firewall_allows(bin: &Path) -> Option<(bool, String)> {
+    let state = Command::new(SOCKETFILTERFW)
+        .arg("--getglobalstate")
+        .output()
+        .ok()?;
+    let state = String::from_utf8_lossy(&state.stdout);
+    if !(state.contains("State = 1") || state.contains("State = 2")) {
+        return None;
+    }
+    let apps = Command::new(SOCKETFILTERFW)
+        .arg("--listapps")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&apps.stdout);
+    let target = bin.to_string_lossy();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut allowed = false;
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim_end().ends_with(target.as_ref()) {
+            allowed = lines.get(i + 1).is_some_and(|n| n.contains("Allow"));
+            break;
+        }
+    }
+    let quoted = format!("'{}'", target.replace('\'', "'\\''"));
+    let fix = format!(
+        "sudo {SOCKETFILTERFW} --add {quoted} && sudo {SOCKETFILTERFW} --unblockapp {quoted}"
+    );
+    Some((allowed, fix))
+}
+
+/// Try to allow `bin` through the Application Firewall without a password
+/// prompt (`sudo -n`); true when it is allowed afterwards.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn try_unblock_firewall(bin: &Path) -> bool {
+    for action in ["--add", "--unblockapp"] {
+        let _ = Command::new("sudo")
+            .args(["-n", SOCKETFILTERFW, action])
+            .arg(bin)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    matches!(firewall_allows(bin), Some((true, _)) | None)
+}
+
 pub fn find_warrend(flag: Option<&Path>) -> Result<PathBuf, Failure> {
     if let Some(p) = flag {
         let p = absolute(p.to_path_buf());

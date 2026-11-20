@@ -80,8 +80,9 @@ type), `--lume-api` / `WARREN_LUME_API`, `--lume-bin` / `WARREN_LUME_BIN`,
 `GET /v1/health` lists `lume` in `runtimes` when the type is on.
 
 What to expect, as measured by `scripts/mac/e2e.sh` on the Phase 0 MacBook
-(four runs on 2026-11-19): create to running with a healthy gateway in 21 to
-23 s (the clone is instant, the rest is the boot); sleep in 3 to 4 s, which
+(six runs on 2026-11-19 and 2026-11-20): create to running with a healthy
+gateway in 19 to 23 s (the clone is instant, the rest is the boot); sleep in
+3 to 4 s, which
 writes the VM's memory to disk and frees one of the two slots; wake in 5 to 11 s
 with every process intact (the marker process keeps its pid); fork of a
 running instance in 30 to 37 s (the source is suspended for the copy, the
@@ -97,6 +98,22 @@ one `build-base.sh` generated (SSH takes keys only, the VM is reachable only
 from the Mac itself and blocked between guests by `pf`), and Lume's own
 `lume ssh`, `lume shutdown` and `lume restart`, which assume the stock
 password, do not work on instances; screen access is not exposed yet.
+
+### The macOS Application Firewall and the broker
+
+Guests reach the egress broker (allowlist proxy and secret routes) at the
+host's NAT address, `192.168.64.1:7349`. macOS's Application Firewall treats
+`warrend` like any other ad-hoc-signed program and adds it as "Block incoming
+connections" the first time it listens, which resets every connection from a
+guest while loopback keeps working. Allow it once:
+
+```sh
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$(command -v warrend)"
+```
+
+`warren doctor` reports the state and `warren up` prints the command when it
+cannot run it itself. Instances with `network: allow-all` and no secrets do not
+use the broker and are unaffected.
 
 ## Constraints that shape everything
 

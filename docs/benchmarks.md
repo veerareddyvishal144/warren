@@ -59,3 +59,26 @@ In rough priority order.
 8. **The question iOS developers will ask**: an `xcodebuild` of a known open-source app inside a `mac` instance against the same build on the host, wall clock.
 
 Record the machine, OS and Lume or Docker versions, the Warren commit, the exact command and the raw per-run numbers with any result you add here; attach the raw numbers to the pull request so the table can be recomputed.
+
+## Final runs on the release build (2026-11-20)
+
+Two consecutive `scripts/mac/e2e.sh --port 7357` runs on the hardened base
+image (password rotated, keys-only SSH, Node and the agent CLIs preinstalled)
+with the release binaries that include the PTY endpoint, the setup commands
+and the egress broker:
+
+| Step | Run 1 | Run 2 |
+|---|---|---|
+| create to running | 22 s | 21 s |
+| sleep | 3 s | 3 s |
+| wake, marker pid kept | 5 s | 5 s |
+| daemon restart, instance adopted | 6 s | 5 s |
+| fork | 29 s | 27 s |
+| delete both | 19 s | 19 s |
+
+`warren run --type mac --no-tty -- ...` on a fresh directory (create, push 19
+files, run, pull one changed file back) took 20 s end to end; `warren shell`
+over the PTY returned the remote exit code. On Linux (Azure VM, 32 cores,
+Docker with gVisor) the ten-scenario e2e suite took 90 s and an allowlist
+`warren-claude` instance reached an allowed host through the broker with a
+`CONNECT 200` while an unlisted host was refused.

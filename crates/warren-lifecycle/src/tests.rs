@@ -475,6 +475,33 @@ async fn type_comes_from_the_template_when_omitted() {
     assert_eq!(base.kind, InstanceType::Default);
 }
 
+/// `--type mac` without a template must not fall back to `warren-base`, which
+/// has no macOS image: the mac system template is chosen instead.
+#[tokio::test]
+async fn a_mac_create_without_a_template_uses_the_mac_template() {
+    let env = Env::new();
+    env.templates.put(Template {
+        name: "warren-macos".into(),
+        image_ref: "warren-macos-26".into(),
+        types: vec![InstanceType::Mac],
+        default_shape: Shape {
+            cpu: 2,
+            memory: 4,
+            disk: 50,
+        },
+        revision: 1,
+        ..Default::default()
+    });
+    let inst = env
+        .create(CreateInstanceRequest {
+            kind: Some(InstanceType::Mac),
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(inst.template_name, "warren-macos");
+    assert_eq!(inst.kind, InstanceType::Mac);
+}
+
 #[tokio::test]
 async fn env_key_rules() {
     let env = Env::new();

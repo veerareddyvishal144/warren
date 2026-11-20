@@ -31,6 +31,8 @@ use crate::{
 
 /// Template used when a create request names none.
 pub const DEFAULT_TEMPLATE: &str = "warren-base";
+/// Template a `mac` create gets when it names none (`warren-base` has no macOS image).
+pub const DEFAULT_MAC_TEMPLATE: &str = "warren-macos";
 /// How often `ensure_awake` re-reads a transitional instance.
 pub const WAKE_POLL: Duration = Duration::from_millis(250);
 /// How long `ensure_awake` waits for a transitional instance to run.
@@ -738,12 +740,18 @@ impl Lifecycle for Manager {
                 "performance instances are not available in this build",
             ));
         }
+        // No template in the request: the default one, unless the requested
+        // type rules it out (`mac` needs the macOS base image), in which case
+        // the system template for that type.
         let template_ref = req
             .template
             .as_deref()
             .map(str::trim)
             .filter(|t| !t.is_empty())
-            .unwrap_or(DEFAULT_TEMPLATE)
+            .unwrap_or(match req.kind {
+                Some(InstanceType::Mac) => DEFAULT_MAC_TEMPLATE,
+                _ => DEFAULT_TEMPLATE,
+            })
             .to_string();
         let tpl = self.deps.templates.resolve(&ws.id, &template_ref).await?;
         // No type in the request: the template decides (`mac` for warren-macos).
