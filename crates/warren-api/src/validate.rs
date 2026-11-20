@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use warren_core::{
     Config, CreateInstanceRequest, Error, ExecRequest, ForkRequest, InstanceType, MAX_ENV_ENTRIES,
     MAX_ENV_VALUE_BYTES, MAX_IDLE_TIMEOUT_SEC, MAX_METADATA_ENTRIES, PatchInstanceRequest,
-    RegisterTemplateRequest, Result, ShapeRequest, ids,
+    RegisterTemplateRequest, Result, SecretSpec, ShapeRequest, broker, ids,
 };
 
 /// Longest accepted name (workspace, key, instance, cron) in characters.
@@ -142,6 +142,20 @@ pub fn resize(s: &ShapeRequest) -> Result<()> {
     shape(s)
 }
 
+/// `allowed_domains`: at most `MAX_ALLOWED_DOMAINS` host names or `*.suffix`
+/// patterns (see `warren_core::broker::valid_domain_pattern`).
+pub fn allowed_domains(domains: &[String]) -> Result<()> {
+    broker::normalize_allowed_domains(domains).map(|_| ())
+}
+
+/// `secrets`: at most `MAX_SECRETS` entries with variable names for `name` and
+/// `env`, an `https://` upstream, a header token and a value of at most
+/// `MAX_SECRET_VALUE_BYTES`. Whether the daemon has a broker is the
+/// lifecycle's check.
+pub fn secrets(secrets: &[SecretSpec]) -> Result<()> {
+    broker::validate_secrets(secrets)
+}
+
 /// `POST /v1/instances`.
 pub fn create_instance(cfg: &Config, req: &CreateInstanceRequest) -> Result<()> {
     if let Some(t) = &req.template {
@@ -172,6 +186,12 @@ pub fn create_instance(cfg: &Config, req: &CreateInstanceRequest) -> Result<()> 
     if let Some(s) = &req.shape {
         shape(s)?;
     }
+    if let Some(d) = &req.allowed_domains {
+        allowed_domains(d)?;
+    }
+    if let Some(s) = &req.secrets {
+        secrets(s)?;
+    }
     Ok(())
 }
 
@@ -188,6 +208,12 @@ pub fn patch_instance(cfg: &Config, req: &PatchInstanceRequest) -> Result<()> {
     }
     if let Some(t) = req.idle_timeout_seconds {
         idle_timeout(cfg, t)?;
+    }
+    if let Some(d) = &req.allowed_domains {
+        allowed_domains(d)?;
+    }
+    if let Some(s) = &req.secrets {
+        secrets(s)?;
     }
     Ok(())
 }

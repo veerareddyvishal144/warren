@@ -71,6 +71,119 @@ async fn create_instance_with_options() {
     assert!(v.get("budget").is_none(), "no budget on instances: {v}");
 }
 
+/// A `SecretSpec` body.
+fn secret(name: &str, upstream: &str, header: &str, value: &str, env: &str) -> Value {
+    json!({ "name": name, "upstream": upstream, "header": header, "value": value, "env": env })
+}
+
+#[tokio::test]
+async fn allowlist_and_secrets_are_accepted_and_secrets_never_returned() {
+    let h = Harness::new();
+    let acct = h.signup().await;
+    let no_secret = |v: &Value| {
+        assert!(v.get("secrets").is_none(), "secrets leaked: {v}");
+        let text = v.to_string();
+        assert!(
+            !text.contains("sk-ant-real") && !text.contains("sk-oa-real"),
+            "a secret value leaked: {v}"
+        );
+    };
+    let v = h
+        .create_instance(
+            &acct.key,
+            json!({
+                "network": "allowlist",
+                "allowed_domains": ["api.anthropic.com", "*.npmjs.org"],
+                "secrets": [secret("ANTHROPIC_API_KEY", "https://api.anthropic.com", "x-api-key", "sk-ant-real", "ANTHROPIC_BASE_URL")]
+            }),
+        )
+        .await;
+    let id = id_of(&v);
+    assert_eq!(v["network"], "allowlist");
+    assert_eq!(
+        v["allowed_domains"],
+        json!(["api.anthropic.com", "*.npmjs.org"])
+    );
+    no_secret(&v);
+    // The lifecycle received the value; nothing reads it back.
+    let stored = h.store.lock().secrets.clone();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].instance_id, id);
+    assert_eq!(stored[0].value, "sk-ant-real");
+
+    let (status, v) = h
+        .call("GET", &format!("/v1/instances/{id}"), Some(&acct.key), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        v["allowed_domains"],
+        json!(["api.anthropic.com", "*.npmjs.org"])
+    );
+    no_secret(&v);
+    let (_, v) = h.call("GET", "/v1/instances", Some(&acct.key), None).await;
+    no_secret(&v["data"][0]);
+
+    // A patch replaces the allowlist and the secrets; the answer shows the
+    // allowlist only.
+    let (status, v) = h
+        .call(
+            "PATCH",
+            &format!("/v1/instances/{id}"),
+            Some(&acct.key),
+            Some(json!({
+                "allowed_domains": ["api.openai.com"],
+                "secrets": [secret("OPENAI_API_KEY", "https://api.openai.com/v1", "Authorization", "sk-oa-real", "OPENAI_BASE_URL")]
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["allowed_domains"], json!(["api.openai.com"]));
+    no_secret(&v);
+    let stored = h.store.lock().secrets.clone();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].name, "OPENAI_API_KEY");
+
+    // Patch validation answers before the lifecycle.
+    for (body, want) in [
+        (json!({ "allowed_domains": ["*.com"] }), "allowed_domains"),
+        (
+            json!({ "secrets": [secret("K", "https://a.example.com", "x-api-key", "", "K_URL")] }),
+            "empty value",
+        ),
+        (
+            json!({ "secrets": [secret("K", "https://a.example.com", "x-api-key", "v", "K")] }),
+            "more than once",
+        ),
+    ] {
+        let (status, v) = h
+            .call(
+                "PATCH",
+                &format!("/v1/instances/{id}"),
+                Some(&acct.key),
+                Some(body.clone()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {v}");
+        assert!(message(&v).contains(want), "{body} -> {v}");
+    }
+    // Clearing both: an empty allowlist is omitted from the object.
+    let (status, v) = h
+        .call(
+            "PATCH",
+            &format!("/v1/instances/{id}"),
+            Some(&acct.key),
+            Some(json!({ "allowed_domains": [], "secrets": [] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert!(v.get("allowed_domains").is_none(), "{v}");
+    assert!(h.store.lock().secrets.is_empty());
+    assert_eq!(
+        h.lifecycle.calls(),
+        vec!["create", "get", "list", "patch", "patch"]
+    );
+}
+
 #[tokio::test]
 async fn create_instance_validation_errors() {
     let h = Harness::new();
@@ -152,6 +265,51 @@ async fn create_instance_validation_errors() {
             "unknown field `gpu`",
         ),
         (json!([1, 2]), "invalid_request", "invalid type"),
+        (
+            json!({ "network": "open" }),
+            "invalid_request",
+            "unknown variant",
+        ),
+        (
+            json!({ "allowed_domains": ["localhost"] }),
+            "invalid_request",
+            "allowed_domains",
+        ),
+        (
+            json!({ "allowed_domains": (0..65).map(|i| format!("h{i}.example.com")).collect::<Vec<_>>() }),
+            "invalid_request",
+            "at most 64",
+        ),
+        (
+            json!({ "secrets": [secret("lower", "https://a.example.com", "x-api-key", "v", "L_URL")] }),
+            "invalid_request",
+            "secret name",
+        ),
+        (
+            json!({ "secrets": [secret("K", "http://a.example.com", "x-api-key", "v", "K_URL")] }),
+            "invalid_request",
+            "https://",
+        ),
+        (
+            json!({ "secrets": [secret("K", "https://a.example.com", "Host", "v", "K_URL")] }),
+            "invalid_request",
+            "header",
+        ),
+        (
+            json!({ "secrets": [secret("K", "https://a.example.com", "x-api-key", &"v".repeat(8193), "K_URL")] }),
+            "invalid_request",
+            "8192",
+        ),
+        (
+            json!({ "secrets": (0..17).map(|i| secret(&format!("K{i}"), "https://a.example.com", "x-api-key", "v", &format!("U{i}"))).collect::<Vec<_>>() }),
+            "invalid_request",
+            "at most 16",
+        ),
+        (
+            json!({ "secrets": [{ "name": "K", "upstream": "https://a.example.com", "header": "x-api-key", "value": "v", "env": "K_URL", "extra": 1 }] }),
+            "invalid_request",
+            "unknown field `extra`",
+        ),
     ];
     for (body, want_code, want_text) in cases {
         let (status, v) = h

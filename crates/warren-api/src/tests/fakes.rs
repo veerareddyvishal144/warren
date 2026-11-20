@@ -17,8 +17,26 @@ use warren_core::{
     ApiKey, Backup, Clock, Config, CreateInstanceRequest, Cron, DEFAULT_IDLE_TIMEOUT_SEC, Error,
     ExecRequest, ExecResult, ForkRequest, Instance, InstanceSecret, InstanceStatus, InstanceType,
     Lifecycle, LogsOptions, MetricPoint, PatchInstanceRequest, RegisterTemplateRequest, Result,
-    Shape, ShapeRequest, Store, Template, TemplateScope, TemplateService, Workspace, ids, shapes,
+    SecretSpec, Shape, ShapeRequest, Store, Template, TemplateScope, TemplateService, Workspace,
+    broker, ids, shapes,
 };
+
+/// Stored rows for request secrets, the way the real lifecycle writes them.
+fn secret_rows(instance_id: &str, specs: &[SecretSpec], now: i64) -> Vec<InstanceSecret> {
+    specs
+        .iter()
+        .map(|s| InstanceSecret {
+            instance_id: instance_id.to_string(),
+            name: s.name.clone(),
+            upstream: s.upstream.clone(),
+            header: s.header.clone(),
+            value: s.value.clone(),
+            env: s.env.clone(),
+            route_token: broker::new_route_token(),
+            created_at: now,
+        })
+        .collect()
+}
 
 macro_rules! boxed {
     ($( fn $name:ident <$($lt:lifetime),*> ($($params:tt)*) -> $out:ty $body:block )*) => {
@@ -508,6 +526,7 @@ impl Lifecycle for FakeLifecycle {
                 metadata: req.metadata.clone().unwrap_or_default(),
                 env: req.env.clone().unwrap_or_default(),
                 network: req.network.unwrap_or_default(),
+                allowed_domains: req.allowed_domains.clone().unwrap_or_default(),
                 auto_sleep: req.auto_sleep.unwrap_or(false),
                 idle_timeout_seconds: req.idle_timeout_seconds.unwrap_or(DEFAULT_IDLE_TIMEOUT_SEC),
                 default_port: tpl.default_port,
@@ -520,6 +539,9 @@ impl Lifecycle for FakeLifecycle {
                 ..Default::default()
             };
             self.store.create_instance(&inst).await?;
+            if let Some(specs) = &req.secrets {
+                self.store.replace_instance_secrets(&inst.id, &secret_rows(&inst.id, specs, now)).await?;
+            }
             Ok(inst)
         }
         fn get<'a, 'b, 'c>(&'a self, workspace_id: &'b str, id: &'c str) -> Result<Instance> {
@@ -551,7 +573,13 @@ impl Lifecycle for FakeLifecycle {
             if let Some(n) = req.network {
                 inst.network = n;
             }
+            if let Some(d) = &req.allowed_domains {
+                inst.allowed_domains = d.clone();
+            }
             inst.updated_at = self.clock.now_unix();
+            if let Some(specs) = &req.secrets {
+                self.store.replace_instance_secrets(&inst.id, &secret_rows(&inst.id, specs, inst.updated_at)).await?;
+            }
             self.store.update_instance(&inst).await?;
             Ok(inst)
         }
