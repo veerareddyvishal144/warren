@@ -406,9 +406,16 @@ pub async fn up(ctx: &Ctx, args: UpArgs) -> Result<i32, Failure> {
     println!(
         "  warren connect claude    # register the MCP server with Claude Code (codex, cursor, windsurf, caret, opencode, gemini too)"
     );
-    println!(
-        "  warren run -- claude     # a coding agent in a fresh instance bound to this directory"
-    );
+    if runtimes.iter().any(|r| r == "lume") {
+        println!(
+            "  warren run --type mac -- claude    # Claude Code in a fresh macOS instance bound to this directory"
+        );
+    }
+    if runtimes.iter().any(|r| r == "docker") {
+        println!(
+            "  warren run --template warren-claude -- claude    # Claude Code in a fresh Linux instance bound to this directory"
+        );
+    }
     println!("  warren doctor            # check the setup");
     Ok(EXIT_OK)
 }

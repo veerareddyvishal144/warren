@@ -416,7 +416,8 @@ pub fn connect(ctx: &Ctx, args: ConnectArgs) -> Result<i32, Failure> {
                     notes
                         .push("`claude` is not on PATH; run this once it is installed".to_string());
                 }
-                println!("{shown}");
+                // Printed to be pasted: the key stays complete here.
+                println!("{}", shell_join(&argv));
                 for n in &notes {
                     eprintln!("note: {n}");
                 }
@@ -481,8 +482,9 @@ pub fn connect(ctx: &Ctx, args: ConnectArgs) -> Result<i32, Failure> {
                         }))
                     );
                 } else {
+                    // Printed to be pasted: the key stays complete here.
                     println!("# {} ({name})", path.display());
-                    print!("{}", redact(&body, &key));
+                    print!("{body}");
                     for n in &notes {
                         eprintln!("note: {n}");
                     }

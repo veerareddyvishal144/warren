@@ -38,7 +38,7 @@ brew tap veerareddyvishal144/warren
 brew install warren
 ```
 
-(or `brew install veerareddyvishal144/warren/warren` in one go). The formula installs the release tarball for your platform, so no Rust toolchain is downloaded. `brew services start warren` runs the daemon with its defaults (data under `$(brew --prefix)/var/warren`, the API at `http://api.warren.localhost:7337`); for `mac` instances the daemon needs `--mac-base-vm`, which the service block cannot take, so use `warren mac init` or the [launchd template](#macos-launchd) instead.
+(or `brew install veerareddyvishal144/warren/warren` in one go). The formula installs the release tarball for your platform, so no Rust toolchain is downloaded. `brew services start warren` runs the daemon with its defaults (data under `$(brew --prefix)/var/warren`, the API at `http://api.warren.localhost:7337`); for `mac` instances the daemon needs `--mac-base-vm`, which the service block cannot take, so use `warren up` (it writes the [launchd agent](#macos-launchd) with the right flags) and `warren mac init` instead.
 
 Upgrade with `brew upgrade warren`; remove with `brew uninstall warren` (and `brew untap veerareddyvishal144/warren`).
 
@@ -158,7 +158,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.warren.daemon.plist
 tail -f ~/Library/Logs/Warren/warrend.log
 ```
 
-`--runtime none` skips Docker; drop that pair on a Mac that also runs Docker Desktop for `default` instances. Stop and remove with `launchctl bootout gui/$(id -u)/dev.warren.daemon` and delete the plist. `warren mac init` sets the same thing up without the manual steps.
+`--runtime none` skips Docker; drop that pair on a Mac that also runs Docker Desktop for `default` instances. Stop and remove with `launchctl bootout gui/$(id -u)/dev.warren.daemon` and delete the plist. `warren up` renders and loads this plist for you (data under `~/Library/Application Support/Warren`, Docker used when `docker info` works), `warren mac init` builds the base VM, and `warren down --purge` removes both the agent and the data again ([quickstart.md](quickstart.md)).
 
 ## Verifying an installation
 

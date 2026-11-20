@@ -69,6 +69,24 @@ claude mcp add warren -e WARREN_API_URL=http://api.warren.localhost:7337 -e WARR
 
 Tools: `create_instance`, `exec`, `read_file`, `write_file`, `list_files`, `chat`, `signed_url`, `stop_instance`, `start_instance`, `sleep_instance`, `delete_instance`, `list_instances`, `get_instance`, `list_templates`. See [mcp/README.md](../mcp/README.md) for Cursor, Claude Desktop and Windsurf.
 
+## warren connect
+
+`warren connect <agent>` does the registration above for you, with the URL and key the CLI already has (from `warren up` or `warren login`) and the `warren-mcp` binary installed next to `warren`:
+
+```bash
+warren connect claude      # claude mcp add warren --scope user ... (prints the command when claude is not installed)
+warren connect codex       # [mcp_servers.warren] in ~/.codex/config.toml
+warren connect cursor      # mcpServers.warren in ~/.cursor/mcp.json
+warren connect windsurf    # ~/.codeium/windsurf/mcp_config.json
+warren connect caret       # ~/.caret/mcp.json
+warren connect opencode    # mcp.servers.warren in ~/.config/opencode/opencode.json
+warren connect gemini      # ~/.gemini/settings.json
+```
+
+`--project` writes the project-level file in the current directory instead (`.cursor/mcp.json`, `.caret/mcp.json`, `./opencode.json`, `.gemini/settings.json`, or `--scope project` for Claude Code, which puts the key into `.mcp.json`: keep it out of version control or replace it with `${WARREN_API_KEY}`). Existing files are merged, other servers stay, the previous version is kept as `<file>.bak-<time>`, and `--print` shows the entry instead of writing it. The agent sees the tools after a restart (or `claude mcp list` to check).
+
+For Claude Code there is also a skill that tells the agent when a sandbox is the right tool, which templates and types exist, how exec, files, preview URLs, sleep and fork behave, the two-guest limit on Macs, the MCP tool names and their CLI equivalents: `warren skill install` writes it to `~/.claude/skills/warren/SKILL.md` (`--project` for `.claude/skills/warren/` in the repository). The same text is in [skills/warren/SKILL.md](../skills/warren/SKILL.md) for other agents' instruction files.
+
 ## What agents get wrong
 
 - Using the instance before it is `running`: poll the status.

@@ -1,183 +1,153 @@
 # Quickstart
 
-This page takes a fresh Linux machine to a running instance with a shell, a browser terminal, a files API and an agent that answers `POST /v1/responses`. Everything is plain `curl`; the same calls are available from the `warren` CLI, the MCP server and the dashboard.
+From an installed `warren` to a running instance with a coding agent inside, on an Apple silicon Mac or a Linux host. Everything here is the `warren` CLI; the same calls exist as HTTP ([API.md](API.md), with a curl walkthrough in [TESTING.md](TESTING.md)), in the MCP server, the SDKs and the dashboard.
 
-## 1. Prerequisites
+## 1. Install
 
-- A Linux x86_64 host. Debian 12 and Ubuntu 22.04 or newer are what the images and scripts are tested with.
-- Docker 24 or newer, and a user that can talk to it (`docker info` works without `sudo`, or run the daemon as root).
-- A Rust toolchain, 1.90 or newer (`curl https://sh.rustup.rs -sSf | sh`), plus the musl target for the static gateway: `make musl-setup` (runs `sudo apt-get install musl-tools` and `rustup target add x86_64-unknown-linux-musl`).
-- `git`, `curl`, and `jq` for the examples.
+[install.md](install.md) has every method; the short version:
 
-Optional, recommended: gVisor, so default instances run under `runsc` instead of `runc`:
-
-```bash
-sudo scripts/install-gvisor.sh
-# downloads the release tarball, verifies its SHA-512, installs runsc, registers it in /etc/docker/daemon.json,
-# reloads Docker and runs `docker run --rm --runtime=runsc alpine uname -r` as a smoke test
+```sh
+brew install veerareddyvishal144/warren/warren                                      # macOS or Linux, Homebrew
+curl -fsSL https://raw.githubusercontent.com/veerareddyvishal144/warren/main/scripts/install.sh | sh   # or the install script
+warren --version
 ```
 
-Without gVisor the daemon logs a warning and uses `runc`, which is fine for development and not recommended for untrusted code.
+Both put `warren`, `warrend`, `warren-mcp` and `warren-gateway` side by side, which is where `warren up` and `warren connect` look for them. From a checkout, `cargo build --release -p warrend -p warren-cli -p warren-mcp -p warren-gateway` does the same into `target/release/`.
 
-## 2. Build the images and start the daemon
+What the host needs:
 
-```bash
-git clone https://github.com/veerareddyvishal144/warren.git && cd warren
-make musl-setup # one-time: musl-tools and the x86_64-unknown-linux-musl target
-make images     # static musl build of warren-gateway, then docker build warren/base:dev, warren/agent:dev, warren/opencode:dev
-make dev-up     # cargo build --release of the binaries, then warrend --dev on :7337 with data under ./data
+- **macOS**: an Apple silicon Mac running macOS 14 or newer, [Lume](https://github.com/trycua/cua) 0.7.2 or newer on `PATH` (`/bin/bash -c "$(curl -fsSL https://cua.ai/lume/install.sh)"`; `warren up` prints this when Lume is missing), and about 30 GB of free disk for the base VM. Docker Desktop is optional: with it, the same daemon also serves Linux `default` instances.
+- **Linux**: Docker 24 or newer that your user can talk to (`docker info` without `sudo`; otherwise `sudo usermod -aG docker $USER` and log in again, or run the daemon as root with the system unit from [install.md](install.md)). gVisor is recommended so `default` instances run under `runsc` rather than `runc`: `sudo scripts/install-gvisor.sh` from a checkout. The template images are built locally once, from a checkout, with the installed gateway: `WARREN_GATEWAY_BIN=$(command -v warren-gateway) scripts/build-images.sh` (builds `warren/base:dev`, `warren/agent:dev`, `warren/opencode:dev`, `warren/claude:dev`).
+
+`warren doctor` checks all of this at any point and prints a fix for whatever is missing.
+
+## 2. Start the daemon: `warren up`
+
+```sh
+warren up
 ```
 
-`make dev-up` runs `scripts/dev-up.sh`; the equivalent direct command is:
-
-```bash
-target/release/warrend --dev --data-dir ./data
+```text
+Warren is up.
+  dashboard  http://warren.localhost:7337/
+  API        http://api.warren.localhost:7337
+  key        /Users/alice/.config/warren/config.json (sk_live_k3j2h4..., new workspace)
+  data       /Users/alice/Library/Application Support/Warren
+  service    launchd dev.warren.daemon (pid 4242)
+  log        /Users/alice/Library/Logs/Warren/warrend.log
+  daemon     warrend 0.1.0, runtimes: lume
+Next:
+  warren connect claude    # register the MCP server with Claude Code (codex, cursor, windsurf, caret, opencode, gemini too)
+  warren run --type mac -- claude    # Claude Code in a fresh macOS instance bound to this directory
+  warren doctor            # check the setup
 ```
 
-The script accepts `--no-build` and `WARREN_PORT`, `WARREN_DATA_DIR`, `WARREN_BASE_DOMAIN`, `WARREN_LOG` and `WARREN_IMAGE_TAG` in the environment; flags after `--` go to `warrend`. `--dev` lowers the minimum idle timeout to 5 seconds, lets instances reach the host at `host.docker.internal`, and keeps everything on `warren.localhost:7337`. The daemon prints `warrend listening` with the API URL when it is ready. Check it:
+`warren up` finds `warrend` next to itself, picks the runtime (`--runtime auto`: Docker when `docker info` works, nothing but Lume on a Mac without it; `none` or `docker` to force), refuses a port that something else holds and names the process, and installs the daemon as a service that starts at login:
 
-```bash
-curl -s http://api.warren.localhost:7337/v1/health
-# {"healthy":true,"version":"0.1.0","runtimes":["docker"],"dev_mode":true,"time":1763000000}
+- macOS: a launchd LaunchAgent, `dev.warren.daemon`, rendered from `packaging/launchd/dev.warren.daemon.plist` with absolute paths, running `warrend --runtime none --mac-base-vm warren-macos-26 --data-dir "~/Library/Application Support/Warren" --listen 127.0.0.1:7337`; log in `~/Library/Logs/Warren/warrend.log`.
+- Linux: a systemd user unit, `warrend`, rendered from `packaging/systemd/warrend.service` for user mode (`systemctl --user`), data under `$XDG_DATA_HOME/warren` (`~/.local/share/warren`); `journalctl --user -u warrend` for the log. When your user cannot talk to Docker, `warren up` writes the system unit and the environment file for you and prints the `sudo install ... && sudo systemctl enable --now warrend` steps instead.
+
+Then it waits up to 120 s for `GET /v1/health`, signs up a workspace when the config has no key for that URL, saves `api_url` and `api_key` to `~/.config/warren/config.json` (mode 600), and prints the dashboard and API URLs. Run it again at any time: it stops the previous daemon and installs the new settings. Useful flags: `--port N` (default 7337), `--data-dir DIR`, `--base-domain D` (default `warren.localhost`), `--mac-base-vm NAME`, `--dev` (5 s idle timeouts, instances can reach the host), `--no-service` (a plain background process with its pid in `<data>/warrend.pid`, for a terminal session or a test), `--warrend-bin PATH`.
+
+Three companions:
+
+```sh
+warren status            # service state, health, runtimes, instance count
+warren doctor            # OK/WARN/FAIL per check with a fix each; exit 1 on a failure
+warren down              # stop the daemon; --purge also removes the service and, after confirmation, the data
 ```
 
-Browsers and hosts running systemd-resolved resolve `*.localhost` to the loopback address, so `api.warren.localhost`, `warren.localhost` and every instance host work without DNS changes. On a host without systemd-resolved, add `--resolve api.warren.localhost:7337:127.0.0.1` to curl (one entry per hostname) or put the names in `/etc/hosts`.
+On macOS the daemon's `runtimes` line says `lume` once the base VM exists; until then it says `none` and `warren up` points you at the next step.
 
-## 3. Sign up
+## 3. macOS: build the base VM: `warren mac init`
 
-```bash
-export WARREN_API=http://api.warren.localhost:7337/v1
-curl -s -X POST $WARREN_API/signup -H 'Content-Type: application/json' -d '{"name":"my workspace"}'
+Every `mac` instance is an APFS clone of one base VM, built once:
+
+```sh
+warren mac init                     # 20 to 40 minutes the first time, mostly downloads
+warren mac init --with-agents       # also Node LTS and the claude, codex and opencode CLIs in the image
+warren mac init --dry-run           # print every step and command, run nothing
 ```
 
-```json
-{
-  "workspace": { "id": "ws_k3j2h4g5f6d7s8a9q0w1", "name": "my workspace", "created_at": 1763000000 },
-  "api_key": "sk_live_...",
-  "key_id": "..."
-}
+Without `--source` it first creates a stock VM named `base` from Apple's current restore image (`lume create base --os macos --cpu 4 --memory 4GB --disk-size 50GB --ipsw latest --unattended tahoe`; `--ipsw PATH` for an image you already have, `--unattended sequoia` for a macOS 15 image): Lume's offline setup creates the user `lume`, turns SSH on and boots once to verify. Then it runs `scripts/mac/build-base.sh` (embedded in the binary) to clone `base` into `warren-macos-26`, install the gateway launcher and the `pf` isolation rules, put your SSH key (`~/.ssh/id_ed25519`, generated when missing) in the guest, replace the stock password with a random one kept in `~/.warren/mac/warren-macos-26.password`, and stop the VM. `--source NAME` uses a stock VM you already have, `--target NAME` names the result, `--force` replaces an existing target.
+
+When it is done, `warren up` once more so the daemon picks the VM up; `warren status` then reports `runtimes: lume`. A Mac runs at most two macOS guests at a time ([macos.md](macos.md) has the details and the design); Linux `default` instances on the same Mac need Docker Desktop and `warren up --runtime docker`.
+
+## 4. Connect a coding agent: `warren connect`
+
+```sh
+warren connect claude       # Claude Code: runs `claude mcp add warren --scope user ...`
+warren connect codex        # Codex: ~/.codex/config.toml
+warren connect cursor       # Cursor: ~/.cursor/mcp.json (--project: .cursor/mcp.json)
+warren connect windsurf     # Windsurf: ~/.codeium/windsurf/mcp_config.json
+warren connect caret        # Caret: ~/.caret/mcp.json
+warren connect opencode     # OpenCode: ~/.config/opencode/opencode.json
+warren connect gemini       # Gemini CLI: ~/.gemini/settings.json
 ```
 
-The key is shown once. Keep it in a variable for the rest of this page:
+Each one registers the `warren-mcp` server (installed next to `warren`) with `WARREN_API_URL` and `WARREN_API_KEY` from your config, merges into an existing file without touching other servers, keeps the previous file as `<file>.bak-<time>`, and prints the result with `--print` instead of writing. Restart the agent and ask it to "create a Warren instance and run `uname -a` in it"; the tools are listed in [mcp/README.md](../mcp/README.md). For Claude Code, `warren skill install` adds a skill that explains when to reach for a sandbox and how to use one ([for-agents.md](for-agents.md)).
 
-```bash
-export WARREN_API_KEY=sk_live_...
-AUTH="Authorization: Bearer $WARREN_API_KEY"
+## 5. The first instance
+
+```sh
+warren instances create --template warren-base --wait          # Linux computer (Debian 12, Node, Python, git); --type vm for a Firecracker microVM
+warren instances create --template warren-macos --wait         # macOS VM on a Mac (type mac is implied)
+warren instances list
 ```
 
-## 4. Create an instance
+The create prints the instance id (10 characters) and waits for `running`. Then:
 
-```bash
-curl -s -X POST $WARREN_API/instances -H "$AUTH" -H 'Content-Type: application/json' -d '{
-  "template": "warren-base",
-  "name": "first",
-  "resources": { "cpu": 2, "memory": 4, "disk": 4 },
-  "auto_sleep": true,
-  "idle_timeout_seconds": 900
-}'
+```sh
+warren instances exec ab12cd34ef -- uname -a                   # a command with captured output; the exit code is yours
+warren shell ab12cd34ef                                        # an interactive terminal inside
+warren files put ab12cd34ef ./notes.md notes/notes.md          # files in the persistent home
+warren files ls ab12cd34ef notes
+warren instances exec ab12cd34ef -- 'cd ~ && nohup python3 -m http.server 8000 >/dev/null 2>&1 &'
+warren instances url ab12cd34ef --port 8000                    # a signed URL for anything listening inside
+warren instances open ab12cd34ef --port 7681                   # the browser terminal (Linux templates)
 ```
 
-The response is `201` with `"status": "provisioning"` and the instance's URL. Every field in the request is optional: the defaults are template `warren-base`, type `default`, the template's default shape (2 vCPU, 4 GB RAM, 4 GB disk), `auto_sleep: false`, `idle_timeout_seconds: 900`, `network: "allow-all"`.
+Commands run as `agent` in `/home/agent` on Linux (passwordless sudo; `--user root` for root) and as `lume` in `/Users/lume` on macOS. Anything listening on a port inside is reachable at `http://<id>-<port>.warren.localhost:7337/` with the key in `X-Warren-Key`, or through a signed URL a browser can open. The dashboard at `http://warren.localhost:7337/` shows the same instances with a terminal button; log in with the key from `~/.config/warren/config.json`. Shapes are `--cpu`/`--memory` 2/4, 4/8, 4/16, 4/32; `--env KEY=value` passes credentials for tools inside the instance (never the Warren key itself); `--auto-sleep` lets an idle instance sleep. [instances.md](instances.md) has every action.
 
-Wait for `running`:
+## 6. A coding agent inside: `warren run`
 
-```bash
-ID=$(curl -s $WARREN_API/instances -H "$AUTH" | jq -r '.data[0].id')
-until [ "$(curl -s $WARREN_API/instances/$ID -H "$AUTH" | jq -r .status)" = running ]; do sleep 1; done
-curl -s $WARREN_API/instances/$ID -H "$AUTH" | jq '{id, status, url, resources, runtime}'
+```sh
+cd ~/code/my-app
+warren run --template warren-claude -- claude    # Linux: the warren-claude image has Claude Code, Codex and OpenCode installed
+warren run --type mac -- claude                  # macOS VM built with `warren mac init --with-agents`
+warren run -- npm test                           # any command, in the default warren-base image
 ```
 
-## 5. Run commands
+`warren run` creates an instance bound to the current directory (remembered in `.warren/instance.json`, reused next time; `--new` for a fresh one; `--template` and `--type` only matter when it creates), pushes the directory honouring `.gitignore`, runs the command on a terminal inside under the mirrored path, and pulls back the files that changed when it exits. `--no-sync` skips the copying, `--no-tty` runs through exec and prints the captured output, `--remote-root PATH` changes the remote directory, `warren run --unbind [--delete]` forgets (and optionally destroys) the bound instance; `warren sync push` and `warren sync pull` move files by hand. Agent CLIs inside the instance sign in the way they do anywhere else (a browser login on the instance URL, or provider keys set in the instance's environment).
 
-```bash
-curl -s -X POST $WARREN_API/instances/$ID/exec -H "$AUTH" -H 'Content-Type: application/json' \
-  -d '{"command": "cd ~ && git clone --depth 1 https://github.com/tsl0922/ttyd.git && ls ttyd | head"}'
+## 7. Sleep, wake, stop, delete
+
+```sh
+warren instances sleep ab12cd34ef      # processes stop, the disk stays; any request wakes it (mac: memory kept, processes resume)
+warren instances stop ab12cd34ef       # never wakes on request
+warren instances start ab12cd34ef
+warren instances fork ab12cd34ef --name copy
+warren instances delete ab12cd34ef     # the disk goes too
 ```
 
-```json
-{ "exit_code": 0, "stdout": "CMakeLists.txt\nLICENSE\n...", "stderr": "Cloning into 'ttyd'...\n", "duration_ms": 1830 }
-```
+Files in the home survive sleep, stop and restart; processes and packages installed outside the home do not, except across a macOS sleep. `warren whoami` shows the workspace's awake count and limit when the operator set one ([quotas.md](quotas.md)).
 
-Commands run as the image user `agent` (uid 1000) in `/home/agent`; pass `"user": "root"` for root. Output is capped at 1 MiB per stream. See [exec.md](exec.md).
+## 8. Where things are, and how to remove them
 
-## 6. Use the instance URL
+| | macOS | Linux |
+|---|---|---|
+| Config (URL, key) | `~/.config/warren/config.json` | same |
+| What `warren up` set up | `~/.config/warren/daemon.json` | same |
+| Data: SQLite, secret, instance disks, backups | `~/Library/Application Support/Warren` | `~/.local/share/warren` |
+| Service | `~/Library/LaunchAgents/dev.warren.daemon.plist` | `~/.config/systemd/user/warrend.service` |
+| Log | `~/Library/Logs/Warren/warrend.log` | `journalctl --user -u warrend` |
+| Base VM, guest password | `~/.lume/warren-macos-26`, `~/.warren/mac/warren-macos-26.password` | |
 
-The instance URL serves whatever listens on the template's default port, which is the in-instance gateway (port 3737) for the built-in templates. The same API key works there:
-
-```bash
-curl -s http://$ID.warren.localhost:7337/v1/health -H "X-Warren-Key: $WARREN_API_KEY"
-# {"healthy":true,"agent_ready":false,"driver":"","version":"0.1.0"}
-
-# write and read a file in the persistent home
-curl -s -X PUT "http://$ID.warren.localhost:7337/v1/files/content?path=notes/hello.txt" -H "X-Warren-Key: $WARREN_API_KEY" \
-  --data-binary 'hello from the files API'
-curl -s "http://$ID.warren.localhost:7337/v1/files?path=notes" -H "X-Warren-Key: $WARREN_API_KEY"
-```
-
-Any other port is reachable at `<id>-<port>`:
-
-```bash
-curl -s -X POST $WARREN_API/instances/$ID/exec -H "$AUTH" -H 'Content-Type: application/json' \
-  -d '{"command": "cd ~ && nohup python3 -m http.server 8000 >/dev/null 2>&1 &"}'
-curl -s http://$ID-8000.warren.localhost:7337/ -H "X-Warren-Key: $WARREN_API_KEY" | head -5
-```
-
-## 7. Open the browser terminal
-
-Browsers cannot send the key header, so mint a signed URL for port 7681 (ttyd):
-
-```bash
-curl -s "$WARREN_API/instances/$ID/signed-url?port=7681&ttl=3600" -H "$AUTH"
-# {"url":"http://ab12cd34ef-7681.warren.localhost:7337/?warren_token=...","expires_at":1763003600}
-```
-
-Open the `url` in a browser. The edge verifies the token, sets the `warren_session` cookie and redirects to the clean URL; you land in a login shell as `agent`. The dashboard at `http://warren.localhost:7337/` does the same behind its "terminal" button. See [urls.md](urls.md).
-
-## 8. Talk to an agent
-
-The `warren-agent` template runs the built-in agent against any OpenAI-compatible endpoint. Credentials go in the instance `env`; they are never baked into images and never leave the instance:
-
-```bash
-AGENT=$(curl -s -X POST $WARREN_API/instances -H "$AUTH" -H 'Content-Type: application/json' -d '{
-  "template": "warren-agent",
-  "name": "assistant",
-  "auto_sleep": true,
-  "env": { "OPENAI_BASE_URL": "https://api.openai.com/v1", "OPENAI_API_KEY": "sk-...", "WARREN_MODEL": "gpt-4.1-mini" }
-}' | jq -r .id)
-until [ "$(curl -s $WARREN_API/instances/$AGENT -H "$AUTH" | jq -r .status)" = running ]; do sleep 1; done
-
-curl -s -X POST http://$AGENT.warren.localhost:7337/v1/responses -H "X-Warren-Key: $WARREN_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"input": "Create a file called plan.md in my home directory with three bullet points about Rust, then show it."}'
-```
-
-```json
-{ "id": "...", "session_id": "...", "status": "completed", "output_text": "Done. plan.md contains: ...", "created_at": 1763000000000, "completed_at": 1763000004000 }
-```
-
-Pass the returned `session_id` in the next request to continue the conversation, or `"stream": true` for server-sent events. The `warren-opencode` template runs OpenCode behind the same API. See [agent-api.md](agent-api.md).
-
-## 9. Sleep, wake, stop, delete
-
-```bash
-curl -s -X POST $WARREN_API/instances/$ID/sleep -H "$AUTH"      # {"id":"...","status":"sleeping"}: container stopped, disk kept
-curl -s http://$ID.warren.localhost:7337/v1/health -H "X-Warren-Key: $WARREN_API_KEY"   # held while the instance wakes, then answered
-curl -s -X POST $WARREN_API/instances/$ID/stop -H "$AUTH"       # {"id":"...","status":"stopping"}: never wakes on request
-curl -s -X POST $WARREN_API/instances/$ID/start -H "$AUTH"      # {"id":"...","status":"starting"}
-curl -s -X DELETE $WARREN_API/instances/$ID -H "$AUTH"          # {"id":"...","status":"deleting"}: disk removed
-```
-
-## 10. Check the awake quota
-
-```bash
-curl -s $WARREN_API/workspace -H "$AUTH" | jq '{awake_limit, awake_count}'
-# {"awake_limit":null,"awake_count":1}      null: the daemon runs without --max-awake-instances
-```
-
-When the operator starts the daemon with `--max-awake-instances N`, create, start, wake and fork answer `409 instance_limit_reached` once `N` of the workspace's instances are awake; sleeping and stopped ones do not count. See [quotas.md](quotas.md).
+`warren down --purge` stops the daemon, removes the service and, after a confirmation (`--yes` to skip it), the data directory; the config file and the base VM stay (`lume delete warren-macos-26` removes the VM). [install.md](install.md) covers removing the binaries.
 
 ## Next
 
-- [concepts.md](concepts.md) for the vocabulary, [instances.md](instances.md) for every lifecycle action and the sizing table.
-- [self-hosting.md](self-hosting.md) to run this on a real domain behind TLS.
-- The CLI does all of the above: `warren signup`, `warren instances create --template warren-agent --env OPENAI_API_KEY=... --wait`, `warren instances exec <id> -- uname -a`, `warren chat <id> "hello"`, `warren instances open <id> --port 7681`.
+- [concepts.md](concepts.md) for the vocabulary, [instances.md](instances.md) for every lifecycle action and the sizing table, [templates.md](templates.md) for the catalog and your own images.
+- [macos.md](macos.md) for what a `mac` instance is and is not, [limits.md](limits.md) for the hard limits by type.
+- [self-hosting.md](self-hosting.md) to run the daemon on a server with a real domain and TLS, as root with the system unit.
+- [for-agents.md](for-agents.md) and [mcp/README.md](../mcp/README.md) for agents, [API.md](API.md) for the wire contract behind every command (`--json` on any command prints the raw response).

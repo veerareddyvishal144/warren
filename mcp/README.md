@@ -23,6 +23,8 @@ Two environment variables, read at start:
 
 Get a key from a running daemon with `curl -X POST http://api.warren.localhost:7337/v1/signup` (dev) or `POST /v1/api-keys`.
 
+The `warren` CLI writes all of the configurations below for you, with the URL and key from its own config file (`warren up` or `warren login` fill it): `warren connect claude`, `warren connect codex`, `warren connect cursor`, `warren connect windsurf`, `warren connect caret`, `warren connect opencode`, `warren connect gemini`. Add `--project` for the project-level file where the client has one, `--print` to see the entry instead of writing it; an existing file is merged, not replaced, and kept as `<file>.bak-<time>`. `warren skill install` adds a Claude Code skill that explains when and how to use the tools.
+
 Logs go to stderr; set `RUST_LOG=debug` for request-level detail. Stdout is the protocol stream, so never pipe it anywhere else.
 
 ## Claude Code

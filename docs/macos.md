@@ -16,39 +16,63 @@ Safari, or macOS applications.
 ## Running it
 
 On the Mac (Apple silicon, macOS 14 or newer, [Lume](https://github.com/trycua/cua)
-0.7.2 or newer, `jq`, a Rust toolchain):
+0.7.2 or newer, `jq`, the `warren` and `warrend` binaries from
+[install.md](install.md) or a release build of the workspace):
 
-1. Create a stock macOS VM once, from Apple's restore image, and make sure
-   SSH works in it: `lume create base --os macos --cpu 4 --memory 4GB
-   --disk-size 50GB --ipsw latest`, `lume run base`, finish the macOS setup,
-   enable Remote Login, `lume stop base`.
-2. Turn it into Warren's base image: `bash scripts/mac/build-base.sh
-   --source base --target warren-macos-26`. This clones the VM, installs the
-   gateway LaunchDaemon and launcher, the `pf` isolation rules and your SSH
-   key, replaces the guest user's stock password (`lume`) with a random one
-   and restricts SSH to keys, disables sleep and automatic updates, and
-   stops the clone. The new password is written to
+1. A stock macOS VM, created once from Apple's restore image with the user
+   `lume` and SSH enabled. `warren mac init` creates it when there is none
+   (`lume create base --os macos --cpu 4 --memory 4GB --disk-size 50GB
+   --ipsw latest --unattended tahoe`: Lume's offline setup creates the
+   user, turns Remote Login on and boots once to verify; `--ipsw PATH` for a
+   downloaded image, `--unattended sequoia` for a macOS 15 image). By hand:
+   the same `lume create` without `--unattended`, `lume run base`, finish
+   the macOS setup, enable Remote Login, `lume stop base`.
+2. Turn it into Warren's base image: `warren mac init` (`--source base` to
+   name an existing stock VM, `--target` for another name than
+   `warren-macos-26`, `--force` to replace an existing target, `--dry-run`
+   to see the commands). It runs `scripts/mac/build-base.sh`, embedded in
+   the binary, which clones the VM, installs the gateway LaunchDaemon and
+   launcher, the `pf` isolation rules and your SSH key (`~/.ssh/id_ed25519`,
+   generated when missing), replaces the guest user's stock password
+   (`lume`) with a random one and restricts SSH to keys, disables sleep and
+   automatic updates, and stops the clone. The new password is written to
    `~/.warren/mac/warren-macos-26.password` (`$WARREN_MAC_DIR` to move it,
    mode 600); it is the `sudo` password inside every instance cloned from
    the image and `scripts/mac/debug-guest.sh` reads it from there. Add
    `--with-agents` to also install Node LTS and the `claude`, `codex` and
    `opencode` CLIs in the image (the guest downloads them through the NAT;
    several minutes and about 1 GB), the macOS counterpart of the Linux
-   `warren-claude` template.
-3. Build and run the daemon natively:
-   `cargo build --release -p warrend -p warren-gateway` then
-   `target/release/warrend --runtime none --mac-base-vm warren-macos-26 --dev`.
-   `--runtime none` skips Docker; drop it on a Mac that also runs Docker
-   Desktop for `default` instances. The daemon starts `lume serve` itself
-   when the API on `127.0.0.1:7777` is not answering (`--lume-api` to
-   change) and restarts it if it dies.
-4. Create instances from the `warren-macos` template: with `"type": "mac"`
-   (the dashboard, CLI `--type mac`, SDKs and MCP all know the type) or with
-   the template alone, since a request without a type takes the template's
-   only type. That is how a client that only knows templates, such as a
-   Caret workspace with `warren.template` set to `warren-macos`, gets macOS
-   instances. A requested disk below the base image's 50 GB is raised to it.
-   Or run the whole scenario with `bash scripts/mac/e2e.sh`.
+   `warren-claude` template. From a checkout, `bash
+   scripts/mac/build-base.sh --source base --target warren-macos-26` is the
+   same build without the CLI.
+3. Start the daemon: `warren up`. It installs the LaunchAgent
+   `dev.warren.daemon` from `packaging/launchd/dev.warren.daemon.plist`
+   (`warrend --runtime none --mac-base-vm warren-macos-26 --data-dir
+   "~/Library/Application Support/Warren" --listen 127.0.0.1:7337`, log in
+   `~/Library/Logs/Warren/warrend.log`), waits for `/v1/health`, signs up
+   and saves the key to `~/.config/warren/config.json`. `--runtime auto`
+   (the default) uses Docker as well when `docker info` works, for `default`
+   instances next to the macOS ones; `--port`, `--data-dir`, `--dev` and
+   `--no-service` (a plain background process, pid in `<data>/warrend.pid`)
+   change the shape; `warren status`, `warren doctor` and `warren down`
+   inspect and stop it. Run `warren up` again after `warren mac init` when
+   the daemon was started before the base VM existed. The daemon starts
+   `lume serve` itself when the API on `127.0.0.1:7777` is not answering
+   (`--lume-api` on `warrend` to change) and restarts it if it dies. From a
+   checkout without installing: `cargo build --release -p warrend -p
+   warren-gateway -p warren-cli`, then `target/release/warren up
+   --warrend-bin target/release/warrend`.
+4. Create instances from the `warren-macos` template: `warren run --type
+   mac -- claude` (a macOS instance bound to the current directory, with
+   the agent CLIs when the image was built with `--with-agents`), `warren
+   instances create --template warren-macos --wait`, `warren connect
+   claude` for the MCP tools, or the API with `"type": "mac"` (the
+   dashboard, SDKs and MCP all know the type) or with the template alone,
+   since a request without a type takes the template's only type. That is
+   how a client that only knows templates, such as a Caret workspace with
+   `warren.template` set to `warren-macos`, gets macOS instances. A
+   requested disk below the base image's 50 GB is raised to it. Or run the
+   whole scenario with `bash scripts/mac/e2e.sh`.
 
 Flags and variables: `--mac-base-vm` / `WARREN_MAC_BASE_VM` (enables the
 type), `--lume-api` / `WARREN_LUME_API`, `--lume-bin` / `WARREN_LUME_BIN`,
