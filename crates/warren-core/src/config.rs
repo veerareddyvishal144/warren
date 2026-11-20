@@ -45,6 +45,15 @@ pub struct Config {
     /// default; the cloud metadata range 169.254.0.0/16 is always blocked when the
     /// daemon can install firewall rules.
     pub allow_private_egress: bool,
+    /// Where the egress broker listens (`host:port`); it must be reachable from
+    /// the instances' networks (the Docker bridge, `warren-fc0`, the Lume NAT).
+    /// Empty or `none` runs the daemon without a broker, which refuses
+    /// `allowlist` instances and secrets.
+    pub broker_listen: String,
+    /// `host:port` instances use to reach the broker. None derives it per
+    /// runtime (the bridge gateway for Docker, 172.30.0.1 for Firecracker,
+    /// 192.168.64.1 for Lume) with the port of `broker_listen`.
+    pub broker_advertise_addr: Option<String>,
     pub min_idle_timeout_sec: u32,
     /// Instances a workspace may keep awake at once; None means unlimited.
     pub max_awake_instances: Option<u32>,
@@ -77,6 +86,8 @@ impl Default for Config {
             dev_mode: false,
             signup_enabled: true,
             allow_private_egress: false,
+            broker_listen: crate::broker::DEFAULT_BROKER_LISTEN.into(),
+            broker_advertise_addr: None,
             min_idle_timeout_sec: MIN_IDLE_TIMEOUT_SEC,
             max_awake_instances: None,
             secret: String::new(),
@@ -288,6 +299,17 @@ impl Config {
         }
         candidates.push(PathBuf::from("/usr/local/bin/warren-gateway"));
         candidates.into_iter().find(|p| p.is_file())
+    }
+
+    /// Whether the daemon runs the egress broker (`broker_listen` names an address).
+    pub fn broker_enabled(&self) -> bool {
+        let l = self.broker_listen.trim();
+        !l.is_empty() && !l.eq_ignore_ascii_case("none")
+    }
+
+    /// The port of `broker_listen`, or the default broker port when it names none.
+    pub fn broker_port(&self) -> u16 {
+        crate::broker::listen_port(&self.broker_listen)
     }
 
     pub fn instances_dir(&self) -> PathBuf {

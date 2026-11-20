@@ -7,6 +7,7 @@
 
 pub mod agentapi;
 pub mod auth;
+pub mod broker;
 pub mod config;
 pub mod cronexpr;
 pub mod errors;

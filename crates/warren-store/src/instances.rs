@@ -35,6 +35,7 @@ pub(crate) const COLS: &[&str] = &[
     "metadata",
     "env",
     "network",
+    "allowed_domains",
     "auto_sleep",
     "idle_timeout_seconds",
     "default_port",
@@ -93,6 +94,7 @@ fn read(row: &Row<'_>) -> rusqlite::Result<Instance> {
         metadata: col_json(row, "metadata")?,
         env: col_json(row, "env")?,
         network: col_parse(row, "network", NetworkMode::parse)?,
+        allowed_domains: col_json(row, "allowed_domains")?,
         auto_sleep: row.get("auto_sleep")?,
         idle_timeout_seconds: row.get("idle_timeout_seconds")?,
         url: String::new(),
@@ -111,6 +113,7 @@ fn read(row: &Row<'_>) -> rusqlite::Result<Instance> {
         ip: row.get("ip")?,
         storage_path: row.get("storage_path")?,
         instance_token: row.get("instance_token")?,
+        broker_env: Default::default(),
         disk_used_bytes: row.get("disk_used_bytes")?,
     })
 }
@@ -121,6 +124,8 @@ fn write(conn: &Connection, sql: &str, inst: &Instance) -> rusqlite::Result<usiz
     let metadata = to_json(&inst.metadata)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.to_string().into()))?;
     let env = to_json(&inst.env)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.to_string().into()))?;
+    let allowed_domains = to_json(&inst.allowed_domains)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.to_string().into()))?;
     let kind = inst.kind.as_str();
     let status = inst.status.as_str();
@@ -143,6 +148,7 @@ fn write(conn: &Connection, sql: &str, inst: &Instance) -> rusqlite::Result<usiz
         ":metadata": metadata,
         ":env": env,
         ":network": network,
+        ":allowed_domains": allowed_domains,
         ":auto_sleep": inst.auto_sleep,
         ":idle_timeout_seconds": inst.idle_timeout_seconds,
         ":default_port": inst.default_port,
@@ -229,9 +235,9 @@ pub(crate) fn update(conn: &Connection, inst: &Instance) -> Result<()> {
     }
 }
 
-/// Remove the instance together with its crons and metric samples. Backup rows
-/// are left for `delete_backups_for_instance`, which the caller runs once the
-/// archive files are gone.
+/// Remove the instance together with its crons, metric samples and secrets.
+/// Backup rows are left for `delete_backups_for_instance`, which the caller
+/// runs once the archive files are gone.
 pub(crate) fn delete(conn: &mut Connection, id: &str) -> Result<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -243,6 +249,12 @@ pub(crate) fn delete(conn: &mut Connection, id: &str) -> Result<()> {
         "instance",
     )?;
     exec(&tx, "DELETE FROM crons WHERE instance_id = ?1", params![id]).map_err(map_err)?;
+    exec(
+        &tx,
+        "DELETE FROM instance_secrets WHERE instance_id = ?1",
+        params![id],
+    )
+    .map_err(map_err)?;
     exec(
         &tx,
         "DELETE FROM metrics WHERE instance_id = ?1",

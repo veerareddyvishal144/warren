@@ -129,26 +129,47 @@ impl std::fmt::Display for InstanceType {
 /// Outbound network policy of an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum NetworkMode {
+    /// Unrestricted egress (minus the host-wide metadata and private-range blocks).
     #[default]
     #[serde(rename = "allow-all")]
     AllowAll,
+    /// No route out at all.
     #[serde(rename = "deny-all")]
     DenyAll,
+    /// No route out except through the host-side broker, which forwards
+    /// HTTP(S) to the instance's `allowed_domains` only.
+    #[serde(rename = "allowlist")]
+    Allowlist,
 }
 
 impl NetworkMode {
+    pub const ALL: [NetworkMode; 3] = [Self::AllowAll, Self::DenyAll, Self::Allowlist];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AllowAll => "allow-all",
             Self::DenyAll => "deny-all",
+            Self::Allowlist => "allowlist",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "allow-all" => Some(Self::AllowAll),
             "deny-all" => Some(Self::DenyAll),
+            "allowlist" => Some(Self::Allowlist),
             _ => None,
         }
+    }
+    /// The instance has no direct route out: its runtime attaches it to the
+    /// isolated network, where only the host (and so the broker) is reachable.
+    pub fn is_isolated(self) -> bool {
+        !matches!(self, Self::AllowAll)
+    }
+}
+
+impl std::fmt::Display for NetworkMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -305,6 +326,10 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     pub network: NetworkMode,
+    /// Destinations an `allowlist` instance may reach through the broker:
+    /// exact host names or `*.suffix` patterns (see `warren_core::broker`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_domains: Vec<String>,
     pub auto_sleep: bool,
     pub idle_timeout_seconds: u32,
     /// Derived by the API layer from the base domain; not stored.
@@ -337,15 +362,24 @@ pub struct Instance {
     /// Secret the guest gateway requires on /v1/exec.
     #[serde(skip)]
     pub instance_token: String,
+    /// Variables the lifecycle computes from the network mode, the broker
+    /// address and the instance's secrets right before a runtime call
+    /// (`WARREN_NETWORK`, `WARREN_BROKER`, the proxy variables, one route URL
+    /// per secret). Not stored; see `warren_core::broker::instance_env`.
+    #[serde(skip)]
+    pub broker_env: BTreeMap<String, String>,
     pub disk_used_bytes: i64,
 }
 
 impl Instance {
     /// Env the runtime injects: template defaults, then instance env, then the
-    /// platform variables (which always win).
+    /// broker variables, then the platform variables (which always win).
     pub fn effective_env(&self, tpl_env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
         let mut env = tpl_env.clone();
         for (k, v) in &self.env {
+            env.insert(k.clone(), v.clone());
+        }
+        for (k, v) in &self.broker_env {
             env.insert(k.clone(), v.clone());
         }
         env.insert(ENV_INSTANCE_ID.into(), self.id.clone());
@@ -354,6 +388,70 @@ impl Instance {
         env.insert(ENV_HOME.into(), self.mount_path.clone());
         env.insert(ENV_GATEWAY_PORT.into(), GATEWAY_PORT.to_string());
         env
+    }
+}
+
+/// A credential the host-side broker injects into requests on the instance's
+/// behalf. Part of `CreateInstanceRequest` and `PatchInstanceRequest`; never
+/// returned by any read. `value` is redacted from `Debug` output.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SecretSpec {
+    /// Variable the instance sees with a placeholder value (`warren-broker`),
+    /// so tools find a non-empty key: `[A-Z_][A-Z0-9_]*`.
+    pub name: String,
+    /// The `https://` URL requests are rewritten onto, optionally with a path prefix.
+    pub upstream: String,
+    /// Header the broker adds, e.g. `x-api-key` or `Authorization` (which gets
+    /// `Bearer <value>` unless the value already carries a scheme).
+    pub header: String,
+    /// The credential itself. At most `MAX_SECRET_VALUE_BYTES`.
+    pub value: String,
+    /// Variable that receives the broker route URL (`http://<broker>/r/<token>`),
+    /// e.g. `ANTHROPIC_BASE_URL`.
+    pub env: String,
+}
+
+impl std::fmt::Debug for SecretSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretSpec")
+            .field("name", &self.name)
+            .field("upstream", &self.upstream)
+            .field("header", &self.header)
+            .field("value", &"<redacted>")
+            .field("env", &self.env)
+            .finish()
+    }
+}
+
+/// A stored secret of one instance: the spec plus the route token the
+/// broker recognises it by. Never serialized to clients; `value` and the
+/// token are redacted from `Debug` output.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct InstanceSecret {
+    pub instance_id: String,
+    pub name: String,
+    pub upstream: String,
+    pub header: String,
+    pub value: String,
+    pub env: String,
+    /// Random per instance and secret; the path of the route URL the instance gets.
+    pub route_token: String,
+    pub created_at: i64,
+}
+
+impl std::fmt::Debug for InstanceSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstanceSecret")
+            .field("instance_id", &self.instance_id)
+            .field("name", &self.name)
+            .field("upstream", &self.upstream)
+            .field("header", &self.header)
+            .field("value", &"<redacted>")
+            .field("env", &self.env)
+            .field("route_token", &"<redacted>")
+            .field("created_at", &self.created_at)
+            .finish()
     }
 }
 
@@ -471,6 +569,12 @@ pub const ENV_INSTANCE_TOKEN: &str = "WARREN_INSTANCE_TOKEN";
 pub const ENV_WORKSPACE_ID: &str = "WARREN_WORKSPACE_ID";
 pub const ENV_HOME: &str = "WARREN_HOME";
 pub const ENV_GATEWAY_PORT: &str = "WARREN_GATEWAY_PORT";
+/// The instance's network mode (`allow-all`, `deny-all`, `allowlist`); guests
+/// that enforce their own egress policy (the macOS launcher) read it.
+pub const ENV_NETWORK: &str = "WARREN_NETWORK";
+/// `host:port` of the broker as reachable from inside the instance; set only
+/// when the daemon runs one and knows the address for the instance's runtime.
+pub const ENV_BROKER: &str = "WARREN_BROKER";
 pub const ENV_AGENT_DRIVER: &str = "WARREN_AGENT_DRIVER";
 pub const ENV_AGENT_COMMAND: &str = "WARREN_AGENT_COMMAND";
 pub const ENV_MODEL: &str = "WARREN_MODEL";
@@ -486,6 +590,12 @@ pub const INSTANCE_ID_LENGTH: usize = 10;
 pub const MAX_ENV_ENTRIES: usize = 64;
 pub const MAX_ENV_VALUE_BYTES: usize = 4096;
 pub const MAX_METADATA_ENTRIES: usize = 32;
+/// Most `allowed_domains` entries on one instance.
+pub const MAX_ALLOWED_DOMAINS: usize = 64;
+/// Most secrets on one instance.
+pub const MAX_SECRETS: usize = 16;
+/// Longest secret value, in bytes.
+pub const MAX_SECRET_VALUE_BYTES: usize = 8192;
 /// Backups kept per instance; the oldest is deleted when a new one exceeds it.
 pub const MAX_BACKUPS_PER_INSTANCE: usize = 20;
 /// Total backup bytes a workspace may hold.

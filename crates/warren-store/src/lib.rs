@@ -19,6 +19,7 @@ mod instances;
 mod metrics;
 mod migrations;
 mod rows;
+mod secrets;
 mod store;
 mod store_impl;
 mod templates;
