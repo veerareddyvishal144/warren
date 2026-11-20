@@ -246,6 +246,7 @@ impl Manager {
     /// Errors while saving are logged, never surfaced, because the caller is
     /// already returning the original error.
     pub(crate) async fn fail(&self, inst: &mut Instance, err: &Error, what: &str) {
+        self.broker_unregister(&inst.id);
         let reason = describe(err);
         tracing::error!(instance = %inst.id, op = what, error = %reason, "operation failed");
         if let Err(e) = self.transition(inst, InstanceStatus::Failed, &reason).await {
@@ -258,6 +259,7 @@ impl Manager {
     /// `destroy(remove_storage = false)` (the disk stays), then record both the
     /// original error and the outcome of the forced destroy as the reason.
     pub(crate) async fn fail_force(&self, inst: &mut Instance, err: &Error, what: &str) {
+        self.broker_unregister(&inst.id);
         let outcome = match self.runtime_for(inst) {
             Ok(rt) => match rt.destroy(inst, false).await {
                 Ok(()) => {

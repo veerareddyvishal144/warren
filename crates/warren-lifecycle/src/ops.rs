@@ -14,13 +14,14 @@ use warren_core::{
     Backup, CreateInstanceRequest, DEFAULT_EXEC_TIMEOUT_SEC, DEFAULT_IDLE_TIMEOUT_SEC, Error,
     ExecRequest, ExecResult, ForkRequest, Instance, InstanceStatus, InstanceType, Lifecycle,
     LogsOptions, MAX_BACKUP_BYTES_PER_WORKSPACE, MAX_BACKUPS_PER_INSTANCE, MetricPoint,
-    NetworkMode, PatchInstanceRequest, Result, Runtime, STOP_GRACE_SECS, ShapeRequest, Template,
-    Workspace,
+    NetworkMode, PatchInstanceRequest, Result, Runtime, STOP_GRACE_SECS, SecretSpec, ShapeRequest,
+    Template, Workspace, broker,
     errors::{CODE_HOST_CAPACITY_REACHED, is_requires_restart},
     ids, shapes,
 };
 
 use crate::{
+    broker::check_secret_env_collisions,
     manager::{Manager, conflict_for},
     validate::{
         resolve_region, validate_env, validate_idle_timeout, validate_metadata, validate_name,
@@ -119,6 +120,10 @@ impl Manager {
         inst: &mut Instance,
         from: InstanceStatus,
     ) -> Result<()> {
+        if let Err(e) = self.prepare_broker_env(rt.as_ref(), inst).await {
+            self.fail(inst, &e, "start").await;
+            return Err(e);
+        }
         match rt.start(inst).await {
             Ok(info) => {
                 if !info.ip.is_empty() {
@@ -131,7 +136,9 @@ impl Manager {
                 inst.started_at = now;
                 inst.last_activity_at = now;
                 self.touch_activity(&inst.id, now);
-                self.transition(inst, InstanceStatus::Running, "").await
+                self.transition(inst, InstanceStatus::Running, "").await?;
+                self.broker_register(inst).await;
+                Ok(())
             }
             Err(e) if e.code == CODE_HOST_CAPACITY_REACHED => {
                 // Nothing is wrong with the instance: the host is full. Put the
@@ -178,6 +185,7 @@ impl Manager {
         }
         inst.stopped_at = self.now();
         inst.ip.clear();
+        self.broker_unregister(&inst.id);
         self.transition(inst, InstanceStatus::Stopped, reason).await
     }
 
@@ -198,6 +206,7 @@ impl Manager {
             return Err(e);
         }
         inst.ip.clear();
+        self.broker_unregister(&inst.id);
         self.save(inst).await
     }
 
@@ -234,6 +243,7 @@ impl Manager {
     /// Remove backups (rows and files), crons and the instance row.
     pub(crate) async fn purge_records(&self, inst: &Instance) -> Result<()> {
         let id = inst.id.as_str();
+        self.broker_unregister(id);
         if let Err(e) = self.deps.store.delete_backups_for_instance(id).await {
             tracing::warn!(instance = id, error = %e, "could not delete backup rows");
         }
@@ -275,9 +285,15 @@ impl Manager {
                 self.fail_force(inst, &e, "stop").await;
                 return Err(e);
             }
+            self.broker_unregister(&inst.id);
         }
         let previous = inst.network;
         inst.network = network;
+        if let Err(e) = self.prepare_broker_env(rt.as_ref(), inst).await {
+            inst.network = previous;
+            self.fail(inst, &e, "recreate").await;
+            return Err(e);
+        }
         if let Err(e) = rt.recreate(inst, &tpl).await {
             inst.network = previous;
             self.fail(inst, &e, "recreate").await;
@@ -301,6 +317,7 @@ impl Manager {
     ) {
         let result: Result<()> = async {
             rt.ensure_image(&tpl.image_ref).await?;
+            self.prepare_broker_env(rt.as_ref(), &mut inst).await?;
             rt.create(&mut inst, &tpl).await?;
             self.save(&mut inst).await?;
             self.boot(&mut inst, InstanceStatus::Provisioning).await
@@ -405,6 +422,7 @@ impl Manager {
             self.fail_force(&mut inst, &e, "stop").await;
             return Err(e);
         }
+        self.broker_unregister(&inst.id);
         self.boot(&mut inst, InstanceStatus::Restarting).await?;
         self.overlay(&mut inst);
         Ok(inst)
@@ -515,6 +533,13 @@ impl Manager {
             self.fail_force(&mut inst, &e, "stop").await;
             return Err(e);
         }
+        if was_running {
+            self.broker_unregister(&inst.id);
+        }
+        if let Err(e) = self.prepare_broker_env(rt.as_ref(), &mut inst).await {
+            self.fail(&mut inst, &e, "recreate").await;
+            return Err(e);
+        }
         if let Err(e) = rt.recreate(&mut inst, &tpl).await {
             self.fail(&mut inst, &e, "recreate").await;
             return Err(e);
@@ -588,6 +613,7 @@ impl Manager {
             metadata: req.metadata.clone().unwrap_or_else(|| src.metadata.clone()),
             env: src.env.clone(),
             network: src.network,
+            allowed_domains: src.allowed_domains.clone(),
             auto_sleep: req.auto_sleep.unwrap_or(src.auto_sleep),
             idle_timeout_seconds: req.idle_timeout_seconds.unwrap_or(src.idle_timeout_seconds),
             default_port: src.default_port,
@@ -605,7 +631,27 @@ impl Manager {
         drop(ws_guard);
         tracing::info!(instance = %dst.id, parent = %src.id, "forking");
         let result: Result<()> = async {
+            // The copy gets the source's secrets under fresh route tokens.
+            let inherited = self.deps.store.list_instance_secrets(&src.id).await?;
+            if !inherited.is_empty() {
+                let specs: Vec<SecretSpec> = inherited
+                    .iter()
+                    .map(|s| SecretSpec {
+                        name: s.name.clone(),
+                        upstream: s.upstream.clone(),
+                        header: s.header.clone(),
+                        value: s.value.clone(),
+                        env: s.env.clone(),
+                    })
+                    .collect();
+                let secrets = self.secrets_from_specs(&dst.id, &specs, &[]);
+                self.deps
+                    .store
+                    .replace_instance_secrets(&dst.id, &secrets)
+                    .await?;
+            }
             rt.clone_storage(&src, &mut dst).await?;
+            self.prepare_broker_env(rt.as_ref(), &mut dst).await?;
             rt.create(&mut dst, &tpl).await?;
             self.save(&mut dst).await?;
             self.boot(&mut dst, InstanceStatus::Provisioning).await
@@ -680,6 +726,13 @@ impl Lifecycle for Manager {
         let idle = req.idle_timeout_seconds.unwrap_or(DEFAULT_IDLE_TIMEOUT_SEC);
         validate_idle_timeout(idle, self.deps.config.min_idle_timeout_sec)?;
         let region = resolve_region(req.region.as_deref(), &self.deps.config.region)?;
+        let network = req.network.unwrap_or_default();
+        let allowed_domains =
+            broker::normalize_allowed_domains(req.allowed_domains.as_deref().unwrap_or(&[]))?;
+        let secret_specs = req.secrets.clone().unwrap_or_default();
+        broker::validate_secrets(&secret_specs)?;
+        check_secret_env_collisions(&env, &secret_specs)?;
+        self.check_broker_policy(network, secret_specs.len())?;
         if req.kind == Some(InstanceType::Performance) {
             return Err(Error::not_supported(
                 "performance instances are not available in this build",
@@ -722,7 +775,8 @@ impl Lifecycle for Manager {
             region,
             metadata,
             env,
-            network: req.network.unwrap_or_default(),
+            network,
+            allowed_domains,
             auto_sleep: req.auto_sleep.unwrap_or(false),
             idle_timeout_seconds: idle,
             default_port: tpl.default_port,
@@ -745,12 +799,30 @@ impl Lifecycle for Manager {
         rt.check_capacity().await?;
         let guard = self.lock(&inst.id).await;
         self.deps.store.create_instance(&inst).await?;
+        if !secret_specs.is_empty() {
+            let secrets = self.secrets_from_specs(&inst.id, &secret_specs, &[]);
+            if let Err(e) = self
+                .deps
+                .store
+                .replace_instance_secrets(&inst.id, &secrets)
+                .await
+            {
+                // Nothing may run with half its secrets: take the row back.
+                if let Err(del) = self.deps.store.delete_instance(&inst.id).await {
+                    tracing::error!(instance = %inst.id, error = %del, "could not remove the instance after its secrets failed to store");
+                }
+                return Err(e);
+            }
+        }
         drop(ws_guard);
         tracing::info!(
             instance = %inst.id,
             workspace = %ws.id,
             template = %inst.template_name,
             kind = %kind,
+            network = %network,
+            domains = inst.allowed_domains.len(),
+            secrets = secret_specs.len(),
             shape = %shape,
             "creating"
         );
@@ -807,11 +879,41 @@ impl Lifecycle for Manager {
                 validate_idle_timeout(idle, me.deps.config.min_idle_timeout_sec)?;
                 inst.idle_timeout_seconds = idle;
             }
-            if let Some(network) = req.network.filter(|n| *n != inst.network) {
-                if !settled(inst.status) {
-                    return Err(conflict_for(&inst));
+            // Everything below is checked before anything is written.
+            let mut registry_dirty = false;
+            if let Some(domains) = &req.allowed_domains {
+                inst.allowed_domains = broker::normalize_allowed_domains(domains)?;
+                registry_dirty = true;
+            }
+            let existing = me.deps.store.list_instance_secrets(&inst.id).await?;
+            let new_secrets = match &req.secrets {
+                Some(specs) => {
+                    broker::validate_secrets(specs)?;
+                    check_secret_env_collisions(&inst.env, specs)?;
+                    Some(me.secrets_from_specs(&inst.id, specs, &existing))
                 }
+                None => None,
+            };
+            let network = req.network.unwrap_or(inst.network);
+            let secret_count = new_secrets.as_ref().map_or(existing.len(), Vec::len);
+            me.check_broker_policy(network, secret_count)?;
+            let network_change = req.network.filter(|n| *n != inst.network);
+            if network_change.is_some() && !settled(inst.status) {
+                return Err(conflict_for(&inst));
+            }
+            if let Some(secrets) = &new_secrets {
+                me.deps
+                    .store
+                    .replace_instance_secrets(&inst.id, secrets)
+                    .await?;
+                registry_dirty = true;
+            }
+            if let Some(network) = network_change {
+                // Recreates and, for a running instance, boots again: the
+                // registration is rebuilt on the way.
                 me.apply_network(&mut inst, network).await?;
+            } else if registry_dirty && inst.status == InstanceStatus::Running {
+                me.broker_register(&inst).await;
             }
             me.save(&mut inst).await?;
             me.overlay(&mut inst);

@@ -191,6 +191,7 @@ impl Manager {
                 if inst.status.awake() || inst.status == InstanceStatus::Deleting {
                     tracing::warn!(instance = %inst.id, kind = %inst.kind, "runtime unavailable; marking failed");
                     inst.ip.clear();
+                    self.broker_unregister(&inst.id);
                     return self
                         .transition(inst, InstanceStatus::Failed, &e.message)
                         .await;
@@ -216,11 +217,13 @@ impl Manager {
             InstanceStatus::Running => {
                 if runtime_running {
                     self.touch_activity(&inst.id, now);
+                    self.broker_register(inst).await;
                     tracing::info!(instance = %inst.id, "adopted running instance");
                     Ok(())
                 } else {
                     inst.stopped_at = now;
                     inst.ip.clear();
+                    self.broker_unregister(&inst.id);
                     self.transition(
                         inst,
                         InstanceStatus::Stopped,
@@ -239,6 +242,7 @@ impl Manager {
                 }
                 let reason = format!("daemon restarted during {}", inst.status);
                 inst.ip.clear();
+                self.broker_unregister(&inst.id);
                 self.transition(inst, InstanceStatus::Failed, &reason).await
             }
             InstanceStatus::Stopping => {
@@ -247,6 +251,7 @@ impl Manager {
                 }
                 inst.stopped_at = now;
                 inst.ip.clear();
+                self.broker_unregister(&inst.id);
                 let reason = inst.status_reason.clone();
                 self.transition(inst, InstanceStatus::Stopped, &reason)
                     .await
@@ -322,6 +327,7 @@ impl Manager {
                 tracing::warn!(instance = %inst.id, "runtime exited behind a running instance");
                 inst.stopped_at = now;
                 inst.ip.clear();
+                self.broker_unregister(&inst.id);
                 self.transition(inst, InstanceStatus::Stopped, "runtime not running")
                     .await
             }
@@ -332,6 +338,7 @@ impl Manager {
                 tracing::warn!(instance = %inst.id, "runtime still running behind a failed instance; bringing it down");
                 let outcome = Self::force_down(rt.as_ref(), inst).await;
                 inst.ip.clear();
+                self.broker_unregister(&inst.id);
                 let reason = if inst.status_reason.is_empty() {
                     outcome
                 } else {
@@ -356,6 +363,7 @@ impl Manager {
                     "runtime not running".to_string()
                 };
                 inst.ip.clear();
+                self.broker_unregister(&inst.id);
                 if inst.status == InstanceStatus::Stopping {
                     inst.stopped_at = now;
                     let reason = if inst.status_reason.is_empty() {

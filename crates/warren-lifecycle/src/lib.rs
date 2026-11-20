@@ -16,6 +16,7 @@
 //! the disk-usage refresh and a five-minute repair pass until the shutdown
 //! token is cancelled.
 
+mod broker;
 mod loops;
 mod manager;
 mod ops;
