@@ -231,9 +231,7 @@ async fn connect_is_allowed_only_for_listed_hosts_in_allowlist_mode() {
     for mode in [NetworkMode::DenyAll, NetworkMode::AllowAll] {
         h.register(mode, &["127.0.0.1"], vec![]);
         let head = h
-            .raw(&format!(
-                "CONNECT {dest} HTTP/1.1\r\nHost: {dest}\r\n\r\n"
-            ))
+            .raw(&format!("CONNECT {dest} HTTP/1.1\r\nHost: {dest}\r\n\r\n"))
             .await;
         assert!(head.starts_with("HTTP/1.1 403"), "{mode}: {head}");
     }
@@ -248,7 +246,12 @@ async fn private_destinations_are_blocked_even_when_listed() {
     h.register(
         NetworkMode::Allowlist,
         &["127.0.0.1", "localhost", "metadata.internal"],
-        vec![route("tok", &format!("https://127.0.0.1:{}", up.addr.port()), "x-api-key", "v")],
+        vec![route(
+            "tok",
+            &format!("https://127.0.0.1:{}", up.addr.port()),
+            "x-api-key",
+            "v",
+        )],
     );
     let head = h
         .raw(&format!("CONNECT {dest} HTTP/1.1\r\nHost: {dest}\r\n\r\n"))
@@ -279,7 +282,10 @@ async fn plain_http_is_forwarded_with_path_and_headers() {
         ))
         .await;
     assert!(out.starts_with("HTTP/1.1 200"), "{out}");
-    assert!(out.contains("x-upstream: yes") || out.contains("X-Upstream: yes"), "{out}");
+    assert!(
+        out.contains("x-upstream: yes") || out.contains("X-Upstream: yes"),
+        "{out}"
+    );
     assert!(out.contains("{\"ok\":true}"));
     let seen = up.seen();
     assert_eq!(seen.len(), 1);
@@ -333,7 +339,11 @@ async fn routes_inject_the_secret_and_rewrite_the_path() {
     let seen = up.seen();
     assert_eq!(seen[0].method, "POST");
     assert_eq!(seen[0].path, "/base/v1/messages?beta=1");
-    assert_eq!(seen[0].header("x-api-key"), Some("sk-ant-real"), "placeholder replaced");
+    assert_eq!(
+        seen[0].header("x-api-key"),
+        Some("sk-ant-real"),
+        "placeholder replaced"
+    );
     assert_eq!(seen[0].header("content-type"), Some("application/json"));
     assert_eq!(seen[0].header("content-length"), Some("13"));
     assert_eq!(seen[0].body, "{\"model\":\"m\"}");
@@ -344,7 +354,11 @@ async fn routes_inject_the_secret_and_rewrite_the_path() {
 
     // Authorization gets a Bearer scheme unless the value has one.
     client.get(h.url("/r/tok-openai")).send().await.unwrap();
-    client.get(h.url("/r/tok-github/user")).send().await.unwrap();
+    client
+        .get(h.url("/r/tok-github/user"))
+        .send()
+        .await
+        .unwrap();
     let seen = up.seen();
     assert_eq!(seen[1].path, "/base");
     assert_eq!(seen[1].header("authorization"), Some("Bearer sk-oa-real"));
@@ -399,7 +413,12 @@ async fn registry_replaces_entries_by_id_and_address() {
     assert!(registry.lookup("10.0.0.3".parse().unwrap()).is_none());
     let dbg = format!(
         "{:?}",
-        route("secret-token", "https://x.example.com", "x-api-key", "sk-value")
+        route(
+            "secret-token",
+            "https://x.example.com",
+            "x-api-key",
+            "sk-value"
+        )
     );
     assert!(!dbg.contains("sk-value") && !dbg.contains("secret-token"));
 }

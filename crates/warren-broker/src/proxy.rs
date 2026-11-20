@@ -17,7 +17,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use warren_core::{BrokerEntry, Error, Result, broker};
 
-use crate::server::{Body, Broker, Reply, check_proxy_mode, empty};
+use crate::server::{Body, BoxError, Broker, Reply, check_proxy_mode, empty};
 
 /// Hop-by-hop headers (RFC 9110 section 7.6.1) plus the proxy ones; never forwarded.
 const HOP_BY_HOP: [&str; 9] = [
@@ -98,7 +98,12 @@ fn split_authority(authority: &str, default_port: u16) -> Result<(String, u16)> 
 /// Policy for one destination: the instance proxies, the host is on its
 /// allowlist and it resolves to at least one public address. Returns the
 /// addresses to try, in resolver order.
-async fn admit(broker: &Broker, entry: &BrokerEntry, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+async fn admit(
+    broker: &Broker,
+    entry: &BrokerEntry,
+    host: &str,
+    port: u16,
+) -> Result<Vec<SocketAddr>> {
     check_proxy_mode(entry)?;
     if port == 0 {
         return Err(Error::invalid("port 0 is not a destination"));
@@ -181,7 +186,9 @@ pub(crate) async fn connect(
                     Ok((up, down)) => {
                         tracing::debug!(instance = %instance, %host, port, up, down, "tunnel closed")
                     }
-                    Err(e) => tracing::debug!(instance = %instance, %host, port, error = %e, "tunnel ended"),
+                    Err(e) => {
+                        tracing::debug!(instance = %instance, %host, port, error = %e, "tunnel ended")
+                    }
                 }
             }
             Err(e) => tracing::debug!(instance = %instance, error = %e, "CONNECT upgrade failed"),
@@ -257,7 +264,8 @@ pub(crate) async fn forward(
 /// The upstream answer without hop-by-hop headers, body streaming.
 fn relay(resp: Response<Incoming>) -> Reply {
     let (parts, body) = resp.into_parts();
-    let mut out = Response::new(body.map_err(|e| Box::new(e) as _).boxed() as Body);
+    let body: Body = body.map_err(|e| Box::new(e) as BoxError).boxed();
+    let mut out = Response::new(body);
     *out.status_mut() = parts.status;
     *out.version_mut() = http::Version::HTTP_11;
     *out.headers_mut() = end_to_end_headers(&parts.headers);

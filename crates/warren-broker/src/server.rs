@@ -95,7 +95,9 @@ pub(crate) fn check_proxy_mode(entry: &BrokerEntry) -> Result<()> {
 }
 
 pub(crate) fn empty() -> Body {
-    Empty::<Bytes>::new().map_err(|never| match never {}).boxed()
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed()
 }
 
 pub(crate) fn full(bytes: impl Into<Bytes>) -> Body {

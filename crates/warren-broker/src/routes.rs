@@ -160,7 +160,9 @@ pub(crate) async fn handle(
         .collect()
         .await
         .map_err(|e| {
-            if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+            if e.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
                 Error::invalid(format!(
                     "request body exceeds {} bytes",
                     broker.opts.max_route_body_bytes
@@ -174,11 +176,7 @@ pub(crate) async fn handle(
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .map_err(|_| Error::invalid("unsupported method"))?;
     let upstream_host = url.host_str().unwrap_or("").to_string();
-    let request = broker
-        .http
-        .request(method, url)
-        .headers(headers)
-        .body(body);
+    let request = broker.http.request(method, url).headers(headers).body(body);
     let resp = tokio::time::timeout(broker.opts.response_timeout, request.send())
         .await
         .map_err(|_| Error::timeout(format!("{upstream_host} did not answer in time")))?
@@ -202,8 +200,8 @@ fn relay(resp: reqwest::Response) -> Reply {
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
     let body: Body = StreamBody::new(stream).boxed();
     let mut out = Response::new(body);
-    *out.status_mut() = http::StatusCode::from_u16(status.as_u16())
-        .unwrap_or(http::StatusCode::BAD_GATEWAY);
+    *out.status_mut() =
+        http::StatusCode::from_u16(status.as_u16()).unwrap_or(http::StatusCode::BAD_GATEWAY);
     *out.headers_mut() = headers;
     out
 }
@@ -234,7 +232,9 @@ mod tests {
     fn upstream_urls_keep_prefix_and_query() {
         let r = route("https://api.example.com");
         assert_eq!(
-            upstream_url(&r, "/v1/messages", Some("a=1")).unwrap().as_str(),
+            upstream_url(&r, "/v1/messages", Some("a=1"))
+                .unwrap()
+                .as_str(),
             "https://api.example.com/v1/messages?a=1"
         );
         assert_eq!(
