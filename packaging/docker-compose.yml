@@ -1,0 +1,58 @@
+# The Warren daemon in a container on a Linux host that runs Docker.
+#
+#   docker compose -f packaging/docker-compose.yml up -d --build    # builds warren:local from the repo root
+#   docker compose -f packaging/docker-compose.yml logs -f
+#   curl -s -H 'Host: api.warren.localhost' http://127.0.0.1:7337/v1/health
+#
+# What has to be on the host, because the daemon only talks to dockerd:
+#   - Docker, with the socket at /var/run/docker.sock
+#   - gVisor registered as the `runsc` runtime in the host's dockerd (sudo scripts/install-gvisor.sh);
+#     without it default instances fall back to runc (set WARREN_RUNTIME=runsc to refuse that)
+#   - the template images warren/base, warren/agent, warren/opencode with WARREN_IMAGE_TAG,
+#     built on the host: WARREN_GATEWAY_BIN=<static gateway> scripts/build-images.sh
+#   - the data directory, mounted at the same path inside the container (see volumes)
+# The vm (Firecracker) and mac (Lume) instance types are not available from a container.
+# Details: docs/install.md, "Docker image".
+services:
+  warrend:
+    image: warren:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: warrend
+    restart: unless-stopped
+    # Host networking: the edge binds :7337 on the host and reaches instances at
+    # their addresses on the warren-net bridge. No other container network can
+    # do that (the daemon creates warren-net with inter-container communication
+    # off), so there is no `ports:` section; the standard port is 7337 on the host.
+    network_mode: host
+    # The egress rules the daemon installs in the DOCKER-USER chain (metadata
+    # service, private ranges, the host). Without these the daemon, running as
+    # root, fails at startup.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Same path on both sides: dockerd bind-mounts instance homes
+      # (<data>/instances/<id>/home) and the gateway (<data>/bin/warren-gateway)
+      # from these host paths when the daemon asks for them.
+      - /var/lib/warren:/var/lib/warren
+    environment:
+      WARREN_DATA_DIR: /var/lib/warren
+      WARREN_LISTEN: ":7337"
+      WARREN_PUBLIC_PORT: "7337"
+      WARREN_BASE_DOMAIN: warren.localhost
+      WARREN_RUNTIME: auto            # runsc in production: fails fast when gVisor is missing
+      WARREN_IMAGE_TAG: dev           # the tag scripts/build-images.sh used on the host
+      WARREN_LOG: info
+      # WARREN_IPTABLES: legacy       # hosts whose dockerd uses iptables-legacy
+      # WARREN_SIGNUP_ENABLED: "false"
+      # WARREN_MAX_AWAKE_INSTANCES: "4"
+      # WARREN_ALLOW_PRIVATE_EGRESS: "false"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-H", "Host: api.warren.localhost", "http://127.0.0.1:7337/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
