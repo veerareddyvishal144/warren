@@ -182,6 +182,7 @@ cp "$GUEST_DIR"/warren-gateway-launcher.sh "$GUEST_DIR"/install.sh "$GUEST_DIR"/
    "$GUEST_DIR"/dev.warren.gateway.plist "$GUEST_DIR"/dev.warren.pf.plist "$STAGE/"
 printf '%s\n' "$PUBKEY" >"$STAGE/authorized_key.pub"
 (umask 077 && printf '%s\n' "$NEW_PASSWORD" >"$STAGE/new_password")
+(umask 077 && printf '%s\n' "$PASSWORD" >"$STAGE/old_password")
 bash -n "$STAGE/install.sh"
 bash -n "$STAGE/warren-gateway-launcher.sh"
 if command -v plutil >/dev/null 2>&1; then
@@ -260,7 +261,7 @@ log "new guest password stored in $PASSWORD_FILE (mode 600)"
 # password check so a wrong --password fails here instead of later. The new
 # password travels in a file install.sh deletes after reading.
 log "running install.sh as root inside the guest"
-INSTALL_CMD="sudo -S -k -p '' bash $REMOTE_DIR/install.sh --subnet '$SUBNET' --gateway '$GATEWAY' --ssh-key-file $REMOTE_DIR/authorized_key.pub --new-password-file $REMOTE_DIR/new_password"
+INSTALL_CMD="sudo -S -k -p '' bash $REMOTE_DIR/install.sh --subnet '$SUBNET' --gateway '$GATEWAY' --ssh-key-file $REMOTE_DIR/authorized_key.pub --new-password-file $REMOTE_DIR/new_password --old-password-file $REMOTE_DIR/old_password"
 if [ "$WITH_AGENTS" = 1 ]; then
     INSTALL_CMD="$INSTALL_CMD --with-agents"
     [ -n "$NODE_VERSION" ] && INSTALL_CMD="$INSTALL_CMD --node-version '$NODE_VERSION'"
@@ -278,9 +279,11 @@ if [ "$KEY_WORKED" = 0 ]; then
 fi
 # Password logins must now be refused (install.sh turned them off). With no
 # authentication offered, ssh fails and names the methods the server would
-# accept: "Permission denied (publickey)." is what the image must say.
+# accept: "Permission denied (publickey)." is what the image must say. (BatchMode
+# refuses to type a password, so asking for password auth makes ssh fail at once
+# and print the list; asking for "none" prints nothing on macOS's ssh.)
 METHODS="$(ssh "${SSH_OPTS[@]}" -o ControlMaster=no -o ControlPath=none -o BatchMode=yes \
-    -o PubkeyAuthentication=no -o PreferredAuthentications=none "$REMOTE" true 2>&1 || true)"
+    -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive "$REMOTE" true 2>&1 || true)"
 case "$METHODS" in
     *password*|*keyboard-interactive*)
         log "warning: the guest's sshd still offers password authentication ($METHODS); the hardening in install.sh did not take" ;;

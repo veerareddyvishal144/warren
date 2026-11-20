@@ -7,6 +7,9 @@
 #   --ssh-key-file FILE               the same, read from the first line of FILE
 #   --new-password PASS               set the guest user's password to PASS (verified with dscl -authonly)
 #   --new-password-file FILE          the same, read from the first line of FILE (the file is deleted)
+#   --old-password PASS | --old-password-file FILE
+#                                     the guest user's current password; Secure Token accounts refuse a
+#                                     password change without it (dscl: eDSAuthFailed)
 #   --with-agents                     install Node LTS under /usr/local and the claude, codex and opencode CLIs
 #   --node-version vX.Y.Z             Node version for --with-agents (default: the latest LTS at nodejs.org)
 #
@@ -32,7 +35,7 @@ log() { printf '[install] %s\n' "$*" >&2; }
 die() { log "error: $*"; exit 1; }
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
-SUBNET="" GATEWAY="" SSH_KEY="" SSH_KEY_FILE="" NEW_PASSWORD="" NEW_PASSWORD_FILE=""
+SUBNET="" GATEWAY="" SSH_KEY="" SSH_KEY_FILE="" NEW_PASSWORD="" NEW_PASSWORD_FILE="" OLD_PASSWORD="" OLD_PASSWORD_FILE=""
 WITH_AGENTS=0 NODE_VERSION=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -42,6 +45,8 @@ while [ $# -gt 0 ]; do
         --ssh-key-file) SSH_KEY_FILE="${2:-}"; shift ;;
         --new-password) NEW_PASSWORD="${2:-}"; shift ;;
         --new-password-file) NEW_PASSWORD_FILE="${2:-}"; shift ;;
+        --old-password) OLD_PASSWORD="${2:-}"; shift ;;
+        --old-password-file) OLD_PASSWORD_FILE="${2:-}"; shift ;;
         --with-agents) WITH_AGENTS=1 ;;
         --node-version) NODE_VERSION="${2:-}"; shift ;;
         -h|--help) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -68,6 +73,11 @@ if [ -n "$NEW_PASSWORD_FILE" ]; then
     NEW_PASSWORD="$(head -n 1 "$NEW_PASSWORD_FILE")"
     rm -f "$NEW_PASSWORD_FILE"
     [ -n "$NEW_PASSWORD" ] || die "$NEW_PASSWORD_FILE is empty"
+fi
+if [ -n "$OLD_PASSWORD_FILE" ]; then
+    [ -f "$OLD_PASSWORD_FILE" ] || die "--old-password-file $OLD_PASSWORD_FILE does not exist"
+    OLD_PASSWORD="$(head -n 1 "$OLD_PASSWORD_FILE")"
+    rm -f "$OLD_PASSWORD_FILE"
 fi
 if [ -n "$NODE_VERSION" ]; then
     case "$NODE_VERSION" in
@@ -178,8 +188,17 @@ fi
 if [ -n "$NEW_PASSWORD" ]; then
     log "setting the password of $GUEST_USER"
     AUTOLOGIN_USER="$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null || true)"
-    if ! dscl . -passwd "$GUEST_HOME" "$NEW_PASSWORD" 2>&1 | sed 's/^/  dscl: /' >&2; then
-        log "dscl -passwd failed; trying sysadminctl -resetPasswordFor"
+    # A Secure Token account (every user the Setup Assistant creates) refuses a
+    # change that does not prove the old password, even for root: dscl answers
+    # eDSAuthFailed. With the old password both tools work; without it only an
+    # account without a Secure Token can be changed.
+    if [ -n "$OLD_PASSWORD" ]; then
+        if ! dscl . -passwd "$GUEST_HOME" "$OLD_PASSWORD" "$NEW_PASSWORD" 2>&1 | sed 's/^/  dscl: /' >&2; then
+            log "dscl -passwd failed; trying sysadminctl -resetPasswordFor with the old password"
+            sysadminctl -resetPasswordFor "$GUEST_USER" -newPassword "$NEW_PASSWORD" -adminUser "$GUEST_USER" -adminPassword "$OLD_PASSWORD" 2>&1 | sed 's/^/  sysadminctl: /' >&2 || true
+        fi
+    elif ! dscl . -passwd "$GUEST_HOME" "$NEW_PASSWORD" 2>&1 | sed 's/^/  dscl: /' >&2; then
+        log "dscl -passwd failed (Secure Token account without --old-password?); trying sysadminctl -resetPasswordFor"
         sysadminctl -resetPasswordFor "$GUEST_USER" -newPassword "$NEW_PASSWORD" 2>&1 | sed 's/^/  sysadminctl: /' >&2 || true
     fi
     dscl . -authonly "$GUEST_USER" "$NEW_PASSWORD" >/dev/null 2>&1 \
