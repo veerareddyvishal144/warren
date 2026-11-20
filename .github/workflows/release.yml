@@ -1,0 +1,184 @@
+name: Release
+
+# Builds the release tarballs and publishes them to a GitHub Release.
+#
+# Triggers:
+#   - a pushed tag v<version>: builds every platform, checks that <version> equals
+#     the Cargo workspace version, publishes the release with notes from CHANGELOG.md
+#     (the [<version>] section, else [Unreleased], else the tag message).
+#   - workflow_dispatch: on a tag ref the same thing; on a branch a dry run that
+#     builds everything and uploads the tarballs, SHA256SUMS, notes and formula as a
+#     workflow artifact without creating a release.
+#
+# Platforms and what each tarball holds (warrend, warren, warren-mcp, warren-gateway, LICENSE):
+#   - darwin-arm64  macOS on Apple silicon. Every binary is ad-hoc signed
+#                   (codesign -s -) so Apple silicon runs it; that needs no Apple
+#                   Developer account and no certificate. The binaries are not
+#                   notarized, so a tarball that arrives through a browser is
+#                   quarantined until `xattr -d com.apple.quarantine`.
+#   - linux-x86_64  built inside an ubuntu:22.04 container on the ubuntu-24.04 runner, so
+#   - linux-arm64   (ubuntu-24.04-arm) the daemon, CLI and MCP server run on glibc 2.35 and
+#                   newer (Ubuntu 22.04, Debian 12). warren-gateway is a fully static musl
+#                   binary on both, mirroring ci.yml, because the daemon injects it into
+#                   arbitrary images.
+#
+# The packaging itself is scripts/release/package.sh, which also runs locally as a dry run.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  version:
+    name: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the Cargo workspace version and check the tag against it
+        id: v
+        run: |
+          cargo_version="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\([^"]*\)".*/\1/p;}' Cargo.toml | head -n1)"
+          if [ -z "$cargo_version" ]; then
+            echo "::error file=Cargo.toml::cannot read [workspace.package] version"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+            case "$tag" in
+              v*) ;;
+              *) echo "::error::tag '$tag' does not start with v; release tags look like v$cargo_version"; exit 1 ;;
+            esac
+            if [ "${tag#v}" != "$cargo_version" ]; then
+              echo "::error::tag $tag does not match the Cargo workspace version $cargo_version. Set version = \"${tag#v}\" under [workspace.package] in Cargo.toml (and move the CHANGELOG Unreleased section under [${tag#v}]), commit, then move the tag; or delete the tag and release v$cargo_version."
+              exit 1
+            fi
+            publish=true
+            echo "releasing $tag (Cargo workspace version $cargo_version)"
+          else
+            tag="v$cargo_version"
+            publish=false
+            echo "::notice::dry run from $GITHUB_REF_TYPE $GITHUB_REF_NAME: building $tag; no release is created"
+          fi
+          {
+            echo "version=$cargo_version"
+            echo "tag=$tag"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.platform }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            os: macos-14
+          - platform: linux-x86_64
+            os: ubuntu-24.04
+            container: ubuntu:22.04
+            musl: x86_64-unknown-linux-musl
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+            container: ubuntu:22.04
+            musl: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    # Empty for macOS, which then runs directly on the runner.
+    container: ${{ matrix.container }}
+    timeout-minutes: 90
+    steps:
+      - name: Install the build tools (Linux container)
+        if: runner.os == 'Linux'
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config musl-tools file
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Add the musl target for the static gateway
+        if: runner.os == 'Linux'
+        run: rustup target add "${{ matrix.musl }}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.platform }}
+      - name: Build and package (scripts/release/package.sh)
+        run: scripts/release/package.sh --version "${{ needs.version.outputs.version }}" --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: warren-${{ matrix.platform }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: release
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The annotated tag message is the fallback source of the notes.
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: warren-*
+          path: dist
+          merge-multiple: true
+      - name: Write SHA256SUMS (verifies each tarball against its build job's digest)
+        run: scripts/release/checksums.sh dist
+      - name: Release notes
+        run: |
+          scripts/release/notes.sh --version "$VERSION" --tag "$TAG" --sums dist/SHA256SUMS > dist/notes.md
+          cat dist/notes.md
+      - name: Homebrew formula pointing at this release
+        run: |
+          scripts/release/update-formula.sh --version "$VERSION" --sums dist/SHA256SUMS
+          cp packaging/homebrew/warren.rb dist/warren.rb
+          ls -l dist
+      - name: Upload the dry-run bundle
+        if: needs.version.outputs.publish != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: warren-release-dry-run
+          path: dist
+          retention-days: 7
+      - name: Publish the GitHub Release
+        if: needs.version.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: Warren ${{ needs.version.outputs.version }}
+          body_path: dist/notes.md
+          files: |
+            dist/warren-*.tar.gz
+            dist/SHA256SUMS
+            dist/warren.rb
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(needs.version.outputs.version, '-') }}
+          make_latest: ${{ !contains(needs.version.outputs.version, '-') }}
