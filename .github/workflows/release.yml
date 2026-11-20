@@ -121,7 +121,7 @@ jobs:
           shared-key: release-${{ matrix.platform }}
       - name: Build and package (scripts/release/package.sh)
         run: scripts/release/package.sh --version "${{ needs.version.outputs.version }}" --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: warren-${{ matrix.platform }}
           path: |
@@ -163,7 +163,7 @@ jobs:
           ls -l dist
       - name: Upload the dry-run bundle
         if: needs.version.outputs.publish != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: warren-release-dry-run
           path: dist
