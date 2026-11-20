@@ -2976,6 +2976,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "warren-broker"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "parking_lot 0.13.0",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "warren-core",
+]
+
+[[package]]
 name = "warren-cli"
 version = "0.1.0"
 dependencies = [
