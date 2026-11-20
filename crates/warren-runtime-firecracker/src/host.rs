@@ -205,6 +205,38 @@ pub fn egress_policy_rules(
     rules
 }
 
+/// The rule letting guests reach the daemon's egress broker on the bridge
+/// address: new TCP connections from the guest subnet to `HOST_IP:port` are
+/// accepted in `INPUT`. Inserted after [`egress_policy_rules`], so `-I`
+/// places it ahead of the host-address drops. Forwarding stays as
+/// [`set_egress`] left it: `deny-all` and `allowlist` guests reach the host
+/// and nothing beyond it.
+pub fn broker_accept_rule(port: u16) -> Vec<String> {
+    let dest = format!("{HOST_IP}/32");
+    let port = port.to_string();
+    [
+        "INPUT",
+        "-i",
+        BRIDGE,
+        "-s",
+        SUBNET,
+        "-d",
+        &dest,
+        "-p",
+        "tcp",
+        "--dport",
+        &port,
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "NEW",
+        "-j",
+        "ACCEPT",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
 /// Addresses from the JSON of `ip -j -4 addr`: every `inet` address whose scope
 /// is not `host`, deduplicated, loopback excluded.
 pub fn parse_ip_addr_json(text: &str) -> Vec<Ipv4Addr> {
@@ -244,9 +276,10 @@ pub async fn host_addresses(ip: &Path) -> Result<Vec<Ipv4Addr>> {
 
 /// Bring the guest network up: the bridge with the host address, IPv4
 /// forwarding, MASQUERADE for the subnet, FORWARD accepts for the bridge
-/// (Docker sets the FORWARD policy to DROP) and, above them, the egress policy
-/// drops of [`egress_policy_rules`]. Idempotent; needs root.
-pub async fn ensure_network(allow_private_egress: bool) -> Result<()> {
+/// (Docker sets the FORWARD policy to DROP), above them the egress policy
+/// drops of [`egress_policy_rules`] and, with a broker port, the
+/// [`broker_accept_rule`] above those. Idempotent; needs root.
+pub async fn ensure_network(allow_private_egress: bool, broker_port: Option<u16>) -> Result<()> {
     require_root("configure the guest network")?;
     let ip = tool("ip")?;
     let iptables = tool("iptables")?;
@@ -281,6 +314,11 @@ pub async fn ensure_network(allow_private_egress: bool) -> Result<()> {
         tracing::warn!("no host addresses found; guests are not kept from reaching the host");
     }
     for rule in egress_policy_rules(allow_private_egress, &host_addrs) {
+        let parts: Vec<&str> = rule.iter().map(String::as_str).collect();
+        ensure_rule(&iptables, &parts).await?;
+    }
+    if let Some(port) = broker_port {
+        let rule = broker_accept_rule(port);
         let parts: Vec<&str> = rule.iter().map(String::as_str).collect();
         ensure_rule(&iptables, &parts).await?;
     }
@@ -369,8 +407,9 @@ fn egress_block_rule(guest: &str) -> [&str; 7] {
     ["FORWARD", "-i", BRIDGE, "-s", guest, "-j", "DROP"]
 }
 
-/// Block or allow forwarding from one guest; `deny-all` instances get a DROP
-/// rule ahead of the bridge accept. Needs root.
+/// Block or allow forwarding from one guest; `deny-all` and `allowlist`
+/// instances get a DROP rule ahead of the bridge accept (the broker on the
+/// host is reached through `INPUT`, which this does not touch). Needs root.
 pub async fn set_egress(guest: Ipv4Addr, allow: bool) -> Result<()> {
     require_root("change guest egress rules")?;
     let iptables = tool("iptables")?;
@@ -386,6 +425,32 @@ pub async fn set_egress(guest: Ipv4Addr, allow: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broker_rule_accepts_the_host_port_from_the_subnet() {
+        assert_eq!(
+            broker_accept_rule(7349),
+            [
+                "INPUT",
+                "-i",
+                "warren-fc0",
+                "-s",
+                "172.30.0.0/24",
+                "-d",
+                "172.30.0.1/32",
+                "-p",
+                "tcp",
+                "--dport",
+                "7349",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "NEW",
+                "-j",
+                "ACCEPT"
+            ]
+        );
+    }
 
     #[test]
     fn op_goes_after_table_selector() {
@@ -522,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn network_setup_requires_root_or_works() {
         if !is_root() {
-            let err = ensure_network(false).await.unwrap_err();
+            let err = ensure_network(false, None).await.unwrap_err();
             assert!(err.message.contains("needs root"));
             assert!(tap_create("tap-test0").await.is_err());
             // Deleting a tap that does not exist needs no privilege.
@@ -530,8 +595,8 @@ mod tests {
             eprintln!("skipping the live bridge, tap isolation and iptables checks: needs root");
             return;
         }
-        ensure_network(false).await.unwrap();
-        ensure_network(false).await.unwrap();
+        ensure_network(false, Some(7349)).await.unwrap();
+        ensure_network(false, Some(7349)).await.unwrap();
         assert!(link_exists(BRIDGE));
         let iptables = tool("iptables").unwrap();
         let ip = tool("ip").unwrap();

@@ -276,6 +276,11 @@ mod tests {
     fn hidden_variables() {
         assert!(is_hidden_var("WARREN_INSTANCE_TOKEN"));
         assert!(is_hidden_var("WARREN_GATEWAY_BIND"));
+        assert!(is_hidden_var("WARREN_NETWORK"));
+        assert!(is_hidden_var("WARREN_BROKER"));
+        // The proxy variables and secret routes are for the agent's tools.
+        assert!(!is_hidden_var("HTTPS_PROXY"));
+        assert!(!is_hidden_var("ANTHROPIC_BASE_URL"));
         assert!(is_hidden_var("WARREN_"));
         assert!(!is_hidden_var(ENV_HOME));
         assert!(!is_hidden_var("WARREN"));

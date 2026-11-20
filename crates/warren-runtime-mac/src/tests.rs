@@ -543,6 +543,10 @@ async fn create_clones_the_base_applies_the_shape_and_writes_the_share() {
     );
     assert!(env.contains("export WARREN_HOME='/Users/lume'"), "{env}");
     assert!(env.contains("export WARREN_AGENT_DRIVER='echo'"), "{env}");
+    assert!(
+        env.contains("export WARREN_NETWORK='allow-all'"),
+        "the launcher reads the policy from warren.env: {env}"
+    );
     let c = calls(&e);
     assert!(
         c.iter()
