@@ -192,6 +192,8 @@ impl UpPlan {
             self.listen.clone(),
             "--public-port".to_string(),
             self.port.to_string(),
+            "--broker-listen".to_string(),
+            format!("0.0.0.0:{}", self.port + 2),
             "--base-domain".to_string(),
             self.base_domain.clone(),
         ];
@@ -1884,6 +1886,8 @@ mod tests {
                 "127.0.0.1:7357",
                 "--public-port",
                 "7357",
+                "--broker-listen",
+                "0.0.0.0:7359",
                 "--base-domain",
                 "warren.localhost",
                 "--mac-base-vm",

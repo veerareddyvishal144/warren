@@ -230,7 +230,7 @@ CREATE_PAYLOAD='{"template":"warren-macos","type":"mac","auto_sleep":false}'
 start_warrend() {
     "$BIN" --runtime none --mac-base-vm "$BASE_VM" --dev \
         --listen ":$PORT" --public-port "$PORT" --data-dir "$DATA" --base-domain "$BASE_DOMAIN" \
-        --gateway-bin "$GW" --log "${WARREN_LOG:-info}" >>"$LOG" 2>&1 &
+        --gateway-bin "$GW" --log "${WARREN_LOG:-info}" --broker-listen "0.0.0.0:$((PORT + 2))" >>"$LOG" 2>&1 &
     WARREND_PID=$!
 }
 # wait_healthy STEP: poll GET /v1/health until it answers 200 with healthy=true; fails STEP after 120 s.

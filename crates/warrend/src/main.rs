@@ -244,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
         let addr = normalize_listen(&cfg.broker_listen);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
-            .with_context(|| format!("bind broker listener {addr}"))?;
+            .with_context(|| format!("bind broker listener {addr} (another warrend on this host? pass --broker-listen with a free port, or `none`)"))?;
         tracing::info!(
             listen = %addr,
             advertise = cfg.broker_advertise_addr.as_deref().unwrap_or("(per runtime)"),
