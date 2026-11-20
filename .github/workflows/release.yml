@@ -145,7 +145,7 @@ jobs:
         with:
           # The annotated tag message is the fallback source of the notes.
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: warren-*
           path: dist
