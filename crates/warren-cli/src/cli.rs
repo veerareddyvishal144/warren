@@ -97,6 +97,162 @@ pub enum Command {
         #[command(subcommand)]
         cmd: SyncCmd,
     },
+    // ----- setup and integration (setup.rs, doctor.rs, mac.rs, connect.rs) -----
+    /// Start the daemon on this machine as a service, wait for it and save an API key.
+    Up(UpArgs),
+    /// Stop the daemon `warren up` started; --purge also removes the service and, after confirmation, the data.
+    Down(DownArgs),
+    /// Service state, health, runtimes and instance count of the daemon on this machine.
+    Status,
+    /// Check this machine for everything Warren needs; exits 1 when something fails.
+    Doctor,
+    /// macOS instances: prepare this Mac (Lume and the base VM).
+    Mac {
+        #[command(subcommand)]
+        cmd: MacCmd,
+    },
+    /// Register the Warren MCP server with a coding agent.
+    Connect(ConnectArgs),
+    /// Skill files that teach a coding agent how to use Warren.
+    Skill {
+        #[command(subcommand)]
+        cmd: SkillCmd,
+    },
+}
+
+/// Container runtime choice of `warren up`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum RuntimeChoice {
+    /// Docker when it is reachable (gVisor when registered), else no containers.
+    #[default]
+    Auto,
+    /// No Docker: only `mac` instances (macOS) or nothing but the API.
+    None,
+    /// Docker is required; fail when it is not reachable.
+    Docker,
+}
+
+/// Arguments of `warren up`.
+#[derive(Debug, Args, Default)]
+pub struct UpArgs {
+    /// Port of the API, the dashboard and the instance URLs (default 7337).
+    #[arg(long, value_name = "N")]
+    pub port: Option<u16>,
+    /// Data directory (default: ~/Library/Application Support/Warren on macOS, $XDG_DATA_HOME/warren or ~/.local/share/warren on Linux).
+    #[arg(long, value_name = "DIR")]
+    pub data_dir: Option<PathBuf>,
+    /// Base domain of every URL (default warren.localhost).
+    #[arg(long, value_name = "DOMAIN")]
+    pub base_domain: Option<String>,
+    /// macOS: the Lume base VM for mac instances (default warren-macos-26).
+    #[arg(long, value_name = "NAME")]
+    pub mac_base_vm: Option<String>,
+    /// Container runtime: auto (Docker when reachable), none (no Docker) or docker (Docker required).
+    #[arg(long, value_enum, default_value_t = RuntimeChoice::Auto)]
+    pub runtime: RuntimeChoice,
+    /// Development mode for the daemon (5 s idle timeouts, host.docker.internal in instances).
+    #[arg(long)]
+    pub dev: bool,
+    /// Install no service: start warrend as a background process and record its pid in <data>/warrend.pid.
+    #[arg(long)]
+    pub no_service: bool,
+    /// The warrend binary (default: next to this binary, then PATH).
+    #[arg(long, env = "WARREN_WARREND", value_name = "PATH")]
+    pub warrend_bin: Option<PathBuf>,
+    /// Listen address handed to warrend (default 127.0.0.1:<port>; `:<port>` binds every interface).
+    #[arg(long, value_name = "ADDR")]
+    pub listen: Option<String>,
+}
+
+/// Arguments of `warren down`.
+#[derive(Debug, Args, Default)]
+pub struct DownArgs {
+    /// Also remove the service definition and, after confirmation, the data directory.
+    #[arg(long)]
+    pub purge: bool,
+    /// Answer yes to the confirmation (needed to remove the data directory without a terminal).
+    #[arg(long)]
+    pub yes: bool,
+}
+
+/// `warren mac ...`
+#[derive(Debug, Subcommand)]
+pub enum MacCmd {
+    /// Build the macOS base VM this Mac serves `mac` instances from (needs Lume 0.7.2 or newer).
+    Init(MacInitArgs),
+}
+
+/// Arguments of `warren mac init`.
+#[derive(Debug, Args, Default)]
+pub struct MacInitArgs {
+    /// An existing stock macOS VM to clone (user lume, SSH on, stopped). Without it one is created from a restore image.
+    #[arg(long, value_name = "VM")]
+    pub source: Option<String>,
+    /// Restore image for the stock VM: `latest` or the path of an .ipsw file.
+    #[arg(long, value_name = "latest|PATH", default_value = "latest")]
+    pub ipsw: String,
+    /// Name of the stock VM created without --source.
+    #[arg(long, value_name = "NAME", default_value = "base")]
+    pub stock: String,
+    /// Lume unattended-setup preset for the stock VM: tahoe (macOS 26) or sequoia (macOS 15).
+    #[arg(long, value_name = "PRESET", default_value = "tahoe")]
+    pub unattended: String,
+    /// Name of the base VM to build.
+    #[arg(long, value_name = "NAME", default_value = "warren-macos-26")]
+    pub target: String,
+    /// Also install Node LTS and the claude, codex and opencode CLIs in the image (needs internet in the VM).
+    #[arg(long)]
+    pub with_agents: bool,
+    /// Replace the target VM when it already exists.
+    #[arg(long)]
+    pub force: bool,
+    /// Print every step and command without running anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// The coding agents `warren connect` knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ConnectTarget {
+    /// Claude Code (`claude mcp add`).
+    Claude,
+    /// Codex CLI (~/.codex/config.toml).
+    Codex,
+    /// Cursor (~/.cursor/mcp.json or .cursor/mcp.json).
+    Cursor,
+    /// Windsurf (~/.codeium/windsurf/mcp_config.json).
+    Windsurf,
+    /// Caret (~/.caret/mcp.json or .caret/mcp.json).
+    Caret,
+    /// OpenCode (~/.config/opencode/opencode.json or ./opencode.json).
+    Opencode,
+    /// Gemini CLI (~/.gemini/settings.json or .gemini/settings.json).
+    Gemini,
+}
+
+/// Arguments of `warren connect`.
+#[derive(Debug, Args)]
+pub struct ConnectArgs {
+    /// The agent to configure.
+    #[arg(value_enum)]
+    pub agent: ConnectTarget,
+    /// Write the project-level configuration in the current directory instead of the user-level one.
+    #[arg(long)]
+    pub project: bool,
+    /// Show what would be written or run instead of doing it.
+    #[arg(long)]
+    pub print: bool,
+}
+
+/// `warren skill ...`
+#[derive(Debug, Subcommand)]
+pub enum SkillCmd {
+    /// Write the Warren skill to ~/.claude/skills/warren/SKILL.md (or .claude/skills/warren/ in the project).
+    Install {
+        /// Install into the current directory's .claude/skills instead of the home directory.
+        #[arg(long)]
+        project: bool,
+    },
 }
 
 /// Arguments of `warren shell`.
@@ -1109,6 +1265,143 @@ mod tests {
             panic!()
         };
         assert!(a.id.is_none() && a.exclude.is_empty());
+    }
+
+    #[test]
+    fn setup_commands() {
+        let Command::Up(u) = parse(&["up"]).command else {
+            panic!()
+        };
+        assert!(u.port.is_none() && u.data_dir.is_none() && !u.dev && !u.no_service);
+        assert_eq!(u.runtime, RuntimeChoice::Auto);
+        let Command::Up(u) = parse(&[
+            "up",
+            "--port",
+            "7357",
+            "--data-dir",
+            "/tmp/w",
+            "--base-domain",
+            "lvh.me",
+            "--mac-base-vm",
+            "warren-macos-26",
+            "--runtime",
+            "none",
+            "--dev",
+            "--no-service",
+            "--warrend-bin",
+            "/x/warrend",
+            "--listen",
+            ":7357",
+        ])
+        .command
+        else {
+            panic!()
+        };
+        assert_eq!(u.port, Some(7357));
+        assert_eq!(u.data_dir.as_deref(), Some(std::path::Path::new("/tmp/w")));
+        assert_eq!(u.base_domain.as_deref(), Some("lvh.me"));
+        assert_eq!(u.mac_base_vm.as_deref(), Some("warren-macos-26"));
+        assert_eq!(u.runtime, RuntimeChoice::None);
+        assert!(u.dev && u.no_service);
+        assert_eq!(
+            u.warrend_bin.as_deref(),
+            Some(std::path::Path::new("/x/warrend"))
+        );
+        assert_eq!(u.listen.as_deref(), Some(":7357"));
+        assert_eq!(
+            fails(&["up", "--runtime", "podman"]).kind(),
+            ErrorKind::InvalidValue
+        );
+        let Command::Down(d) = parse(&["down", "--purge", "--yes"]).command else {
+            panic!()
+        };
+        assert!(d.purge && d.yes);
+        let Command::Down(d) = parse(&["down"]).command else {
+            panic!()
+        };
+        assert!(!d.purge && !d.yes);
+        assert!(matches!(parse(&["status"]).command, Command::Status));
+        assert!(matches!(parse(&["doctor"]).command, Command::Doctor));
+    }
+
+    #[test]
+    fn mac_connect_and_skill() {
+        let Command::Mac {
+            cmd: MacCmd::Init(m),
+        } = parse(&["mac", "init"]).command
+        else {
+            panic!()
+        };
+        assert!(m.source.is_none() && !m.with_agents && !m.force && !m.dry_run);
+        assert_eq!(m.ipsw, "latest");
+        assert_eq!(m.stock, "base");
+        assert_eq!(m.unattended, "tahoe");
+        assert_eq!(m.target, "warren-macos-26");
+        let Command::Mac {
+            cmd: MacCmd::Init(m),
+        } = parse(&[
+            "mac",
+            "init",
+            "--source",
+            "sandbox",
+            "--ipsw",
+            "/tmp/x.ipsw",
+            "--target",
+            "t",
+            "--with-agents",
+            "--force",
+            "--dry-run",
+        ])
+        .command
+        else {
+            panic!()
+        };
+        assert_eq!(m.source.as_deref(), Some("sandbox"));
+        assert_eq!(m.ipsw, "/tmp/x.ipsw");
+        assert_eq!(m.target, "t");
+        assert!(m.with_agents && m.force && m.dry_run);
+        assert_eq!(
+            fails(&["mac"]).kind(),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+
+        let Command::Connect(c) = parse(&["connect", "claude"]).command else {
+            panic!()
+        };
+        assert_eq!(c.agent, ConnectTarget::Claude);
+        assert!(!c.project && !c.print);
+        for (name, want) in [
+            ("codex", ConnectTarget::Codex),
+            ("cursor", ConnectTarget::Cursor),
+            ("windsurf", ConnectTarget::Windsurf),
+            ("caret", ConnectTarget::Caret),
+            ("opencode", ConnectTarget::Opencode),
+            ("gemini", ConnectTarget::Gemini),
+        ] {
+            let Command::Connect(c) = parse(&["connect", name, "--project", "--print"]).command
+            else {
+                panic!()
+            };
+            assert_eq!(c.agent, want);
+            assert!(c.project && c.print);
+        }
+        assert_eq!(fails(&["connect", "emacs"]).kind(), ErrorKind::InvalidValue);
+        assert_eq!(
+            fails(&["connect"]).kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert!(matches!(
+            parse(&["skill", "install"]).command,
+            Command::Skill {
+                cmd: SkillCmd::Install { project: false }
+            }
+        ));
+        assert!(matches!(
+            parse(&["skill", "install", "--project"]).command,
+            Command::Skill {
+                cmd: SkillCmd::Install { project: true }
+            }
+        ));
     }
 
     #[test]

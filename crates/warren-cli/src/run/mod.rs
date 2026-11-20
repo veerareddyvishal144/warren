@@ -12,6 +12,11 @@ mod templates;
 mod runcmd;
 mod shell;
 mod sync;
+// Setup and integration (`up`, `down`, `status`, `doctor`, `mac init`, `connect`, `skill`).
+mod connect;
+mod doctor;
+mod mac;
+mod setup;
 
 use std::path::PathBuf;
 
@@ -95,6 +100,14 @@ pub async fn run(cli: Cli) -> Result<i32, Failure> {
         Command::Shell(args) => shell::shell(&ctx, args).await,
         Command::Run(args) => runcmd::run(&ctx, args).await,
         Command::Sync { cmd } => sync::run(&ctx, cmd).await,
+        // ----- setup and integration -----
+        Command::Up(args) => setup::up(&ctx, args).await,
+        Command::Down(args) => setup::down(&ctx, args).await,
+        Command::Status => setup::status(&ctx).await,
+        Command::Doctor => doctor::doctor(&ctx).await,
+        Command::Mac { cmd } => mac::run(&ctx, cmd),
+        Command::Connect(args) => connect::connect(&ctx, args),
+        Command::Skill { cmd } => connect::skill(&ctx, cmd),
     }
 }
 
