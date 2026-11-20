@@ -17,3 +17,11 @@ clap.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 futures.workspace = true
+# `shell` and `run`: the WebSocket to the gateway's PTY and raw-mode terminal handling.
+tokio-tungstenite.workspace = true
+nix = { workspace = true, features = ["term", "ioctl"] }
+# `sync` and `run`: .gitignore-aware walks and tarballs.
+ignore.workspace = true
+tar.workspace = true
+flate2.workspace = true
+serde.workspace = true

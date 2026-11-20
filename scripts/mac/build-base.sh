@@ -1,27 +1,36 @@
 #!/usr/bin/env bash
 # Builds the Warren macOS base VM on an Apple silicon Mac: clones a stock Lume
 # macOS VM, boots the clone, installs the guest pieces from scripts/mac/guest
-# (gateway LaunchDaemon and launcher, pf isolation anchor, SSH key, no sleep,
-# no auto-updates) and stops it. warrend then clones this VM for every `mac`
-# instance (docs/macos.md).
+# (gateway LaunchDaemon and launcher, pf isolation anchor, SSH key, a new guest
+# password with SSH restricted to keys, optionally Node and the agent CLIs, no
+# sleep, no auto-updates) and stops it. warrend then clones this VM for every
+# `mac` instance (docs/macos.md).
 #
 # Usage: bash scripts/mac/build-base.sh [options]
-#   --source NAME      stock Lume VM to clone (default base); must be stopped
-#   --target NAME      name of the base VM to create (default warren-macos-26)
-#   --user USER        guest user (default lume)
-#   --password PASS    guest user's password, fed to sudo -S inside the guest (default lume)
-#   --ssh-key FILE     private key; FILE.pub is installed in the guest (default ~/.ssh/id_ed25519)
-#   --subnet CIDR      Lume NAT subnet the pf anchor blocks (default 192.168.64.0/24)
-#   --gateway IP       host address the pf anchor allows (default 192.168.64.1)
-#   --force            stop and delete an existing target first
-#   -h, --help         this text
+#   --source NAME        stock Lume VM to clone (default base); must be stopped
+#   --target NAME        name of the base VM to create (default warren-macos-26)
+#   --user USER          guest user (default lume)
+#   --password PASS      the guest user's CURRENT password, fed to sudo -S inside the guest (default lume)
+#   --new-password PASS  the password the guest user gets (default: random, openssl rand -base64 18)
+#   --ssh-key FILE       private key; FILE.pub is installed in the guest (default ~/.ssh/id_ed25519)
+#   --subnet CIDR        Lume NAT subnet the pf anchor blocks (default 192.168.64.0/24)
+#   --gateway IP         host address the pf anchor allows (default 192.168.64.1)
+#   --with-agents        also install Node LTS and the claude, codex and opencode CLIs (guest needs internet)
+#   --node-version V     Node version for --with-agents (default: the latest LTS at nodejs.org)
+#   --force              stop and delete an existing target first
+#   -h, --help           this text
+#
+# The new guest password is written to $WARREN_MAC_DIR/<target>.password
+# (default ~/.warren/mac, file mode 600) before the install starts; it is the
+# sudo password inside every clone of the image. SSH keeps working with the
+# key only: install.sh turns password authentication off in the guest.
 #
 # SSH: the key is tried first (BatchMode). When the guest does not know it yet,
 # ssh asks for the guest password once (ControlMaster keeps the session for the
 # copy and the install), after which the key is installed for next time.
 #
-# Needs: lume >= 0.7.2, ssh/scp, and jq (recommended: brew install jq; a sed
-# fallback is used without it).
+# Needs: lume >= 0.7.2, ssh/scp, openssl (or /dev/urandom), and jq
+# (recommended: brew install jq; a sed fallback is used without it).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,17 +39,21 @@ GUEST_DIR="$HERE/guest"
 log() { printf '[build-base] %s\n' "$*" >&2; }
 die() { log "error: $*"; exit 1; }
 
-SOURCE=base TARGET=warren-macos-26 GUEST_USER=lume PASSWORD=lume
+SOURCE=base TARGET=warren-macos-26 GUEST_USER=lume PASSWORD=lume NEW_PASSWORD=""
 SSH_KEY="$HOME/.ssh/id_ed25519" SUBNET=192.168.64.0/24 GATEWAY=192.168.64.1 FORCE=0
+WITH_AGENTS=0 NODE_VERSION=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --source) SOURCE="${2:-}"; shift ;;
         --target) TARGET="${2:-}"; shift ;;
         --user) GUEST_USER="${2:-}"; shift ;;
         --password) PASSWORD="${2:-}"; shift ;;
+        --new-password) NEW_PASSWORD="${2:-}"; shift ;;
         --ssh-key) SSH_KEY="${2:-}"; shift ;;
         --subnet) SUBNET="${2:-}"; shift ;;
         --gateway) GATEWAY="${2:-}"; shift ;;
+        --with-agents) WITH_AGENTS=1 ;;
+        --node-version) NODE_VERSION="${2:-}"; shift ;;
         --force) FORCE=1 ;;
         -h|--help) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option $1 (try --help)" ;;
@@ -49,9 +62,32 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$SOURCE" ] && [ -n "$TARGET" ] || die "--source and --target must not be empty"
 [ "$SOURCE" != "$TARGET" ] || die "--source and --target are the same VM ($SOURCE)"
+case "$TARGET" in
+    */*|.*) die "--target must be a plain VM name (it also names the password file)" ;;
+esac
 [ "$(uname -s)" = Darwin ] || die "this script runs on the Mac host (Lume needs Apple silicon)"
 [ "$(uname -m)" = arm64 ] || die "Apple silicon required (uname -m is $(uname -m))"
 [ -d "$GUEST_DIR" ] || die "$GUEST_DIR is missing"
+if [ -n "$NODE_VERSION" ] && [ "$WITH_AGENTS" = 0 ]; then
+    die "--node-version only makes sense together with --with-agents"
+fi
+
+# --- the new guest password -----------------------------------------------------------
+# Generated here, stored on the host before anything touches the guest, and
+# handed to install.sh in a file so it never appears on a command line.
+if [ -z "$NEW_PASSWORD" ]; then
+    if command -v openssl >/dev/null 2>&1; then
+        NEW_PASSWORD="$(openssl rand -base64 18)"
+    else
+        NEW_PASSWORD="$(head -c 18 /dev/urandom | base64)"
+    fi
+    [ "${#NEW_PASSWORD}" -ge 20 ] || die "could not generate a password"
+fi
+case "$NEW_PASSWORD" in
+    *[[:space:]]*) die "--new-password must not contain whitespace (it is fed to sudo -S line by line)" ;;
+esac
+MAC_DIR="${WARREN_MAC_DIR:-$HOME/.warren/mac}"
+PASSWORD_FILE="$MAC_DIR/$TARGET.password"
 
 # --- tools ------------------------------------------------------------------------
 command -v lume >/dev/null 2>&1 || die "lume is not installed or not on PATH (https://github.com/trycua/cua, 0.7.2 or newer)"
@@ -145,6 +181,8 @@ STAGE="$(mktemp -d "${TMPDIR:-/tmp}/warren-guest.XXXXXX")"
 cp "$GUEST_DIR"/warren-gateway-launcher.sh "$GUEST_DIR"/install.sh "$GUEST_DIR"/pf.anchor.template \
    "$GUEST_DIR"/dev.warren.gateway.plist "$GUEST_DIR"/dev.warren.pf.plist "$STAGE/"
 printf '%s\n' "$PUBKEY" >"$STAGE/authorized_key.pub"
+(umask 077 && printf '%s\n' "$NEW_PASSWORD" >"$STAGE/new_password")
+(umask 077 && printf '%s\n' "$PASSWORD" >"$STAGE/old_password")
 bash -n "$STAGE/install.sh"
 bash -n "$STAGE/warren-gateway-launcher.sh"
 if command -v plutil >/dev/null 2>&1; then
@@ -153,10 +191,13 @@ fi
 
 # --- ssh session ------------------------------------------------------------------
 # Clones reuse addresses, so host keys are neither checked nor stored. One
-# ControlMaster connection carries the copy and the install.
+# ControlMaster connection carries the copy and the install. The key is always
+# offered: once install.sh has turned password authentication off, any new
+# connection (the final shutdown) must use it.
 CTRL="/tmp/warren-build-base-%C"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
-          -o ConnectTimeout=5 -o ControlMaster=auto -o ControlPath="$CTRL" -o ControlPersist=600)
+          -o ConnectTimeout=5 -o ControlMaster=auto -o ControlPath="$CTRL" -o ControlPersist=600
+          -i "$SSH_KEY")
 REMOTE="$GUEST_USER@$IP"
 cleanup() {
     ssh "${SSH_OPTS[@]}" -O exit "$REMOTE" >/dev/null 2>&1 || true
@@ -206,19 +247,56 @@ log "copying guest files to $REMOTE:$REMOTE_DIR"
 ssh "${SSH_OPTS[@]}" "$REMOTE" "rm -rf $REMOTE_DIR"
 scp -q -r "${SSH_OPTS[@]}" "$STAGE" "$REMOTE:$REMOTE_DIR"
 
+# --- the password file on the host ---------------------------------------------------------
+# Written before the install so the new password is never only inside a VM
+# that may be half built. 0700 directory, 0600 file.
+install -d -m 700 "$MAC_DIR" || die "cannot create $MAC_DIR"
+(umask 077 && printf '%s\n' "$NEW_PASSWORD" >"$PASSWORD_FILE.tmp") || die "cannot write $PASSWORD_FILE"
+chmod 600 "$PASSWORD_FILE.tmp"
+mv -f "$PASSWORD_FILE.tmp" "$PASSWORD_FILE"
+log "new guest password stored in $PASSWORD_FILE (mode 600)"
+
 # --- install inside the guest ----------------------------------------------------------
 # sudo -S reads the password from stdin; -p '' hides the prompt. -k forces the
-# password check so a wrong --password fails here instead of later.
+# password check so a wrong --password fails here instead of later. The new
+# password travels in a file install.sh deletes after reading.
 log "running install.sh as root inside the guest"
-INSTALL_CMD="sudo -S -k -p '' bash $REMOTE_DIR/install.sh --subnet '$SUBNET' --gateway '$GATEWAY' --ssh-key-file $REMOTE_DIR/authorized_key.pub"
-printf '%s\n' "$PASSWORD" | ssh "${SSH_OPTS[@]}" "$REMOTE" "$INSTALL_CMD" || die "install.sh failed inside the guest (see the output above)"
+INSTALL_CMD="sudo -S -k -p '' bash $REMOTE_DIR/install.sh --subnet '$SUBNET' --gateway '$GATEWAY' --ssh-key-file $REMOTE_DIR/authorized_key.pub --new-password-file $REMOTE_DIR/new_password --old-password-file $REMOTE_DIR/old_password"
+if [ "$WITH_AGENTS" = 1 ]; then
+    INSTALL_CMD="$INSTALL_CMD --with-agents"
+    [ -n "$NODE_VERSION" ] && INSTALL_CMD="$INSTALL_CMD --node-version '$NODE_VERSION'"
+    log "--with-agents: the guest downloads Node and the CLIs through the NAT; expect several minutes"
+fi
+printf '%s\n' "$PASSWORD" | ssh "${SSH_OPTS[@]}" "$REMOTE" "$INSTALL_CMD" \
+    || die "install.sh failed inside the guest (see the output above). The guest password may already be the one in $PASSWORD_FILE, or still the old one; the ssh session is still open: ssh ${SSH_OPTS[*]} $REMOTE"
 
 if [ "$KEY_WORKED" = 0 ]; then
-    if ssh "${SSH_OPTS[@]}" -o ControlMaster=no -o ControlPath=none -o BatchMode=yes -i "$SSH_KEY" "$REMOTE" true 2>/dev/null; then
+    if ssh "${SSH_OPTS[@]}" -o ControlMaster=no -o ControlPath=none -o BatchMode=yes "$REMOTE" true 2>/dev/null; then
         log "key-based ssh now works"
     else
         log "warning: key-based ssh still fails after the install; check /Users/$GUEST_USER/.ssh in the guest"
     fi
+fi
+# Password logins must now be refused (install.sh turned them off). With no
+# authentication offered, ssh fails and names the methods the server would
+# accept: "Permission denied (publickey)." is what the image must say. (BatchMode
+# refuses to type a password, so asking for password auth makes ssh fail at once
+# and print the list; asking for "none" prints nothing on macOS's ssh.)
+METHODS="$(ssh "${SSH_OPTS[@]}" -o ControlMaster=no -o ControlPath=none -o BatchMode=yes \
+    -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive "$REMOTE" true 2>&1 || true)"
+case "$METHODS" in
+    *password*|*keyboard-interactive*)
+        log "warning: the guest's sshd still offers password authentication ($METHODS); the hardening in install.sh did not take" ;;
+    *publickey*)
+        log "the guest's sshd offers public keys only" ;;
+    *)
+        log "warning: could not read the guest's ssh authentication methods: $METHODS" ;;
+esac
+# The new password must work for sudo (install.sh verified it with dscl; this checks it end to end).
+if printf '%s\n' "$NEW_PASSWORD" | ssh "${SSH_OPTS[@]}" "$REMOTE" "sudo -S -k -p '' true" 2>/dev/null; then
+    log "sudo inside the guest accepts the new password"
+else
+    die "sudo inside the guest does not accept the password in $PASSWORD_FILE"
 fi
 ssh "${SSH_OPTS[@]}" "$REMOTE" "rm -rf $REMOTE_DIR" || true
 
@@ -230,7 +308,7 @@ ssh "${SSH_OPTS[@]}" -O exit "$REMOTE" >/dev/null 2>&1 || true
 # seconds after writing files can lose them (the first base image came up
 # without its LaunchDaemons). sync first, then let macOS shut itself down.
 log "shutting $TARGET down cleanly from inside the guest"
-printf '%s\n' "$PASSWORD" | ssh "${SSH_OPTS[@]}" "$REMOTE" "sync; sudo -S -k -p '' shutdown -h now" >/dev/null 2>&1 || true
+printf '%s\n' "$NEW_PASSWORD" | ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$REMOTE" "sync; sudo -S -k -p '' shutdown -h now" >/dev/null 2>&1 || true
 deadline=$((SECONDS + 120))
 while [ "$(lume_field "$TARGET" status || true)" != stopped ]; do
     if [ "$SECONDS" -ge "$deadline" ]; then
@@ -246,12 +324,19 @@ while [ "$(lume_field "$TARGET" status || true)" != stopped ]; do
     sleep 2
 done
 
+AGENTS_LINE="not installed (rerun with --with-agents)"
+[ "$WITH_AGENTS" = 1 ] && AGENTS_LINE="node${NODE_VERSION:+ $NODE_VERSION} (LTS), claude, codex, opencode in /usr/local/bin"
 cat <<SUMMARY
 
 Base VM ready: $TARGET (cloned from $SOURCE, stopped)
-  guest user      $GUEST_USER  (ssh key $PUBKEY_FILE installed)
+  guest user      $GUEST_USER  (ssh key $PUBKEY_FILE installed; ssh accepts keys only)
+  password        $PASSWORD_FILE  (mode 600; sudo inside every clone, e.g. debug-guest.sh)
   pf anchor       blocks $SUBNET except $GATEWAY
   LaunchDaemons   dev.warren.gateway (KeepAlive), dev.warren.pf
+  agents          $AGENTS_LINE
+
+Lume's own conveniences that assume the stock password (lume ssh, lume
+shutdown, lume restart) no longer work on this image; use ssh -i $SSH_KEY.
 
 Next:
   target/release/warrend --runtime none --mac-base-vm $TARGET --dev \\

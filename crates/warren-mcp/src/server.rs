@@ -502,7 +502,7 @@ impl<B: Backend> WarrenServer<B> {
     }
 
     #[tool(
-        description = "List the templates an instance can be created from: the system catalog (warren-base, warren-agent, warren-opencode) followed by workspace templates. Each has name, description, agent (true when chat works), default_shape, types and revision.",
+        description = "List the templates an instance can be created from: the system catalog (warren-base, warren-agent, warren-claude, warren-opencode) followed by workspace templates. Each has name, description, agent (true when chat works), default_shape, types and revision.",
         annotations(
             title = "List templates",
             read_only_hint = true,

@@ -8,6 +8,10 @@ mod agent;
 mod api;
 mod instances;
 mod templates;
+// Interactive terminal and workspace sync (`shell`, `run`, `sync`).
+mod runcmd;
+mod shell;
+mod sync;
 
 use std::path::PathBuf;
 
@@ -87,6 +91,10 @@ pub async fn run(cli: Cli) -> Result<i32, Failure> {
         Command::Instances { cmd } => instances::run(&ctx, cmd).await,
         Command::Chat(args) => agent::chat(&ctx, args).await,
         Command::Files { cmd } => agent::files(&ctx, cmd).await,
+        // ----- interactive terminal and workspace sync -----
+        Command::Shell(args) => shell::shell(&ctx, args).await,
+        Command::Run(args) => runcmd::run(&ctx, args).await,
+        Command::Sync { cmd } => sync::run(&ctx, cmd).await,
     }
 }
 

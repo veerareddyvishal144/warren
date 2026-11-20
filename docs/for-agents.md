@@ -18,7 +18,7 @@ Environment
   not_found 404, conflict 409, instance_limit_reached 409, internal 500, bad_gateway 502, try_again 503, timeout 504. Unknown JSON fields are rejected.
 
 Instances
-- Create: POST /instances with any of {"template":"warren-base"|"warren-agent"|"warren-opencode", "name", "resources":{"cpu","memory","disk"},
+- Create: POST /instances with any of {"template":"warren-base"|"warren-agent"|"warren-opencode"|"warren-claude"|"warren-macos", "name", "resources":{"cpu","memory","disk"},
   "env":{...}, "auto_sleep":true, "idle_timeout_seconds":900, "network":"allow-all"|"deny-all"}. Shapes: 2/4, 4/8, 4/16, 4/32 (vCPU/GB).
   The response has "id" (10 chars) and "url". Status starts at "provisioning"; poll GET /instances/{id} until "running" before using it.
 - Run a command: POST /instances/{id}/exec {"command":"...", "user":"root"?, "timeout_seconds":600?} -> {"exit_code","stdout","stderr","duration_ms","truncated"}.

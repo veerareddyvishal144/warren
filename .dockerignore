@@ -1,0 +1,22 @@
+# Build context of the root Dockerfile: the workspace sources, Cargo files, LICENSE
+# and packaging/docker. Everything a `cargo build --locked` of the four binaries
+# does not read stays out (the crates embed only files under crates/).
+.git
+.github
+.claude
+target
+target-*
+dist
+data
+data-mac*
+images
+docs
+sdk
+mcp
+node_modules
+*.ext4
+*.squashfs
+vmlinux*
+firecracker
+*.log
+.DS_Store

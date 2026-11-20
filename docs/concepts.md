@@ -14,7 +14,7 @@ The full object is in [API.md](API.md#the-instance-object); lifecycle details in
 
 A template is a named image plus the facts the platform needs to run it: `image_ref`, `default_port` (what the bare instance URL serves; `3737`, the gateway, for the built-in ones), `mount_path`, whether it serves the Agent API (`agent`), the instance types it allows, a default shape and default `env`.
 
-System templates (`warren-base`, `warren-agent`, `warren-opencode`) are seeded by the daemon and visible to everyone. Workspace templates are registered with `POST /v1/templates` from any image that follows the [image contract](../images/common/README.md); posting the same name again publishes a new revision, and `name@3` pins a revision. Instances remember the template and revision they run and can be moved with `POST /v1/instances/{id}/update`. See [templates.md](templates.md).
+System templates (`warren-base`, `warren-agent`, `warren-opencode`, `warren-claude`, and `warren-macos` on Mac hosts) are seeded by the daemon and visible to everyone. Workspace templates are registered with `POST /v1/templates` from any image that follows the [image contract](../images/common/README.md); posting the same name again publishes a new revision, and `name@3` pins a revision. Instances remember the template and revision they run and can be moved with `POST /v1/instances/{id}/update`. See [templates.md](templates.md).
 
 ## Session and response
 

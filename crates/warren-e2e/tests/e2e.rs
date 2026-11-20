@@ -1565,7 +1565,12 @@ async fn templates_body(cx: Ctx) -> Result<()> {
     let key = cx.ws.api_key();
     let catalog = sdk.templates().await?;
     let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
-    for name in ["warren-base", "warren-agent", "warren-opencode"] {
+    for name in [
+        "warren-base",
+        "warren-agent",
+        "warren-opencode",
+        "warren-claude",
+    ] {
         ensure!(
             catalog
                 .iter()

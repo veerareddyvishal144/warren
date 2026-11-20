@@ -143,6 +143,13 @@ async fn changed_definition_publishes_a_new_revision_and_keeps_created_at() {
     reordered.types.reverse();
     reordered.created_at = NOW - 86_400;
     w.store.seed(reordered);
+    // The rest of the catalog (warren-claude) is stored exactly as defined.
+    for t in catalog.iter().skip(3) {
+        let mut same = t.clone();
+        same.created_at = NOW - 86_400;
+        same.updated_at = NOW - 86_400;
+        w.store.seed(same);
+    }
 
     w.templates.ensure_system_templates().await.unwrap();
 
@@ -181,7 +188,12 @@ async fn new_image_tag_publishes_new_revisions_without_a_stale_digest() {
     let upgraded =
         Templates::with_clock(w.store.clone(), runtimes(&w.runtime), cfg, w.clock.clone());
     upgraded.ensure_system_templates().await.unwrap();
-    for name in ["warren-base", "warren-agent", "warren-opencode"] {
+    for name in [
+        "warren-base",
+        "warren-agent",
+        "warren-opencode",
+        "warren-claude",
+    ] {
         let t = w.store.get_template("", name).await.unwrap();
         assert_eq!(t.revision, 2, "{name}");
         assert!(t.image_ref.ends_with(":v2"), "{name}: {}", t.image_ref);
@@ -368,6 +380,7 @@ async fn lists_system_templates_first_then_workspace_templates_by_name() {
         vec![
             "warren-agent",
             "warren-base",
+            "warren-claude",
             "warren-opencode",
             "alpha",
             "zeta"
@@ -376,12 +389,23 @@ async fn lists_system_templates_first_then_workspace_templates_by_name() {
     let theirs = w.templates.list(OTHER_WS).await.unwrap();
     assert_eq!(
         names(&theirs),
-        vec!["warren-agent", "warren-base", "warren-opencode", "theirs"]
+        vec![
+            "warren-agent",
+            "warren-base",
+            "warren-claude",
+            "warren-opencode",
+            "theirs"
+        ]
     );
     let anonymous = w.templates.list("").await.unwrap();
     assert_eq!(
         names(&anonymous),
-        vec!["warren-agent", "warren-base", "warren-opencode"]
+        vec![
+            "warren-agent",
+            "warren-base",
+            "warren-claude",
+            "warren-opencode"
+        ]
     );
 }
 
@@ -646,7 +670,13 @@ async fn delete_rules() {
     );
     assert_eq!(
         names(&w.templates.list(WS).await.unwrap()),
-        vec!["warren-agent", "warren-base", "warren-opencode", "busy"]
+        vec![
+            "warren-agent",
+            "warren-base",
+            "warren-claude",
+            "warren-opencode",
+            "busy"
+        ]
     );
     assert!(
         w.templates.get(WS, "warren-base").await.is_ok(),

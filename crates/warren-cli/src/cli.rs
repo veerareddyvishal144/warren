@@ -87,6 +87,94 @@ pub enum Command {
     },
     /// Daemon health (no authentication).
     Health,
+    // ----- interactive terminal and workspace sync (shell.rs, runcmd.rs, sync.rs) -----
+    /// Open an interactive shell, or run a command on a terminal, inside an instance.
+    Shell(ShellArgs),
+    /// Run a command in an instance bound to the current directory, syncing files both ways.
+    Run(RunArgs),
+    /// Copy the current directory to an instance and changed files back.
+    Sync {
+        #[command(subcommand)]
+        cmd: SyncCmd,
+    },
+}
+
+/// Arguments of `warren shell`.
+#[derive(Debug, Args)]
+pub struct ShellArgs {
+    /// Instance id.
+    #[arg(required_unless_present = "gateway_url")]
+    pub id: Option<String>,
+    /// Working directory inside the instance, relative to the home.
+    #[arg(long, value_name = "PATH")]
+    pub cwd: Option<String>,
+    /// Connect straight to a gateway (no daemon), for testing.
+    #[arg(long, hide = true, value_name = "URL", requires = "gateway_token")]
+    pub gateway_url: Option<String>,
+    /// Instance token for --gateway-url.
+    #[arg(long, hide = true, value_name = "TOKEN")]
+    pub gateway_token: Option<String>,
+    /// A command to run on the terminal instead of a login shell, after `--`.
+    /// A single argument is passed to the shell verbatim; several are quoted and joined.
+    #[arg(last = true, num_args = 0..)]
+    pub command: Vec<String>,
+}
+
+/// Arguments of `warren run`.
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// Create a fresh instance even when the directory is already bound.
+    #[arg(long)]
+    pub new: bool,
+    /// Instance type when creating: default, vm or mac.
+    #[arg(long = "type", value_name = "default|vm|mac", value_parser = parse_instance_type)]
+    pub kind: Option<InstanceType>,
+    /// Template when creating (default warren-base; warren-macos for --type mac).
+    #[arg(long)]
+    pub template: Option<String>,
+    /// Display name when creating.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Remote directory the current directory maps to (default: <mount_path>/work/<directory name>).
+    #[arg(long, value_name = "PATH")]
+    pub remote_root: Option<String>,
+    /// Neither push before nor pull after the command.
+    #[arg(long)]
+    pub no_sync: bool,
+    /// Run through exec without a terminal and print the captured output when it ends.
+    #[arg(long)]
+    pub no_tty: bool,
+    /// Forget the instance bound to the current directory.
+    #[arg(long, conflicts_with_all = ["new", "no_sync", "no_tty", "command"])]
+    pub unbind: bool,
+    /// With --unbind: destroy the bound instance as well.
+    #[arg(long, requires = "unbind")]
+    pub delete: bool,
+    /// The command to run, after `--`. A single argument is passed to the shell verbatim; several are quoted and joined.
+    #[arg(last = true, num_args = 0.., required_unless_present = "unbind")]
+    pub command: Vec<String>,
+}
+
+/// `warren sync ...`
+#[derive(Debug, Subcommand)]
+pub enum SyncCmd {
+    /// Upload the current directory (honouring .gitignore) to the instance.
+    Push(SyncArgs),
+    /// Download the files changed on the instance since the last sync.
+    Pull(SyncArgs),
+}
+
+/// Arguments of `warren sync push|pull`.
+#[derive(Debug, Args)]
+pub struct SyncArgs {
+    /// Instance id (default: the instance `warren run` bound to the current directory).
+    pub id: Option<String>,
+    /// Remote directory (default: the bound remote root, else <mount_path>/work/<directory name>).
+    #[arg(long, value_name = "PATH")]
+    pub remote_root: Option<String>,
+    /// A directory or file name to leave out (repeatable), on top of the defaults.
+    #[arg(long = "exclude", value_name = "NAME")]
+    pub exclude: Vec<String>,
 }
 
 /// `warren templates ...`
@@ -907,6 +995,120 @@ mod tests {
             panic!()
         };
         assert_eq!((path.as_str(), local.to_str()), ("proj", Some("-")));
+    }
+
+    #[test]
+    fn shell_run_and_sync() {
+        let Command::Shell(s) = parse(&["shell", "i"]).command else {
+            panic!()
+        };
+        assert_eq!(s.id.as_deref(), Some("i"));
+        assert!(s.command.is_empty() && s.cwd.is_none() && s.gateway_url.is_none());
+        let Command::Shell(s) =
+            parse(&["shell", "i", "--cwd", "work/app", "--", "ls", "-la"]).command
+        else {
+            panic!()
+        };
+        assert_eq!(s.cwd.as_deref(), Some("work/app"));
+        assert_eq!(s.command, vec!["ls", "-la"]);
+        let Command::Shell(s) = parse(&[
+            "shell",
+            "--gateway-url",
+            "http://127.0.0.1:38737",
+            "--gateway-token",
+            "tok",
+            "--",
+            "echo hi; exit 4",
+        ])
+        .command
+        else {
+            panic!()
+        };
+        assert_eq!(s.id, None);
+        assert_eq!(s.gateway_url.as_deref(), Some("http://127.0.0.1:38737"));
+        assert_eq!(s.gateway_token.as_deref(), Some("tok"));
+        assert_eq!(s.command, vec!["echo hi; exit 4"]);
+        assert_eq!(fails(&["shell"]).kind(), ErrorKind::MissingRequiredArgument);
+        assert_eq!(
+            fails(&["shell", "--gateway-url", "http://x"]).kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+
+        let Command::Run(r) = parse(&["run", "--", "claude"]).command else {
+            panic!()
+        };
+        assert_eq!(r.command, vec!["claude"]);
+        assert!(!r.new && !r.no_sync && !r.no_tty && !r.unbind && !r.delete);
+        assert!(r.kind.is_none() && r.template.is_none() && r.remote_root.is_none());
+        let Command::Run(r) = parse(&[
+            "run",
+            "--new",
+            "--type",
+            "mac",
+            "--template",
+            "warren-macos",
+            "--name",
+            "ios",
+            "--remote-root",
+            "/Users/lume/work/app",
+            "--no-sync",
+            "--no-tty",
+            "--",
+            "xcodebuild",
+            "-scheme",
+            "App",
+        ])
+        .command
+        else {
+            panic!()
+        };
+        assert!(r.new && r.no_sync && r.no_tty);
+        assert_eq!(r.kind, Some(InstanceType::Mac));
+        assert_eq!(r.template.as_deref(), Some("warren-macos"));
+        assert_eq!(r.name.as_deref(), Some("ios"));
+        assert_eq!(r.remote_root.as_deref(), Some("/Users/lume/work/app"));
+        assert_eq!(r.command, vec!["xcodebuild", "-scheme", "App"]);
+        let Command::Run(r) = parse(&["run", "--unbind", "--delete"]).command else {
+            panic!()
+        };
+        assert!(r.unbind && r.delete && r.command.is_empty());
+        assert_eq!(fails(&["run"]).kind(), ErrorKind::MissingRequiredArgument);
+        assert_eq!(
+            fails(&["run", "--delete"]).kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            fails(&["run", "--unbind", "--", "ls"]).kind(),
+            ErrorKind::ArgumentConflict
+        );
+
+        let Command::Sync {
+            cmd: SyncCmd::Push(a),
+        } = parse(&[
+            "sync",
+            "push",
+            "i",
+            "--remote-root",
+            "/x",
+            "--exclude",
+            "vendor",
+            "--exclude",
+            "tmp",
+        ])
+        .command
+        else {
+            panic!()
+        };
+        assert_eq!(a.id.as_deref(), Some("i"));
+        assert_eq!(a.remote_root.as_deref(), Some("/x"));
+        assert_eq!(a.exclude, vec!["vendor", "tmp"]);
+        let Command::Sync {
+            cmd: SyncCmd::Pull(a),
+        } = parse(&["sync", "pull"]).command
+        else {
+            panic!()
+        };
+        assert!(a.id.is_none() && a.exclude.is_empty());
     }
 
     #[test]

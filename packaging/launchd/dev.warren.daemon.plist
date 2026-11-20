@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Warren daemon as a macOS LaunchAgent (runs as you, when you are logged in).
+  Template: replace the placeholders before loading it; launchd does not
+  expand ~ or $HOME.
+
+    __WARREND__   absolute path of warrend: /opt/homebrew/bin/warrend (Homebrew)
+                  or /usr/local/bin/warrend (install script, tarball)
+    __HOME__      your home directory, e.g. /Users/alice
+    __BASE_VM__   the Lume base VM built with scripts/mac/build-base.sh,
+                  e.g. warren-macos-26 (see docs/macos.md)
+
+  Install by hand:
+    mkdir -p ~/Library/LaunchAgents ~/Library/Logs/Warren ~/.warren
+    sed -e "s|__WARREND__|$(command -v warrend)|g" -e "s|__HOME__|$HOME|g" -e "s|__BASE_VM__|warren-macos-26|g" \
+        packaging/launchd/dev.warren.daemon.plist > ~/Library/LaunchAgents/dev.warren.daemon.plist
+    plutil -lint ~/Library/LaunchAgents/dev.warren.daemon.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.warren.daemon.plist
+    tail -f ~/Library/Logs/Warren/warrend.log
+  Stop and remove:
+    launchctl bootout gui/$(id -u)/dev.warren.daemon
+    rm ~/Library/LaunchAgents/dev.warren.daemon.plist
+
+  Flags: runtime none means no Docker (only mac instances); drop that pair on a
+  Mac that also runs Docker Desktop for default instances. Every flag has a
+  WARREN_* variable (docs/self-hosting.md); the data directory must be an
+  absolute path (the daemon hands Lume an absolute share path).
+-->
+<dict>
+	<key>Label</key>
+	<string>dev.warren.daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__WARREND__</string>
+		<string>--runtime</string>
+		<string>none</string>
+		<string>--mac-base-vm</string>
+		<string>__BASE_VM__</string>
+		<string>--data-dir</string>
+		<string>__HOME__/.warren/data</string>
+		<string>--listen</string>
+		<string>127.0.0.1:7337</string>
+		<string>--public-port</string>
+		<string>7337</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>WorkingDirectory</key>
+	<string>__HOME__/.warren</string>
+	<key>StandardOutPath</key>
+	<string>__HOME__/Library/Logs/Warren/warrend.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/Library/Logs/Warren/warrend.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- lume (Homebrew) must be on PATH: the daemon starts `lume serve` itself. -->
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>HOME</key>
+		<string>__HOME__</string>
+		<key>WARREN_LOG</key>
+		<string>info</string>
+		<!-- <key>WARREN_MAC_VNC</key><string>true</string> -->
+	</dict>
+</dict>
+</plist>

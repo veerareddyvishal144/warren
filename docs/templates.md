@@ -1,6 +1,6 @@
 # Templates
 
-A template is a named image plus what the platform needs to run it. Three come built in; you register your own from any Linux image: the daemon injects its gateway into images that do not ship it, so files, exec and health work without changing the image (see [Any image works](#any-image-works-the-injected-gateway)).
+A template is a named image plus what the platform needs to run it. Four come built in (five on a Mac host); you register your own from any Linux image: the daemon injects its gateway into images that do not ship it, so files, exec and health work without changing the image (see [Any image works](#any-image-works-the-injected-gateway)).
 
 ```bash
 export WARREN_API=http://api.warren.localhost:7337/v1
@@ -16,9 +16,10 @@ JSON='Content-Type: application/json'
 | `warren-base` | `warren/base:<tag>` | no | none | 2 vCPU / 4 GB / 4 GB | A plain Linux computer: Debian 12, Node 24, Python 3, git, build tools, a browser terminal (ttyd on 7681) and the files API. `POST /v1/responses` answers `404 not_supported`. |
 | `warren-agent` | `warren/agent:<tag>` | yes | `openai` | 2 vCPU / 4 GB / 4 GB | The built-in agent: an agent loop with shell, read/write-file and list-dir tools on any OpenAI-compatible chat-completions endpoint. Needs `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `WARREN_MODEL` in the instance env. |
 | `warren-opencode` | `warren/opencode:<tag>` | yes | `command` | 2 vCPU / 4 GB / 6 GB | OpenCode, the open-source coding agent, run once per turn (`opencode run <prompt>`) in the home directory. Provider keys such as `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` come from the instance env. |
+| `warren-claude` | `warren/claude:<tag>` | no | none | 2 vCPU / 4 GB / 6 GB | The plain Linux computer plus the `claude` (Claude Code), `codex` and `opencode` CLIs installed under `/usr/local` for every user. No Agent API: run the CLIs over exec or the browser terminal, with `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and friends in the instance env. The same CLIs go into the macOS base image with `scripts/mac/build-base.sh --with-agents`. |
 | `warren-macos` | the base Lume VM named by `--mac-base-vm` | no | none | 2 vCPU / 4 GB / 50 GB | A macOS virtual machine on an Apple silicon host, type `mac` only: shell, exec and the files API inside a full macOS guest. Present in the catalog only when the daemon runs with `--mac-base-vm`. See [macos.md](macos.md). |
 
-The three Linux templates serve the gateway on port 3737 (`default_port`), mount the persistent disk at `/home/agent`, allow the `default` and `vm` types, and run as user `agent` (uid 1000) with passwordless sudo. `<tag>` is the daemon's `--image-tag` (`dev` by default) and must match what `scripts/build-images.sh` built. `warren-macos` also serves the gateway on 3737 but mounts the home at `/Users/lume`, allows only `mac`, and its disk starts at the base image's size and only grows (up to 500 GB).
+The four Linux templates serve the gateway on port 3737 (`default_port`), mount the persistent disk at `/home/agent`, allow the `default` and `vm` types, and run as user `agent` (uid 1000) with passwordless sudo. `<tag>` is the daemon's `--image-tag` (`dev` by default) and must match what `scripts/build-images.sh` built. `warren-macos` also serves the gateway on 3737 but mounts the home at `/Users/lume`, allows only `mac`, and its disk starts at the base image's size and only grows (up to 500 GB).
 
 ```bash
 curl -s $WARREN_API/templates -H "$AUTH"                 # system catalog first, then workspace templates by name
@@ -123,9 +124,10 @@ Platform variables injected into every instance, which always win over template 
 ## Building the built-in images
 
 ```bash
-make images                                        # all three, tag dev
+make images                                        # all four, tag dev
 WARREN_IMAGE_TAG=v1 scripts/build-images.sh base agent
+scripts/build-images.sh claude                     # just warren/claude (needs warren/base of the same tag)
 WARREN_DOCKER_BUILD_ARGS="--pull --no-cache" scripts/build-images.sh    # refresh base layers and "latest" downloads
 ```
 
-The script builds `warren-gateway` in release mode, stages it at `images/.build/warren-gateway`, runs `docker build` with `images/` as the context and prints the sizes; `warren/base` must stay under 700 MB. Start the daemon with the same tag (`--image-tag v1` or `WARREN_IMAGE_TAG=v1`).
+The script builds `warren-gateway` in release mode, stages it at `images/.build/warren-gateway`, runs `docker build` with `images/` as the context (base, agent, opencode, claude in that order) and prints the sizes; `warren/base` must stay under 700 MB. `WARREN_OPENCODE_VERSION`, `WARREN_CLAUDE_CODE_VERSION` and `WARREN_CODEX_VERSION` pin the npm packages the opencode and claude images install (default `latest`). Start the daemon with the same tag (`--image-tag v1` or `WARREN_IMAGE_TAG=v1`).
