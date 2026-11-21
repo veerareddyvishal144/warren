@@ -2,6 +2,7 @@
 //! file, pid files, liveness checks through `/proc`, signals and CPU/RSS sampling.
 
 use std::{
+    ffi::OsString,
     path::Path,
     process::Stdio,
     time::{Duration, Instant},
@@ -111,11 +112,12 @@ pub fn cpu_percent(prev: CpuSample, cur: CpuSample) -> f64 {
     (cur.ticks - prev.ticks) as f64 / USER_HZ / secs * 100.0
 }
 
-/// Start `firecracker --no-api --config-file <config>` with stdin closed and the
-/// console (stdout and stderr) appended to `console_log`. The child is put in
-/// its own process group so signals aimed at the daemon do not reach the VMs,
-/// and dropped without waiting: tokio reaps it in the background.
-pub async fn spawn(bin: &Path, config: &Path, console_log: &Path) -> Result<i32> {
+/// Start `program args...` (firecracker, or the jailer that execs it) with
+/// stdin closed and the console (stdout and stderr) appended to
+/// `console_log`. The child is put in its own process group so signals aimed
+/// at the daemon do not reach the VMs, and dropped without waiting: tokio
+/// reaps it in the background.
+pub async fn spawn(program: &Path, args: &[OsString], console_log: &Path) -> Result<i32> {
     let out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -124,10 +126,8 @@ pub async fn spawn(bin: &Path, config: &Path, console_log: &Path) -> Result<i32>
     let err = out
         .try_clone()
         .map_err(|e| Error::internal(format!("dup console log: {e}")))?;
-    let mut cmd = tokio::process::Command::new(bin);
-    cmd.arg("--no-api")
-        .arg("--config-file")
-        .arg(config)
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
@@ -135,11 +135,31 @@ pub async fn spawn(bin: &Path, config: &Path, console_log: &Path) -> Result<i32>
         .kill_on_drop(false);
     let child = cmd
         .spawn()
-        .map_err(|e| Error::internal(format!("spawn {}: {e}", bin.display())))?;
+        .map_err(|e| Error::internal(format!("spawn {}: {e}", program.display())))?;
     let pid = child
         .id()
         .ok_or_else(|| Error::internal("firecracker exited before it could be observed"))?;
     i32::try_from(pid).map_err(|_| Error::internal(format!("pid {pid} out of range")))
+}
+
+/// `<bin> --version`, normalised to `x.y.z` (Firecracker prints
+/// `Firecracker v1.18.0`). `None` when the binary cannot be run or prints
+/// nothing that looks like a version; the caller then skips its own version
+/// check and leaves it to Firecracker.
+pub async fn version(bin: &Path) -> Option<String> {
+    let out = tokio::process::Command::new(bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    let v = crate::snapshot::parse_version(&text);
+    if v.is_none() {
+        tracing::warn!(bin = %bin.display(), output = %text.trim(), "cannot read the firecracker version");
+    }
+    v
 }
 
 /// Poll until the process is gone (or a zombie) or `timeout` passes. Returns
@@ -258,6 +278,47 @@ mod tests {
     #[test]
     fn signal_to_missing_process_is_ok() {
         signal(i32::MAX - 1, Signal::SIGKILL).unwrap();
+    }
+
+    /// `version` runs `<bin> --version`; a shell script standing in for
+    /// Firecracker shows the parsing, a missing binary gives `None`.
+    #[tokio::test]
+    async fn reads_a_firecracker_style_version() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("fc-version");
+        let fake = tmp.path().join("firecracker");
+        std::fs::write(&fake, "#!/bin/sh\necho 'Firecracker v1.18.0'\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(version(&fake).await.as_deref(), Some("1.18.0"));
+        std::fs::write(&fake, "#!/bin/sh\necho 'no version'\n").unwrap();
+        assert_eq!(version(&fake).await, None);
+        assert_eq!(version(&tmp.path().join("missing")).await, None);
+    }
+
+    /// `spawn` runs any program with the console redirected to the log.
+    #[tokio::test]
+    async fn spawn_redirects_the_console() {
+        let tmp = TempDir::new("fc-spawn");
+        let log = tmp.path().join("console.log");
+        let sh = crate::host::find_tool("sh").unwrap();
+        let args: Vec<OsString> = vec!["-c".into(), "echo hello-console; echo err >&2".into()];
+        let pid = spawn(&sh, &args, &log).await.unwrap();
+        assert!(pid > 0);
+        assert!(wait_exit(pid, "", Duration::from_secs(5)).await);
+        // Without /proc (macOS) wait_exit returns at once; give the shell a moment.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut text = String::new();
+        while Instant::now() < deadline {
+            text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.contains("hello-console") && text.contains("err") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            text.contains("hello-console") && text.contains("err"),
+            "{text}"
+        );
     }
 
     #[test]

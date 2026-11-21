@@ -355,15 +355,37 @@ fn with_op<'a>(rule: &[&'a str], op: &'a str) -> Vec<&'a str> {
     out
 }
 
+/// `ip tuntap add <tap> mode tap [user <uid> group <gid>]`: a tap owned by
+/// `owner` may be attached to by a process with that uid without
+/// `CAP_NET_ADMIN`, which is how a jailed Firecracker opens it.
+pub fn tap_add_args(tap: &str, owner: Option<(u32, u32)>) -> Vec<String> {
+    let mut args: Vec<String> = ["tuntap", "add", tap, "mode", "tap"]
+        .map(String::from)
+        .to_vec();
+    if let Some((uid, gid)) = owner {
+        args.extend([
+            "user".into(),
+            uid.to_string(),
+            "group".into(),
+            gid.to_string(),
+        ]);
+    }
+    args
+}
+
 /// Create a tap device attached to the bridge; an existing one is recreated so
-/// a stale device from a crashed VM never lingers. Needs root.
-pub async fn tap_create(name: &str) -> Result<()> {
+/// a stale device from a crashed VM never lingers. With `owner` (uid, gid)
+/// the device belongs to that user, for a VM that runs unprivileged inside
+/// the jailer. Needs root.
+pub async fn tap_create_owned(name: &str, owner: Option<(u32, u32)>) -> Result<()> {
     require_root("create tap devices")?;
     let ip = tool("ip")?;
     if link_exists(name) {
         run(&ip, &["link", "del", name]).await?;
     }
-    run(&ip, &["tuntap", "add", name, "mode", "tap"]).await?;
+    let add = tap_add_args(name, owner);
+    let add: Vec<&str> = add.iter().map(String::as_str).collect();
+    run(&ip, &add).await?;
     run(&ip, &["link", "set", name, "master", BRIDGE, "up"]).await?;
     // Isolated port: the kernel never forwards frames between two isolated
     // ports, so guests cannot reach each other even on the same bridge.
@@ -493,6 +515,18 @@ mod tests {
     }
 
     #[test]
+    fn tap_creation_names_the_jail_owner_when_given() {
+        assert_eq!(
+            tap_add_args("tap-ab12cd34", None).join(" "),
+            "tuntap add tap-ab12cd34 mode tap"
+        );
+        assert_eq!(
+            tap_add_args("tap-ab12cd34", Some((61000, 61000))).join(" "),
+            "tuntap add tap-ab12cd34 mode tap user 61000 group 61000"
+        );
+    }
+
+    #[test]
     fn egress_policy_covers_metadata_private_ranges_and_host() {
         let host = [Ipv4Addr::new(10, 0, 0, 13), Ipv4Addr::new(172, 30, 0, 1)];
         let rules = egress_policy_rules(false, &host);
@@ -589,7 +623,7 @@ mod tests {
         if !is_root() {
             let err = ensure_network(false, None).await.unwrap_err();
             assert!(err.message.contains("needs root"));
-            assert!(tap_create("tap-test0").await.is_err());
+            assert!(tap_create_owned("tap-test0", None).await.is_err());
             // Deleting a tap that does not exist needs no privilege.
             tap_delete("tap-does-not-exist").await.unwrap();
             eprintln!("skipping the live bridge, tap isolation and iptables checks: needs root");
@@ -610,8 +644,8 @@ mod tests {
                 rule.join(" ")
             );
         }
-        tap_create("tap-wtest0").await.unwrap();
-        tap_create("tap-wtest0").await.unwrap();
+        tap_create_owned("tap-wtest0", None).await.unwrap();
+        tap_create_owned("tap-wtest0", None).await.unwrap();
         assert!(link_exists("tap-wtest0"));
         assert!(
             tap_is_isolated("tap-wtest0").await.unwrap(),

@@ -2,6 +2,10 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use crate::{InstanceType, Shape, Template, TemplateScope, types::*};
 
+/// Default uid and gid the Firecracker jailer drops to: a dedicated id above
+/// the ranges distributions hand to system and login users, below `nobody`.
+pub const DEFAULT_FIRECRACKER_JAIL_ID: u32 = 61000;
+
 /// Daemon configuration. Built by `warrend` from flags and `WARREN_*` variables;
 /// defaults are safe for a single developer machine.
 #[derive(Debug, Clone)]
@@ -20,6 +24,18 @@ pub struct Config {
     pub enable_firecracker: bool,
     pub firecracker_bin: PathBuf,
     pub kernel_image: Option<PathBuf>,
+    /// The Firecracker `jailer` binary. When set, every microVM is launched
+    /// through it: a chroot per instance under `firecracker_jail_dir()`, the
+    /// process dropped to `firecracker_jail_uid`/`gid`, seccomp on. None
+    /// launches `firecracker_bin` directly as root (the default).
+    pub firecracker_jailer: Option<PathBuf>,
+    /// Unprivileged uid and gid the jailer switches to; they need not exist
+    /// in `/etc/passwd`.
+    pub firecracker_jail_uid: u32,
+    pub firecracker_jail_gid: u32,
+    /// Apply the per-shape token-bucket limits to each microVM's block device
+    /// and NIC. On by default; `--firecracker-no-rate-limits` turns it off.
+    pub firecracker_rate_limits: bool,
     /// Base URL of the Lume API server (`lume serve`) that hosts `mac` instances.
     pub lume_api_url: String,
     /// The `lume` executable, started as `lume serve` when the API is down.
@@ -77,6 +93,10 @@ impl Default for Config {
             enable_firecracker: false,
             firecracker_bin: PathBuf::from("/usr/local/bin/firecracker"),
             kernel_image: None,
+            firecracker_jailer: None,
+            firecracker_jail_uid: DEFAULT_FIRECRACKER_JAIL_ID,
+            firecracker_jail_gid: DEFAULT_FIRECRACKER_JAIL_ID,
+            firecracker_rate_limits: true,
             lume_api_url: "http://127.0.0.1:7777".into(),
             lume_bin: PathBuf::from("lume"),
             mac_base_vm: None,
@@ -327,6 +347,12 @@ impl Config {
 
     pub fn instances_dir(&self) -> PathBuf {
         self.data_dir.join("instances")
+    }
+
+    /// Where the Firecracker jailer builds its chroots (`--chroot-base-dir`):
+    /// under the data directory so the instance files can be hard-linked in.
+    pub fn firecracker_jail_dir(&self) -> PathBuf {
+        self.data_dir.join("firecracker").join("jail")
     }
     /// Per-instance state of `mac` instances (the shared folder each VM mounts).
     pub fn mac_dir(&self) -> PathBuf {

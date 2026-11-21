@@ -1,5 +1,7 @@
 //! Layout of one instance's storage: `<instances_dir>/<id>/vm/` holds the
-//! rootfs image, the Firecracker config, the guest ip, the pid and the console log.
+//! rootfs image, the Firecracker config, the guest ip, the pid, the console
+//! log, the API socket of the running process and, while the instance sleeps
+//! with its memory saved, the `snapshot/` directory.
 
 use std::path::{Path, PathBuf};
 
@@ -21,6 +23,8 @@ pub const IP_FILE: &str = "ip";
 pub const PID_FILE: &str = "pid";
 /// Serial console output of every boot.
 pub const CONSOLE_LOG: &str = "console.log";
+/// Firecracker's API socket while the VM runs outside the jailer.
+pub const API_SOCK: &str = "firecracker.sock";
 /// Scratch directories used while rebuilding or backing up.
 pub const KEEP_DIR: &str = "home-keep";
 pub const RESTORE_DIR: &str = "restore-tmp";
@@ -80,6 +84,22 @@ impl VmPaths {
     /// `vm/console.log`.
     pub fn console(&self) -> PathBuf {
         self.vm.join(CONSOLE_LOG)
+    }
+    /// `vm/firecracker.sock`.
+    pub fn api_sock(&self) -> PathBuf {
+        self.vm.join(API_SOCK)
+    }
+    /// `vm/snapshot`, the saved memory of a sleeping VM.
+    pub fn snapshot_dir(&self) -> PathBuf {
+        self.vm.join(crate::snapshot::DIR)
+    }
+    /// `vm/snapshot/vmstate`.
+    pub fn snapshot_vmstate(&self) -> PathBuf {
+        crate::snapshot::vmstate(&self.snapshot_dir())
+    }
+    /// `vm/snapshot/mem`.
+    pub fn snapshot_mem(&self) -> PathBuf {
+        crate::snapshot::mem(&self.snapshot_dir())
     }
     /// Scratch directory holding the preserved home during a rebuild.
     pub fn keep_dir(&self) -> PathBuf {

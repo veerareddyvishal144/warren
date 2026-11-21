@@ -5,7 +5,10 @@ use std::{net::Ipv4Addr, path::Path};
 use serde::{Deserialize, Serialize};
 use warren_core::{Error, Result, Shape};
 
-use crate::net::{self, HOST_IP, NETMASK};
+use crate::{
+    limits::RateLimits,
+    net::{self, HOST_IP, NETMASK},
+};
 
 /// The gateway binary inside the image; it runs as PID 1 with `--init`.
 pub const GUEST_INIT: &str = "/usr/local/bin/warren-gateway";
@@ -42,6 +45,9 @@ pub struct Drive {
     pub path_on_host: String,
     pub is_root_device: bool,
     pub is_read_only: bool,
+    /// Bandwidth and ops limits; none means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limiter: Option<RateLimiter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +56,32 @@ pub struct NetworkInterface {
     pub host_dev_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_mac: Option<String>,
+    /// Limit on traffic from the host into the guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_rate_limiter: Option<RateLimiter>,
+    /// Limit on traffic from the guest out to the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_rate_limiter: Option<RateLimiter>,
+}
+
+/// Firecracker's `RateLimiter`: a bandwidth bucket (bytes) and an ops bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimiter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bandwidth: Option<TokenBucket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ops: Option<TokenBucket>,
+}
+
+/// Firecracker's `TokenBucket`: `size` tokens are refilled every
+/// `refill_time` milliseconds; `one_time_burst` extra tokens are available
+/// once at the start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenBucket {
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_time_burst: Option<u64>,
+    pub refill_time: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,13 +106,17 @@ pub fn boot_args_with_init(guest_ip: Ipv4Addr, init: &str) -> String {
 }
 
 /// Build the configuration for one VM. Paths are made absolute because
-/// Firecracker resolves them relative to its own working directory.
+/// Firecracker resolves them relative to its own working directory (inside
+/// the jailer they are jail-relative and already absolute). `limits` puts
+/// token-bucket rate limiters on the root drive and both directions of the
+/// NIC; `None` leaves them unlimited.
 pub fn render(
     kernel: &Path,
     rootfs: &Path,
     tap: &str,
     guest_ip: Ipv4Addr,
     shape: Shape,
+    limits: Option<&RateLimits>,
 ) -> VmConfig {
     VmConfig {
         boot_source: BootSource {
@@ -92,11 +128,14 @@ pub fn render(
             path_on_host: absolute(rootfs),
             is_root_device: true,
             is_read_only: false,
+            rate_limiter: limits.map(RateLimits::drive),
         }],
         network_interfaces: vec![NetworkInterface {
             iface_id: IFACE_ID.into(),
             host_dev_name: tap.to_string(),
             guest_mac: Some(net::guest_mac(guest_ip)),
+            rx_rate_limiter: limits.map(RateLimits::nic),
+            tx_rate_limiter: limits.map(RateLimits::nic),
         }],
         machine_config: MachineConfig {
             vcpu_count: shape.cpu,
@@ -116,9 +155,14 @@ fn absolute(p: &Path) -> String {
     abs.to_string_lossy().into_owned()
 }
 
+/// The config as pretty JSON.
+pub fn to_json(cfg: &VmConfig) -> Result<String> {
+    Ok(serde_json::to_string_pretty(cfg)?)
+}
+
 /// Write the config as pretty JSON.
 pub fn write(path: &Path, cfg: &VmConfig) -> Result<()> {
-    let text = serde_json::to_string_pretty(cfg)?;
+    let text = to_json(cfg)?;
     std::fs::write(path, text)
         .map_err(|e| Error::internal(format!("write {}: {e}", path.display())))
 }
@@ -158,6 +202,7 @@ mod tests {
                 memory: 4,
                 disk: 4,
             },
+            None,
         );
         let v: serde_json::Value = serde_json::to_value(&cfg).unwrap();
         assert_eq!(
@@ -182,27 +227,69 @@ mod tests {
         assert_eq!(v["network-interfaces"][0]["guest_mac"], "06:00:ac:1e:00:02");
         assert_eq!(v["machine-config"]["vcpu_count"], 2);
         assert_eq!(v["machine-config"]["mem_size_mib"], 4096);
-        // Only the four top-level sections Firecracker expects.
+        // Only the four top-level sections Firecracker expects, and no rate
+        // limiter keys at all when limits are off.
         assert_eq!(v.as_object().unwrap().len(), 4);
+        assert!(v["drives"][0].get("rate_limiter").is_none());
+        assert!(v["network-interfaces"][0].get("rx_rate_limiter").is_none());
+        assert!(v["network-interfaces"][0].get("tx_rate_limiter").is_none());
+    }
+
+    #[test]
+    fn renders_rate_limiters_in_firecracker_form() {
+        let shape = Shape {
+            cpu: 4,
+            memory: 8,
+            disk: 6,
+        };
+        let limits = crate::limits::for_shape(shape);
+        let cfg = render(
+            Path::new("/vmlinux"),
+            Path::new("/rootfs.ext4"),
+            "tap-ab12cd34",
+            Ipv4Addr::new(172, 30, 0, 2),
+            shape,
+            Some(&limits),
+        );
+        let v: serde_json::Value = serde_json::to_value(&cfg).unwrap();
+        // Jail-relative paths stay as they are.
+        assert_eq!(v["boot-source"]["kernel_image_path"], "/vmlinux");
+        assert_eq!(v["drives"][0]["path_on_host"], "/rootfs.ext4");
+        let drive = &v["drives"][0]["rate_limiter"];
+        assert_eq!(drive["bandwidth"]["size"], 20_000_000);
+        assert_eq!(drive["bandwidth"]["refill_time"], 100);
+        assert_eq!(drive["bandwidth"]["one_time_burst"], 200_000_000);
+        assert_eq!(drive["ops"]["size"], 800);
+        let rx = &v["network-interfaces"][0]["rx_rate_limiter"];
+        let tx = &v["network-interfaces"][0]["tx_rate_limiter"];
+        assert_eq!(rx, tx);
+        assert_eq!(rx["bandwidth"]["size"], 2_500_000, "200 Mbit/s over 100 ms");
+        assert!(rx.get("ops").is_none());
     }
 
     #[test]
     fn round_trips_through_disk() {
         let tmp = crate::testutil::TempDir::new("fc-vmconfig");
         let path = tmp.path().join("config.json");
+        let shape = Shape {
+            cpu: 4,
+            memory: 8,
+            disk: 6,
+        };
         let cfg = render(
             Path::new("/k/vmlinux"),
             Path::new("/i/vm/rootfs.ext4"),
             "tap-x",
             Ipv4Addr::new(172, 30, 0, 9),
-            Shape {
-                cpu: 4,
-                memory: 8,
-                disk: 6,
-            },
+            shape,
+            Some(&crate::limits::for_shape(shape)),
         );
         write(&path, &cfg).unwrap();
         assert_eq!(read(&path).unwrap(), cfg);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            to_json(&cfg).unwrap()
+        );
         assert!(read(&tmp.path().join("missing.json")).is_err());
     }
 }
