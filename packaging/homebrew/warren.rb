@@ -20,13 +20,13 @@ class Warren < Formula
     # Virtualization.framework, and no Intel binaries are published.
     depends_on arch: :arm64
     url "https://github.com/veerareddyvishal144/warren/releases/download/v0.1.0/warren-0.1.0-darwin-arm64.tar.gz"
-    sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+    sha256 "00af4632f94ef21bee0b3905c0714e894e738ee5b84bbc80d13b6185bf310577"
   end
 
   on_linux do
     on_intel do
       url "https://github.com/veerareddyvishal144/warren/releases/download/v0.1.0/warren-0.1.0-linux-x86_64.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "5cf7ff75f3aeacd7c9d5a91bc95430df1d545a6398c40d36367056bfef7d5b92"
     end
     on_arm do
       url "https://github.com/veerareddyvishal144/warren/releases/download/v0.1.0/warren-0.1.0-linux-arm64.tar.gz"
