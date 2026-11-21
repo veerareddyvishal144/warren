@@ -315,6 +315,7 @@ pub async fn doctor(ctx: &Ctx) -> Result<i32, Failure> {
     if cfg!(target_os = "macos") {
         mac_checks(&mut checks, state.as_ref(), &runtimes).await;
         firewall_check(&mut checks);
+        smolvm_check(&mut checks);
     } else if cfg!(target_os = "linux") {
         linux_checks(&mut checks);
     }
@@ -568,6 +569,38 @@ fn firewall_check(checks: &mut Vec<Check>) {
                 bin.display()
             ),
             fix,
+        )),
+    }
+}
+
+/// smolvm gives a Mac Linux instances as microVMs without Docker Desktop
+/// (docs/linux-on-mac.md); optional when a Docker daemon answers.
+fn smolvm_check(checks: &mut Vec<Check>) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    match setup::find_smolvm() {
+        Some(bin) => {
+            let version = std::process::Command::new(&bin)
+                .arg("--version")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "version unknown".to_string());
+            checks.push(Check::ok(
+                "smolvm",
+                format!("{version} at {} (Linux instances as microVMs)", bin.display()),
+            ));
+        }
+        None if setup::docker_ok() => checks.push(Check::ok(
+            "smolvm",
+            "not installed; Docker runs the Linux instances on this Mac",
+        )),
+        None => checks.push(Check::warn(
+            "smolvm",
+            "not installed and no Docker daemon answers: no Linux instances on this Mac",
+            "install smolvm (https://github.com/smol-machines/smolvm/releases) or Docker Desktop, then `warren up` again; see docs/linux-on-mac.md",
         )),
     }
 }

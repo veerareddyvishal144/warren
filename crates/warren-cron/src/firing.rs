@@ -126,7 +126,11 @@ impl Firer {
         if let Err(e) = self.lifecycle.ensure_awake(&cron.instance_id).await {
             return format!("wake failed: {}", describe(&e));
         }
-        let (endpoint, token) = match self.lifecycle.gateway_credentials(&cron.instance_id).await {
+        let (endpoint, token) = match self
+            .lifecycle
+            .gateway_upstream(&cron.instance_id, self.gateway_port)
+            .await
+        {
             Ok(creds) => creds,
             Err(e) => return format!("error: {}", describe(&e)),
         };

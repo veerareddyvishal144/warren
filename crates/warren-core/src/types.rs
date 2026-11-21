@@ -357,6 +357,12 @@ pub struct Instance {
     pub runtime_ref: String,
     #[serde(skip)]
     pub ip: String,
+    /// Host ports standing in for ports inside the instance when the host
+    /// cannot route to the instance's network (macOS hosts with Docker Desktop
+    /// or the smolvm engine): guest port -> port on `ip` (then `127.0.0.1`).
+    /// Empty when the edge reaches the instance's own address directly.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub published_ports: BTreeMap<u16, u16>,
     #[serde(skip)]
     pub storage_path: String,
     /// Secret the guest gateway requires on /v1/exec.

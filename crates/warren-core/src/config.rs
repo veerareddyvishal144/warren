@@ -45,6 +45,11 @@ pub struct Config {
     /// default; the cloud metadata range 169.254.0.0/16 is always blocked when the
     /// daemon can install firewall rules.
     pub allow_private_egress: bool,
+    /// Publish each Docker instance's gateway and terminal ports on 127.0.0.1
+    /// and reach it there instead of its container address; needed on macOS
+    /// hosts (Docker Desktop, the smolvm engine), where the host has no route
+    /// to the container networks. Defaults to on for macOS hosts.
+    pub docker_publish_ports: bool,
     /// Where the egress broker listens (`host:port`); it must be reachable from
     /// the instances' networks (the Docker bridge, `warren-fc0`, the Lume NAT).
     /// Empty or `none` runs the daemon without a broker, which refuses
@@ -86,6 +91,7 @@ impl Default for Config {
             dev_mode: false,
             signup_enabled: true,
             allow_private_egress: false,
+            docker_publish_ports: cfg!(target_os = "macos"),
             broker_listen: crate::broker::DEFAULT_BROKER_LISTEN.into(),
             broker_advertise_addr: None,
             min_idle_timeout_sec: MIN_IDLE_TIMEOUT_SEC,

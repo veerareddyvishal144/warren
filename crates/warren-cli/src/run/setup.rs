@@ -174,7 +174,12 @@ struct UpPlan {
     data_dir: PathBuf,
     runtime: String,
     mac_base_vm: Option<String>,
+    /// `--image-tag` for the daemon when given.
+    image_tag: Option<String>,
     lume_bin: Option<PathBuf>,
+    /// `DOCKER_HOST` for the daemon when Linux instances run through an engine
+    /// with its own socket (smolvm on macOS).
+    docker_host: Option<String>,
     dev: bool,
     api_url: String,
     dashboard_url: String,
@@ -200,6 +205,10 @@ impl UpPlan {
         if let Some(vm) = &self.mac_base_vm {
             a.push("--mac-base-vm".into());
             a.push(vm.clone());
+        }
+        if let Some(tag) = &self.image_tag {
+            a.push("--image-tag".into());
+            a.push(tag.clone());
         }
         if let Some(lume) = &self.lume_bin {
             a.push("--lume-bin".into());
@@ -231,7 +240,31 @@ pub async fn up(ctx: &Ctx, args: UpArgs) -> Result<i32, Failure> {
     let mut notes: Vec<String> = Vec::new();
 
     // Platform preflight.
-    let docker = docker_ok();
+    let mut docker = docker_ok();
+    // A Mac without a Docker daemon: smolvm's Docker Engine API runs every
+    // Linux instance as its own microVM. It gets a private state directory
+    // under the data dir so the user's Docker context stays untouched.
+    let mut docker_host: Option<String> = None;
+    if cfg!(target_os = "macos")
+        && !docker
+        && !matches!(args.runtime, RuntimeChoice::None)
+        && let Some(smolvm) = find_smolvm()
+    {
+        match start_smolvm_engine(&smolvm, &data_dir) {
+            Ok(sock) => {
+                docker_host = Some(format!("unix://{}", sock.display()));
+                docker = true;
+                notes.push(format!(
+                    "Linux instances run as smolvm microVMs through {} (no Docker Desktop); load the Warren images into that engine first, see docs/linux-on-mac.md",
+                    sock.display()
+                ));
+            }
+            Err(e) => notes.push(format!(
+                "smolvm found at {} but its Docker engine did not come up: {e}",
+                smolvm.display()
+            )),
+        }
+    }
     let runtime = resolve_runtime(args.runtime, docker)?;
     let mut lume_bin = None;
     let mut mac_base_vm = None;
@@ -298,7 +331,9 @@ pub async fn up(ctx: &Ctx, args: UpArgs) -> Result<i32, Failure> {
         data_dir,
         runtime,
         mac_base_vm,
+        image_tag: args.image_tag.clone(),
         lume_bin,
+        docker_host,
         dev: args.dev,
         api_url: api_url_for(&base_domain, port),
         dashboard_url: dashboard_url_for(&base_domain, port),
@@ -465,6 +500,7 @@ fn start_process(plan: &UpPlan) -> Result<DaemonState, Failure> {
         .map_err(|e| Failure::local(format!("{}: {e}", log_path.display())))?;
     let child = Command::new(&plan.warrend)
         .args(plan.warrend_args())
+        .envs(plan.docker_host.iter().map(|h| ("DOCKER_HOST", h.as_str())))
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(err)
@@ -535,6 +571,8 @@ pub struct LaunchdParams<'a> {
     pub log_path: &'a Path,
     /// Directories prepended to the PATH launchd gives the daemon (where `lume` lives).
     pub extra_path: &'a [PathBuf],
+    /// Extra environment variables for the daemon (`DOCKER_HOST` for the smolvm engine).
+    pub env: &'a [(String, String)],
 }
 
 /// Fill the LaunchAgent template: placeholders, the `ProgramArguments`
@@ -588,6 +626,22 @@ pub fn render_launchd_plist(template: &str, p: &LaunchdParams<'_>) -> String {
             &format!("<string>{}:/opt/homebrew/bin:", prefix.join(":")),
         );
     }
+    // Extra environment: entries appended inside the EnvironmentVariables dict.
+    if !p.env.is_empty()
+        && let Some(start) = out.find("<key>EnvironmentVariables</key>")
+        && let Some(open) = out[start..].find("<dict>")
+    {
+        let at = start + open + "<dict>".len();
+        let mut body = String::new();
+        for (k, v) in p.env {
+            body.push_str(&format!(
+                "\n\t\t<key>{}</key>\n\t\t<string>{}</string>",
+                xml_escape(k),
+                xml_escape(v)
+            ));
+        }
+        out.insert_str(at, &body);
+    }
     out.replace("__HOME__", &xml_escape(&home))
 }
 
@@ -608,6 +662,11 @@ fn install_launchd(plan: &UpPlan, home: &Path) -> Result<DaemonState, Failure> {
         .into_iter()
         .collect();
     let args = plan.warrend_args();
+    let env: Vec<(String, String)> = plan
+        .docker_host
+        .iter()
+        .map(|h| ("DOCKER_HOST".to_string(), h.clone()))
+        .collect();
     let body = render_launchd_plist(
         LAUNCHD_TEMPLATE,
         &LaunchdParams {
@@ -618,6 +677,7 @@ fn install_launchd(plan: &UpPlan, home: &Path) -> Result<DaemonState, Failure> {
             working_dir: &plan.data_dir,
             log_path: &log_path,
             extra_path: &extra,
+            env: &env,
         },
     );
     fs::write(&plist_path, body)
@@ -1477,6 +1537,61 @@ pub async fn lume_host_status() -> Option<Value> {
     resp.json::<Value>().await.ok()
 }
 
+/// The smolvm binary: on PATH, or the newest release layout under
+/// `~/.local/smolvm/<version>/smolvm`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn find_smolvm() -> Option<PathBuf> {
+    if let Some(p) = find_in_path("smolvm") {
+        return Some(p);
+    }
+    let home = std::env::var_os("HOME")?;
+    let base = Path::new(&home).join(".local/smolvm");
+    let mut dirs: Vec<PathBuf> = fs::read_dir(&base)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    dirs.into_iter()
+        .rev()
+        .map(|d| d.join("smolvm"))
+        .find(|p| p.is_file())
+}
+
+/// Register smolvm's Docker Engine API with a private state directory under
+/// `data_dir` (idempotent; `smolvm --state-dir <dir> engine`) and return the
+/// Unix socket it serves, which launchd opens on demand.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn start_smolvm_engine(smolvm: &Path, data_dir: &Path) -> Result<PathBuf, String> {
+    let state = data_dir.join("smolvm");
+    fs::create_dir_all(&state).map_err(|e| format!("{}: {e}", state.display()))?;
+    let out = Command::new(smolvm)
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("engine")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("{}: {e}", smolvm.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`smolvm engine` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let sock = state.join(".smolvm/run/docker.sock");
+    for _ in 0..40 {
+        if sock.exists() {
+            return Ok(sock);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Err(format!(
+        "the engine registered but its socket {} did not appear",
+        sock.display()
+    ))
+}
+
 /// Whether `docker info` succeeds for this user.
 pub fn docker_ok() -> bool {
     run_ok("docker", &["info"]).is_ok()
@@ -1870,7 +1985,9 @@ mod tests {
             data_dir: PathBuf::from("/tmp/w"),
             runtime: "none".into(),
             mac_base_vm: Some("warren-macos-26".into()),
+            image_tag: None,
             lume_bin: Some(PathBuf::from("/Users/u/.local/bin/lume")),
+            docker_host: None,
             dev: true,
             api_url: "http://api.warren.localhost:7357".into(),
             dashboard_url: "http://warren.localhost:7357/".into(),
@@ -1920,6 +2037,7 @@ mod tests {
                 working_dir: Path::new("/Users/alice/Library/Application Support/Warren"),
                 log_path: Path::new("/Users/alice/Library/Logs/Warren/warrend.log"),
                 extra_path: &extra,
+                env: &[],
             },
         );
         assert!(

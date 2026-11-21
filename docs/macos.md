@@ -115,6 +115,9 @@ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$(command -v 
 cannot run it itself. Instances with `network: allow-all` and no secrets do not
 use the broker and are unaffected.
 
+Linux instances on the same Mac, through Docker Desktop or the smolvm
+engine, are covered in [linux-on-mac.md](linux-on-mac.md).
+
 ## Constraints that shape everything
 
 - macOS guests run only on Apple silicon Macs (Virtualization.framework), and

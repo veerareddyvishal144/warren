@@ -62,3 +62,15 @@ In plain terms, as of this release:
 - Apple's licence terms for virtual macOS: [macOS Tahoe SLA](https://www.apple.com/legal/sla/docs/macOSTahoe.pdf).
 - Tart: [github.com/cirruslabs/tart](https://github.com/cirruslabs/tart). Lume: [github.com/trycua/cua](https://github.com/trycua/cua).
 - Warren's own numbers: [benchmarks.md](benchmarks.md), measured on 2026-11-19.
+
+## smolvm as an engine under Warren
+
+smolvm is not only a competitor on the table above: its Docker Engine API mode
+(`smolvm engine`) lets Warren's existing Docker runtime run Linux instances
+as libkrun microVMs on a Mac with no Docker Desktop. Warren adds what smolvm
+leaves to the caller: the API, persistence across stop and start, URLs, the
+egress broker, workspaces and keys, and the agent integrations. Measured on
+this Mac: a `warren-base` instance created and running in 8 s through the
+engine, exec, sleep, wake and delete through the normal API. Memory
+checkpoints and live branching are not reachable through the Docker API and
+would need a native smolvm runtime; see [linux-on-mac.md](linux-on-mac.md).

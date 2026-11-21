@@ -43,7 +43,7 @@ CORS: only trusted origins are granted. On an instance host the trusted origins 
 }
 ```
 
-`url` is derived from the base domain; `runtime` is `docker`, `firecracker` or `lume`. `type` is `default` (gVisor container), `vm` (Firecracker microVM) or `mac` (macOS VM through Lume on an Apple silicon host; see [macos.md](macos.md)).
+`url` is derived from the base domain; `runtime` is `docker`, `firecracker` or `lume`. `published_ports` appears only on hosts that cannot route to the instance's network (macOS hosts with Docker Desktop or the smolvm engine, `--docker-publish-ports`): a map of instance port to the `127.0.0.1` port the daemon proxies through, for example `{"3737": 54321, "7681": 54322}`; preview URLs for ports outside the map answer `400 not_supported` there. `type` is `default` (gVisor container), `vm` (Firecracker microVM) or `mac` (macOS VM through Lume on an Apple silicon host; see [macos.md](macos.md)).
 
 ## Sandbox API (`/v1`)
 

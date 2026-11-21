@@ -17,7 +17,7 @@ use warren_core::{
     NetworkMode, PatchInstanceRequest, Result, Runtime, STOP_GRACE_SECS, SecretSpec, ShapeRequest,
     Template, Workspace, broker,
     errors::{CODE_HOST_CAPACITY_REACHED, is_requires_restart},
-    ids, shapes,
+    ids, join_host_port, shapes,
 };
 
 use crate::{
@@ -1212,5 +1212,29 @@ impl Lifecycle for Manager {
             return Err(Error::bad_gateway("instance has no address"));
         }
         Ok((inst.ip, inst.instance_token))
+    }
+
+    async fn gateway_upstream(&self, id: &str, port: u16) -> Result<(String, String)> {
+        let inst = self.deps.store.get_instance(id).await?;
+        if inst.status != InstanceStatus::Running {
+            return Err(conflict_for(&inst));
+        }
+        if inst.ip.is_empty() {
+            return Err(Error::bad_gateway("instance has no address"));
+        }
+        if inst.published_ports.is_empty() {
+            return Ok((join_host_port(&inst.ip, port), inst.instance_token));
+        }
+        match inst.published_ports.get(&port) {
+            Some(host_port) => Ok((join_host_port(&inst.ip, *host_port), inst.instance_token)),
+            None => Err(Error::not_supported(format!(
+                "port {port} of instance {id} is not published on this host; published ports: {}",
+                inst.published_ports
+                    .keys()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
     }
 }

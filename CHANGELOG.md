@@ -4,7 +4,9 @@ All notable changes to Warren are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- Linux instances on macOS hosts: Docker instances publish their gateway and terminal ports on 127.0.0.1 (`--docker-publish-ports`, default on macOS) because the host cannot route to Docker networks; the instance object reports `published_ports`. `--runtime auto` accepts an engine that offers neither `runsc` nor `runc`, which makes the smolvm engine (one libkrun microVM per instance, no Docker Desktop) a supported Linux engine on a Mac; see `docs/linux-on-mac.md`.
 
 ## [0.1.0] - 2026-11-21
 

@@ -21,6 +21,7 @@ On an Apple silicon Mac with Lume and a base image, `warren up` serves macOS ins
 | Feature | What you get |
 |---|---|
 | Persistent computers | Linux: Debian 12 with Node 24, Python 3, git and build tools, `/home/agent` persists across sleep, stop, restart, resize and template updates. macOS: a full macOS guest whose disk is the home. |
+| Linux sandboxes on a Mac | Without Docker Desktop: the [smolvm engine](docs/linux-on-mac.md) runs each Linux instance as its own microVM on Apple silicon; Docker Desktop works too. The daemon publishes instance ports on loopback where the host cannot route to containers. |
 | Real macOS instances | A macOS VM per instance on an Apple silicon Mac (`warren-macos` template, type `mac`): Xcode, the Simulator, Safari, anything that needs macOS. Same API, URLs, gateway and crons as every other instance. |
 | Sleep with memory | macOS instances suspend in 3 to 4 s and resume in 5 to 11 s with every process intact and the same pids. Linux instances keep their disk across sleep; memory checkpoints are on the roadmap. |
 | Fork, backup, restore, resize | Copy an instance with its disk, take backups without stopping, restore, grow the disk or change the shape. On macOS forks and backups are APFS clones: instant, sharing blocks until writes diverge. |

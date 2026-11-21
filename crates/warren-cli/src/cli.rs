@@ -147,6 +147,10 @@ pub struct UpArgs {
     /// macOS: the Lume base VM for mac instances (default warren-macos-26).
     #[arg(long, value_name = "NAME")]
     pub mac_base_vm: Option<String>,
+    /// Tag of the built-in images the daemon uses (`warren/base:<tag>` and
+    /// friends); the images must exist in the Docker engine (default dev).
+    #[arg(long, value_name = "TAG")]
+    pub image_tag: Option<String>,
     /// Container runtime: auto (Docker when reachable), none (no Docker) or docker (Docker required).
     #[arg(long, value_enum, default_value_t = RuntimeChoice::Auto)]
     pub runtime: RuntimeChoice,

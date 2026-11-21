@@ -112,6 +112,7 @@ fn inst(id: &str, workspace_id: &str, status: InstanceStatus, created_at: i64) -
         ip: "172.30.0.7".into(),
         storage_path: format!("/var/lib/warren/instances/{id}"),
         instance_token: "tok3n".into(),
+        published_ports: Default::default(),
         broker_env: BTreeMap::new(),
         disk_used_bytes: 123_456,
     }
@@ -435,8 +436,8 @@ async fn version_1_database_upgrades_to_version_2_and_round_trips() {
         .unwrap();
     assert_eq!(
         versions,
-        vec![1, 2, 3],
-        "version 1 kept, versions 2 and 3 recorded"
+        vec![1, 2, 3, 4],
+        "version 1 kept, versions 2 to 4 recorded"
     );
 
     let ledger_tables: i64 = store
@@ -509,7 +510,7 @@ async fn version_1_database_upgrades_to_version_2_and_round_trips() {
     let again = SqliteStore::open(&path).expect("reopen");
     assert_eq!(
         again.run(|c| migrations::current_version(c)).await.unwrap(),
-        3
+        4
     );
 }
 

@@ -58,8 +58,9 @@ pub(crate) struct Selection {
 /// Decide the OCI runtime from the configured preference and what the daemon offers.
 ///
 /// `runsc` requires gVisor; `runc` (or an empty preference) is always accepted;
-/// `auto` prefers runsc and falls back to runc; any other name must be registered
-/// with the daemon.
+/// `auto` prefers runsc, falls back to runc, and on an engine that offers
+/// neither (smolvm's Docker API, where every container is a microVM) takes
+/// the runtime it does offer; any other name must be registered with the daemon.
 pub(crate) fn select_runtime(preference: &str, available: &BTreeSet<String>) -> Result<Selection> {
     let has_runsc = available.contains("runsc");
     let pick = |name: &str, fell_back: bool| Selection {
@@ -73,7 +74,10 @@ pub(crate) fn select_runtime(preference: &str, available: &BTreeSet<String>) -> 
         )),
         "" | "runc" => Ok(pick("runc", false)),
         "auto" if has_runsc => Ok(pick("runsc", false)),
-        "auto" => Ok(pick("runc", true)),
+        "auto" if available.contains("runc") || available.is_empty() => Ok(pick("runc", true)),
+        // An engine that offers neither (smolvm's Docker API offers only
+        // `smolvm`, a microVM per container): take what it has.
+        "auto" => Ok(pick(available.iter().next().expect("non-empty"), false)),
         other if available.contains(other) => Ok(pick(other, false)),
         other => {
             let offered = available.iter().cloned().collect::<Vec<_>>().join(", ");
@@ -521,6 +525,14 @@ mod tests {
             Selection {
                 name: "runc".into(),
                 fell_back: true
+            }
+        );
+        // smolvm's Docker API offers only its own runtime: auto takes it.
+        assert_eq!(
+            select_runtime("auto", &offered(&["smolvm"])).unwrap(),
+            Selection {
+                name: "smolvm".into(),
+                fell_back: false
             }
         );
         assert_eq!(select_runtime("runsc", &both).unwrap().name, "runsc");

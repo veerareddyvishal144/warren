@@ -75,7 +75,6 @@ async fn serve(
     }
     let inst = edge.lifecycle.ensure_awake(id).await?;
     edge.lifecycle.record_activity(id);
-    let (ip, token) = edge.lifecycle.gateway_credentials(id).await?;
     let port = if host_port == 0 {
         inst.default_port
     } else {
@@ -84,17 +83,18 @@ async fn serve(
     if port == 0 {
         return Ok((StatusCode::BAD_GATEWAY, NO_DEFAULT_PORT).into_response());
     }
-    forward(edge, req, host, id, &ip, port, &token).await
+    let (authority, token) = edge.lifecycle.gateway_upstream(id, port).await?;
+    forward(edge, req, host, id, &authority, &token).await
 }
 
-/// Send the request to `ip:port` and relay the answer, tunnelling upgrades.
+/// Send the request to `authority` (`host:port`) and relay the answer,
+/// tunnelling upgrades.
 async fn forward(
     edge: &Edge,
     mut req: Request,
     host: &str,
     id: &str,
-    ip: &str,
-    port: u16,
+    authority: &str,
     token: &str,
 ) -> Result<Response> {
     // hyper parks the client's pending upgrade in the extensions. Taking it
@@ -106,7 +106,6 @@ async fn forward(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip());
-    let authority = headers::authority(ip, port);
     let method = req.method().clone();
     let target = req
         .uri()
@@ -114,7 +113,7 @@ async fn forward(
         .map_or_else(|| "/".to_string(), |p| p.as_str().to_string());
     let upstream = build_upstream(
         req,
-        &authority,
+        authority,
         host,
         &edge.config.public_scheme,
         peer,

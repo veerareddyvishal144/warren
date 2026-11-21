@@ -48,6 +48,13 @@ struct Args {
     /// off for a hosted service.
     #[arg(long, env = "WARREN_ALLOW_PRIVATE_EGRESS", default_value_t = false)]
     allow_private_egress: bool,
+    /// Publish each Docker instance's gateway and terminal ports on 127.0.0.1
+    /// and reach it there instead of its container address. Needed on macOS
+    /// hosts (Docker Desktop, the smolvm engine), where the host cannot route
+    /// to Docker networks; preview ports other than the terminal are then not
+    /// reachable. Default: on for macOS hosts.
+    #[arg(long, env = "WARREN_DOCKER_PUBLISH_PORTS", default_value_t = cfg!(target_os = "macos"))]
+    docker_publish_ports: bool,
     /// Where the egress broker (allowlist proxy and secret routes) listens;
     /// it must be reachable from the instances' networks. `none` runs without
     /// a broker, which refuses `allowlist` instances and secrets.
@@ -118,6 +125,7 @@ impl Args {
             dev_mode: dev,
             signup_enabled: self.signup_enabled,
             allow_private_egress: self.allow_private_egress,
+            docker_publish_ports: self.docker_publish_ports,
             broker_listen: self.broker_listen,
             broker_advertise_addr: self
                 .broker_advertise

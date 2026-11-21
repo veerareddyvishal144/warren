@@ -15,13 +15,13 @@ use std::{
 use bollard::{
     models::{
         ContainerCreateBody, ContainerInspectResponse, ContainerUpdateBody, HostConfig,
-        RestartPolicy, RestartPolicyNameEnum,
+        PortBinding, PortMap, RestartPolicy, RestartPolicyNameEnum,
     },
     query_parameters::{CreateContainerOptions, RemoveContainerOptions, StopContainerOptions},
 };
 use tokio::net::TcpStream;
 use warren_core::{
-    Error, GATEWAY_PORT, Instance, NetworkMode, Result, RunInfo, Shape, Template,
+    Error, GATEWAY_PORT, Instance, NetworkMode, Result, RunInfo, Shape, TERMINAL_PORT, Template,
     errors::requires_restart,
 };
 
@@ -44,6 +44,9 @@ pub(crate) struct ContainerSpec<'a> {
     pub(crate) image: &'a str,
     /// Add `host.docker.internal` pointing at the host gateway.
     pub(crate) dev_mode: bool,
+    /// Publish the gateway and terminal ports on 127.0.0.1 (hosts that cannot
+    /// route to the container network).
+    pub(crate) publish_ports: bool,
     /// Override the image's command (tests use it to keep a shell image alive).
     /// With an injection it replaces the image's `Cmd` inside the wrapped command.
     pub(crate) cmd: Option<Vec<String>>,
@@ -97,6 +100,50 @@ pub(crate) fn pick_ip(inspect: &ContainerInspectResponse, preferred: &str) -> Op
     let mut others: Vec<_> = networks.iter().collect();
     others.sort_by(|a, b| a.0.cmp(b.0));
     others.into_iter().find_map(|(_, e)| address(&e.ip_address))
+}
+
+/// Port bindings for the published mode: the gateway and terminal ports on a
+/// free 127.0.0.1 port each, assigned by the engine.
+pub(crate) fn published_port_bindings() -> PortMap {
+    [GATEWAY_PORT, TERMINAL_PORT]
+        .into_iter()
+        .map(|p| {
+            (
+                format!("{p}/tcp"),
+                Some(vec![PortBinding {
+                    host_ip: Some("127.0.0.1".to_string()),
+                    host_port: Some(String::new()),
+                }]),
+            )
+        })
+        .collect()
+}
+
+/// The guest-to-host port map Docker reports after start (`3737/tcp` ->
+/// `54321`); empty when nothing is published.
+pub(crate) fn published_ports(inspect: &ContainerInspectResponse) -> BTreeMap<u16, u16> {
+    let mut out = BTreeMap::new();
+    let Some(ports) = inspect
+        .network_settings
+        .as_ref()
+        .and_then(|n| n.ports.as_ref())
+    else {
+        return out;
+    };
+    for (key, bindings) in ports {
+        let Some(guest) = key.strip_suffix("/tcp").and_then(|p| p.parse::<u16>().ok()) else {
+            continue;
+        };
+        let host = bindings
+            .iter()
+            .flatten()
+            .filter_map(|b| b.host_port.as_deref())
+            .find_map(|p| p.parse::<u16>().ok());
+        if let Some(host) = host {
+            out.insert(guest, host);
+        }
+    }
+    out
 }
 
 /// Whether Docker reports the container as running.
@@ -153,6 +200,7 @@ pub(crate) fn create_body(
         extra_hosts: spec
             .dev_mode
             .then(|| vec!["host.docker.internal:host-gateway".to_string()]),
+        port_bindings: spec.publish_ports.then(published_port_bindings),
         ..Default::default()
     };
     let mut labels = HashMap::from([
@@ -228,6 +276,7 @@ impl DockerRuntime {
             home: &home,
             image: &image,
             dev_mode: self.cfg.dev_mode,
+            publish_ports: self.cfg.docker_publish_ports,
             cmd,
             inject,
         };
@@ -289,7 +338,19 @@ impl DockerRuntime {
             inst.runtime_ref = id.to_string();
         }
         let network = network_for(inst.network);
-        let Some(ip) = pick_ip(&inspect, network) else {
+        let published = if self.cfg.docker_publish_ports {
+            published_ports(&inspect)
+        } else {
+            BTreeMap::new()
+        };
+        let picked = if self.cfg.docker_publish_ports {
+            // The host reaches the instance through the published loopback
+            // ports; the container address is left out of the row on purpose.
+            (!published.is_empty()).then(|| "127.0.0.1".to_string())
+        } else {
+            pick_ip(&inspect, network)
+        };
+        let Some(ip) = picked else {
             let logs = self.tail_logs(&reference, 30).await;
             if !is_running(&inspect) {
                 // Gone before it was inspected: the same template problem
@@ -307,16 +368,27 @@ impl DockerRuntime {
             )));
         };
         match readiness_port(inst) {
-            Some(port) => self
-                .wait_for_port(inst, &reference, &ip, port)
-                .await
-                .map_err(|e| explain_missing_gateway(e, &inspect))?,
+            Some(port) => {
+                let target = if published.is_empty() {
+                    port
+                } else {
+                    *published.get(&port).ok_or_else(|| {
+                        Error::internal(format!(
+                            "container {reference} did not publish port {port} (published: {published:?})"
+                        ))
+                    })?
+                };
+                self.wait_for_port(inst, &reference, &ip, target)
+                    .await
+                    .map_err(|e| explain_missing_gateway(e, &inspect))?
+            }
             None => {
                 tracing::debug!(instance = %inst.id, "template has no default port; not waiting for the gateway")
             }
         }
         inst.ip = ip.clone();
-        tracing::info!(instance = %inst.id, container = %reference, %ip, "instance started");
+        inst.published_ports = published;
+        tracing::info!(instance = %inst.id, container = %reference, %ip, published = ?inst.published_ports, "instance started");
         Ok(RunInfo {
             ip,
             runtime_ref: inst.runtime_ref.clone(),
@@ -525,6 +597,50 @@ mod tests {
     use std::path::PathBuf;
 
     use bollard::models::{EndpointSettings, NetworkSettings};
+
+    #[test]
+    fn published_ports_bind_gateway_and_terminal_on_loopback_and_parse_back() {
+        let bindings = published_port_bindings();
+        let mut keys: Vec<_> = bindings.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["3737/tcp", "7681/tcp"]);
+        for b in bindings.values().flatten().flatten() {
+            assert_eq!(b.host_ip.as_deref(), Some("127.0.0.1"));
+            assert_eq!(
+                b.host_port.as_deref(),
+                Some(""),
+                "the engine picks the port"
+            );
+        }
+        let mut ports = PortMap::new();
+        ports.insert(
+            "3737/tcp".to_string(),
+            Some(vec![PortBinding {
+                host_ip: Some("127.0.0.1".into()),
+                host_port: Some("54321".into()),
+            }]),
+        );
+        ports.insert(
+            "7681/tcp".to_string(),
+            Some(vec![PortBinding {
+                host_ip: Some("127.0.0.1".into()),
+                host_port: Some("54322".into()),
+            }]),
+        );
+        ports.insert("9999/udp".to_string(), None);
+        let inspect = ContainerInspectResponse {
+            network_settings: Some(NetworkSettings {
+                ports: Some(ports),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let map = published_ports(&inspect);
+        assert_eq!(map.get(&3737), Some(&54321));
+        assert_eq!(map.get(&7681), Some(&54322));
+        assert_eq!(map.len(), 2);
+        assert!(published_ports(&ContainerInspectResponse::default()).is_empty());
+    }
     use warren_core::{ENV_INSTANCE_ID, ENV_INSTANCE_TOKEN, TemplateScope};
 
     use super::*;
@@ -567,6 +683,7 @@ mod tests {
             home,
             image: "warren/base:dev",
             dev_mode,
+            publish_ports: false,
             cmd: None,
             inject: None,
         }

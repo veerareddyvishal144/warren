@@ -582,8 +582,6 @@ fn header_helpers() {
     );
     assert!(headers::forwarded_for(&http::HeaderMap::new(), None).is_none());
 
-    assert_eq!(headers::authority("10.1.2.3", 80), "10.1.2.3:80");
-    assert_eq!(headers::authority("fd00::1", 3737), "[fd00::1]:3737");
     assert!(headers::is_hop_by_hop(&http::header::TRANSFER_ENCODING));
     assert!(!headers::is_hop_by_hop(&http::header::AUTHORIZATION));
 }

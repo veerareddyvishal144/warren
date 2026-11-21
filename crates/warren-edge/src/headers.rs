@@ -136,12 +136,3 @@ pub(crate) fn forwarded_for(headers: &HeaderMap, peer: Option<IpAddr>) -> Option
         HeaderValue::from_str(&chain.join(", ")).ok()
     }
 }
-
-/// `host:port`, bracketing IPv6 literals.
-pub(crate) fn authority(ip: &str, port: u16) -> String {
-    if ip.contains(':') && !ip.starts_with('[') {
-        format!("[{ip}]:{port}")
-    } else {
-        format!("{ip}:{port}")
-    }
-}

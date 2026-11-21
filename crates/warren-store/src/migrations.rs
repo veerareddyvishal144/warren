@@ -33,7 +33,17 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "egress_allowlist_and_secrets",
         sql: V3_ALLOWLIST_AND_SECRETS,
     },
+    Migration {
+        version: 4,
+        name: "published_ports",
+        sql: V4_PUBLISHED_PORTS,
+    },
 ];
+
+/// Host ports standing in for instance ports on hosts that cannot route to
+/// the instance network (a JSON object `{"3737": 54321}` on the row).
+const V4_PUBLISHED_PORTS: &str =
+    "ALTER TABLE instances ADD COLUMN published_ports TEXT NOT NULL DEFAULT '{}';";
 
 const BOOTSTRAP: &str = "CREATE TABLE IF NOT EXISTS migrations (
     version    INTEGER PRIMARY KEY,

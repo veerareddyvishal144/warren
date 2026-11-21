@@ -306,6 +306,23 @@ pub trait Lifecycle: Send + Sync {
     async fn gateway_credentials(&self, id: &str) -> Result<(String, String)> {
         Ok((self.endpoint(id).await?, String::new()))
     }
+    /// `host:port` to connect to for `port` inside the instance, with the
+    /// gateway token: the instance address with `port`, unless the host
+    /// publishes instance ports (`Instance::published_ports`), in which case
+    /// the published one. The edge and the cron scheduler use this.
+    async fn gateway_upstream(&self, id: &str, port: u16) -> Result<(String, String)> {
+        let (ip, token) = self.gateway_credentials(id).await?;
+        Ok((join_host_port(&ip, port), token))
+    }
+}
+
+/// `host:port`, bracketing IPv6 addresses.
+pub fn join_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 /// Resolves names and pins, lists the catalog, registers workspace images.

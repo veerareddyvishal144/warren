@@ -54,6 +54,7 @@ pub(crate) const COLS: &[&str] = &[
     "storage_path",
     "instance_token",
     "disk_used_bytes",
+    "published_ports",
 ];
 
 static SELECT: LazyLock<String> =
@@ -95,6 +96,7 @@ fn read(row: &Row<'_>) -> rusqlite::Result<Instance> {
         env: col_json(row, "env")?,
         network: col_parse(row, "network", NetworkMode::parse)?,
         allowed_domains: col_json(row, "allowed_domains")?,
+        published_ports: col_json(row, "published_ports")?,
         auto_sleep: row.get("auto_sleep")?,
         idle_timeout_seconds: row.get("idle_timeout_seconds")?,
         url: String::new(),
@@ -126,6 +128,8 @@ fn write(conn: &Connection, sql: &str, inst: &Instance) -> rusqlite::Result<usiz
     let env = to_json(&inst.env)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.to_string().into()))?;
     let allowed_domains = to_json(&inst.allowed_domains)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.to_string().into()))?;
+    let published_ports = to_json(&inst.published_ports)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.to_string().into()))?;
     let kind = inst.kind.as_str();
     let status = inst.status.as_str();
@@ -167,6 +171,7 @@ fn write(conn: &Connection, sql: &str, inst: &Instance) -> rusqlite::Result<usiz
         ":storage_path": inst.storage_path,
         ":instance_token": inst.instance_token,
         ":disk_used_bytes": inst.disk_used_bytes,
+        ":published_ports": published_ports,
     };
     let mut stmt = conn.prepare_cached(sql)?;
     for (name, value) in binds {
