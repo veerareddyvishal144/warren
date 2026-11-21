@@ -75,6 +75,24 @@ struct Args {
     firecracker_bin: PathBuf,
     #[arg(long, env = "WARREN_KERNEL_IMAGE")]
     kernel: Option<PathBuf>,
+    /// Launch microVMs through the Firecracker jailer at this path: a chroot per
+    /// instance under <data-dir>/firecracker/jail, the process dropped to
+    /// --firecracker-jail-uid/gid, seccomp on. Unset runs firecracker directly.
+    #[arg(long, env = "WARREN_FIRECRACKER_JAILER", value_name = "PATH")]
+    firecracker_jailer: Option<PathBuf>,
+    /// Unprivileged uid the jailer switches to (need not exist in /etc/passwd).
+    #[arg(long, env = "WARREN_FIRECRACKER_JAIL_UID", default_value_t = warren_core::config::DEFAULT_FIRECRACKER_JAIL_ID, value_name = "UID")]
+    firecracker_jail_uid: u32,
+    /// Unprivileged gid the jailer switches to.
+    #[arg(long, env = "WARREN_FIRECRACKER_JAIL_GID", default_value_t = warren_core::config::DEFAULT_FIRECRACKER_JAIL_ID, value_name = "GID")]
+    firecracker_jail_gid: u32,
+    /// Run microVMs without the per-shape disk and network rate limits.
+    #[arg(
+        long,
+        env = "WARREN_FIRECRACKER_NO_RATE_LIMITS",
+        default_value_t = false
+    )]
+    firecracker_no_rate_limits: bool,
     /// Static warren-gateway binary injected into registered images; found next to
     /// warrend or in /usr/local/bin when unset.
     #[arg(long, env = "WARREN_GATEWAY_BIN")]
@@ -132,6 +150,10 @@ impl Args {
             enable_firecracker: self.firecracker,
             firecracker_bin: self.firecracker_bin,
             kernel_image: self.kernel,
+            firecracker_jailer: self.firecracker_jailer,
+            firecracker_jail_uid: self.firecracker_jail_uid,
+            firecracker_jail_gid: self.firecracker_jail_gid,
+            firecracker_rate_limits: !self.firecracker_no_rate_limits,
             gateway_bin: Config::resolve_gateway_bin(self.gateway_bin),
             mac_base_vm: self.mac_base_vm.filter(|v| !v.trim().is_empty()),
             lume_api_url: self.lume_api,

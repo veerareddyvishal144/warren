@@ -1924,3 +1924,219 @@ async fn vm_create_exec_body(cx: Ctx) -> Result<()> {
     cx.ws.delete_and_wait(id).await?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// vm_sleep_keeps_memory (WARREN_E2E_VM=1 only)
+
+/// The marker process of `scripts/mac/e2e.sh`: a `nohup sleep` the way an
+/// agent leaves a server behind. `[s]leep` keeps pgrep from matching the
+/// shell that runs it.
+const MARKER_START: &str = "nohup sleep 100000 </dev/null >/dev/null 2>&1 & echo started";
+const MARKER_FIND: &str = "pgrep -f '[s]leep 100000' || true";
+
+#[tokio::test]
+#[ignore]
+async fn vm_sleep_keeps_memory() {
+    if !Daemon::vm_requested() {
+        eprintln!(
+            "vm_sleep_keeps_memory: skipped; set WARREN_E2E_VM=1 (needs root, /dev/kvm, firecracker and a kernel)"
+        );
+        return;
+    }
+    run_case("vm_sleep_keeps_memory", vm_sleep_keeps_memory_body).await
+}
+
+/// Pid of the marker inside the instance; empty when it is gone.
+async fn marker_pid(cx: &Ctx, id: &str) -> Result<String> {
+    let r = cx.ws.sdk().exec(id, &cmd(MARKER_FIND)).await?;
+    ensure!(r.exit_code == 0, "pgrep in the vm: {r:?}");
+    Ok(r.stdout.trim().to_string())
+}
+
+/// A host process whose command line contains `marker`, from `/proc`
+/// (Linux, where the vm scenario runs; `None` elsewhere).
+fn host_process_with(marker: &str) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if let Ok(bytes) = std::fs::read(entry.path().join("cmdline"))
+                && String::from_utf8_lossy(&bytes).contains(marker)
+            {
+                return Some(pid);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = marker;
+        None
+    }
+}
+
+/// Sleep with memory on a Firecracker instance: a background process started
+/// before the sleep is alive with the same pid after the wake, the VM process
+/// is gone while asleep and a snapshot as large as the guest's RAM sits in the
+/// instance directory, the snapshot is removed after the restore, and a stop
+/// while asleep discards it so the next start boots cold.
+async fn vm_sleep_keeps_memory_body(cx: Ctx) -> Result<()> {
+    ensure!(
+        cx.daemon.vm_enabled(),
+        "the daemon does not report the firecracker runtime: {}",
+        cx.daemon.health()
+    );
+    let sdk = cx.ws.sdk();
+    let req = CreateInstanceRequest {
+        template: Some("warren-base".into()),
+        kind: Some(InstanceType::Vm),
+        ..Default::default()
+    };
+    let inst = sdk.create_instance(&req).await?;
+    let inst = cx.ws.wait_running(&inst.id).await?;
+    let id = inst.id.as_str();
+    let vm_dir = cx.daemon.data_dir().join("instances").join(id).join("vm");
+    let vm_marker = vm_dir.to_string_lossy().into_owned();
+    let snapshot = vm_dir.join("snapshot");
+    ensure!(
+        host_process_with(&vm_marker).is_some(),
+        "a firecracker process for {id} runs with {} on its command line",
+        vm_dir.display()
+    );
+
+    // The marker, and its pid.
+    let r = sdk.exec(id, &cmd(MARKER_START)).await?;
+    ensure!(
+        r.exit_code == 0 && r.stdout.contains("started"),
+        "start the marker: {r:?}"
+    );
+    let pid_before = marker_pid(&cx, id).await?;
+    ensure!(
+        !pid_before.is_empty(),
+        "marker process not found right after starting it"
+    );
+
+    // Sleep: the process is gone, the memory is on disk.
+    let answer = sdk.sleep(id).await?;
+    ensure!(
+        answer.status == InstanceStatus::Sleeping,
+        "sleep answers sleeping: {answer:?}"
+    );
+    cx.ws
+        .wait_for_status(id, InstanceStatus::Sleeping, TRANSITION_TIMEOUT)
+        .await?;
+    ensure!(
+        host_process_with(&vm_marker).is_none(),
+        "the firecracker process of {id} is gone while asleep"
+    );
+    ensure!(!vm_dir.join("pid").exists(), "no pid file while asleep");
+    ensure!(
+        snapshot.join("vmstate").is_file() && snapshot.join("meta.json").is_file(),
+        "snapshot files under {}",
+        snapshot.display()
+    );
+    let mem_len = std::fs::metadata(snapshot.join("mem"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let ram = u64::from(inst.shape.memory) << 30;
+    ensure!(
+        mem_len == ram,
+        "the memory file is as large as the guest's RAM: {mem_len} bytes for a {} GB shape",
+        inst.shape.memory
+    );
+    let meta_text = std::fs::read_to_string(snapshot.join("meta.json"))
+        .map_err(|e| fail(format!("read meta.json: {e}")))?;
+    let meta: Value =
+        serde_json::from_str(&meta_text).map_err(|e| fail(format!("parse meta.json: {e}")))?;
+    ensure!(
+        meta["firecracker_version"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty()),
+        "meta.json records the Firecracker version: {meta}"
+    );
+
+    // Wake: the same process tree, the same pid.
+    let answer = sdk.start(id).await?;
+    ensure!(
+        matches!(
+            answer.status,
+            InstanceStatus::Waking | InstanceStatus::Starting | InstanceStatus::Running
+        ),
+        "start answers waking: {answer:?}"
+    );
+    let woke = cx.ws.wait_running(id).await?;
+    ensure!(
+        woke.status == InstanceStatus::Running,
+        "running after the wake"
+    );
+    let pid_after = marker_pid(&cx, id).await?;
+    ensure!(
+        !pid_after.is_empty(),
+        "marker process is gone after the wake (memory was not preserved)"
+    );
+    ensure!(
+        pid_after == pid_before,
+        "marker pid changed across sleep and wake: {pid_before} -> {pid_after}"
+    );
+    ensure!(
+        !snapshot.join("mem").exists(),
+        "the snapshot is single-use and removed after the restore"
+    );
+    let r = sdk
+        .exec(
+            id,
+            &cmd(&format!(
+                "echo awake > {0}/awake.txt && cat {0}/awake.txt",
+                inst.mount_path
+            )),
+        )
+        .await?;
+    ensure!(
+        r.stdout.trim() == "awake",
+        "the restored guest's disk is writable: {r:?}"
+    );
+
+    // A stop while asleep discards the snapshot; the next start boots cold.
+    sdk.sleep(id).await?;
+    cx.ws
+        .wait_for_status(id, InstanceStatus::Sleeping, TRANSITION_TIMEOUT)
+        .await?;
+    ensure!(
+        snapshot.join("mem").is_file(),
+        "the second sleep saved the memory again"
+    );
+    let answer = sdk.stop(id).await?;
+    ensure!(
+        settles(
+            answer.status,
+            InstanceStatus::Stopping,
+            InstanceStatus::Stopped
+        ),
+        "stop answers stopping: {answer:?}"
+    );
+    cx.ws
+        .wait_for_status(id, InstanceStatus::Stopped, TRANSITION_TIMEOUT)
+        .await?;
+    ensure!(
+        !snapshot.join("mem").exists(),
+        "stop discards the saved memory"
+    );
+    sdk.start(id).await?;
+    cx.ws.wait_running(id).await?;
+    ensure!(
+        marker_pid(&cx, id).await?.is_empty(),
+        "a cold boot after a stop has no marker process"
+    );
+    let r = sdk
+        .exec(id, &cmd(&format!("cat {}/awake.txt", inst.mount_path)))
+        .await?;
+    ensure!(
+        r.stdout.trim() == "awake",
+        "files written after the wake survive the stop: {r:?}"
+    );
+    cx.ws.delete_and_wait(id).await?;
+    ensure!(!vm_dir.exists(), "delete removes the vm directory");
+    Ok(())
+}

@@ -78,6 +78,10 @@ WARREN_LOG=info                         # tracing filter, e.g. info,warren_edge=
 # WARREN_ENABLE_FIRECRACKER=false       # see vm-instances.md
 # WARREN_FIRECRACKER_BIN=/usr/local/bin/firecracker
 # WARREN_KERNEL_IMAGE=
+# WARREN_FIRECRACKER_JAILER=            # path to the jailer binary; unset runs firecracker directly
+# WARREN_FIRECRACKER_JAIL_UID=61000     # unprivileged ids the jailer drops to
+# WARREN_FIRECRACKER_JAIL_GID=61000
+# WARREN_FIRECRACKER_NO_RATE_LIMITS=false   # true runs microVMs without the per-shape disk and NIC limits
 ```
 
 | Variable | Flag | Default | Notes |
@@ -95,6 +99,8 @@ WARREN_LOG=info                         # tracing filter, e.g. info,warren_edge=
 | `WARREN_SECRET` | `--secret` | generated | Rotating it invalidates every signed URL and cookie |
 | `WARREN_IMAGE_TAG` | `--image-tag` | `dev` | Tag of the built-in images |
 | `WARREN_ENABLE_FIRECRACKER`, `WARREN_FIRECRACKER_BIN`, `WARREN_KERNEL_IMAGE` | `--firecracker`, `--firecracker-bin`, `--kernel` | off | [vm-instances.md](vm-instances.md) |
+| `WARREN_FIRECRACKER_JAILER`, `WARREN_FIRECRACKER_JAIL_UID`, `WARREN_FIRECRACKER_JAIL_GID` | `--firecracker-jailer`, `--firecracker-jail-uid`, `--firecracker-jail-gid` | unset (no jailer), 61000, 61000 | Launch microVMs through the Firecracker jailer as an unprivileged user; [vm-instances.md](vm-instances.md#the-jailer) |
+| `WARREN_FIRECRACKER_NO_RATE_LIMITS` | `--firecracker-no-rate-limits` | false | Disable the per-shape disk and NIC limits on microVMs; [vm-instances.md](vm-instances.md#rate-limits) |
 | `WARREN_GATEWAY_BIN` | `--gateway-bin` | next to `warrend`, else `/usr/local/bin/warren-gateway` | Static gateway injected into registered images; the native build placed in `mac` VMs |
 | `WARREN_MAC_BASE_VM`, `WARREN_LUME_API`, `WARREN_LUME_BIN`, `WARREN_MAC_VNC` | `--mac-base-vm`, `--lume-api`, `--lume-bin`, `--mac-vnc` | off, `http://127.0.0.1:7777`, `lume`, off | `mac` instances on an Apple silicon host: [macos.md](macos.md) |
 | `WARREN_SIGNUP_ENABLED` | `--signup-enabled` | `true` | `false` makes `POST /v1/signup` answer 404 |

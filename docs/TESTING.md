@@ -157,13 +157,20 @@ unlimited) next to `awake_count`.
   killed outright, stop the orphaned `warrend` (`pkill -f 'warrend --dev'`) and
   remove its containers (`docker ps -a`).
 
-## The vm test
+## The vm tests
 
 `vm_create_exec` creates a `type: vm` instance from `warren-base`, execs in it,
-reaches its URL and deletes it. It runs only with `WARREN_E2E_VM=1`, which also
-makes every daemon the suite starts run with `--firecracker --kernel <kernel>`
-(and `--firecracker-bin <bin>` when the probe binary exists). It needs root,
-`/dev/kvm`, a Firecracker binary and a kernel:
+reaches its URL and deletes it. `vm_sleep_keeps_memory` starts a `nohup sleep`
+marker in the guest, sleeps the instance, checks on the host that the
+Firecracker process is gone and that `vm/snapshot/{vmstate,mem,meta.json}`
+exist with `mem` as large as the guest's RAM, wakes it and checks the marker is
+alive with the same pid and the snapshot files are gone; then it sleeps and
+stops the instance (the snapshot is discarded) and starts it cold (no marker).
+Both run only with `WARREN_E2E_VM=1`, which also makes every daemon the suite
+starts run with `--firecracker --kernel <kernel>` (and `--firecracker-bin <bin>`
+when the probe binary exists; `WARREN_E2E_FIRECRACKER_JAILER=<jailer>` adds
+`--firecracker-jailer` so the same scenario runs through the jailer). They need
+root, `/dev/kvm`, a Firecracker binary and a kernel:
 
 ```bash
 scripts/e2e.sh --vm                      # whole suite plus vm_*, under sudo

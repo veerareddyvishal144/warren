@@ -55,7 +55,7 @@ Timestamps are unix seconds; zero-valued ones are omitted. `url` is derived from
 | `running` | The gateway answered its health check | CPU, memory, disk | yes |
 | `stopping`, `starting`, `restarting`, `updating` | Transitions you asked for | CPU, memory, disk | yes |
 | `stopped` | Container gone, disk kept; never wakes on request | disk only | no |
-| `sleeping` | Container gone, disk kept; wakes on request | disk only | no |
+| `sleeping` | Container or VM gone, disk kept (and the saved memory for `mac` and `vm`); wakes on request | disk only (plus the memory file for `vm` and `mac`) | no |
 | `waking` | A request or exec is bringing it back | CPU, memory, disk | yes |
 | `failed` | The runtime could not start or run it; see `status_reason` | disk only | no |
 | `deleting`, `deleted` | Being destroyed, then gone | nothing | no |
@@ -115,11 +115,11 @@ A stopped instance keeps its disk and never wakes on request: its URLs answer `4
 curl -s -X POST $WARREN_API/instances/$ID/sleep -H "$AUTH"     # {"id":"ab12cd34ef","status":"sleeping"}
 ```
 
-- **Sleep stops the container and keeps the disk.** Processes and memory are gone; files under the mount path are intact. The instance reports `sleeping` and holds no CPU or memory. The exception is type `mac`: sleep suspends the VM, its memory is saved and restored on wake, so processes survive ([macos.md](macos.md)).
+- **Sleep stops the container and keeps the disk** on type `default`. Processes and memory are gone; files under the mount path are intact. The instance reports `sleeping` and holds no CPU or memory. Types `mac` and `vm` keep the memory too: `mac` suspends the VM through Lume ([macos.md](macos.md)); `vm` pauses the microVM and writes a Firecracker snapshot next to its disk (a memory file as large as the guest's RAM), and the wake resumes it with every process and pid intact ([vm-instances.md](vm-instances.md#sleep-with-memory)).
 - **Anything that reaches the instance wakes it**: a request to any of its URLs (default port or `<id>-<port>`), an exec through the Sandbox API, a cron firing. The edge holds the request while the lifecycle starts the container and waits for the gateway's health endpoint, then forwards it. Expect a few seconds; harness clients should allow a generous timeout on the first request. A wake enforces the awake quota like a start (and, for `mac`, the host's two-VM capacity).
 - **Auto-sleep** (`auto_sleep: true`) sleeps the instance once `idle_timeout_seconds` pass without activity. Activity is any proxied request or response through the edge and any exec; `last_activity_at` on the object shows the last one. The minimum timeout is 300 seconds (5 in dev mode), the maximum 86,400, the default 900. Default `auto_sleep` is `false`: an instance you create runs until you stop, sleep or delete it.
 - **Manual sleep** works regardless of `auto_sleep`.
-- **Memory checkpoints** (gVisor checkpoint/restore, Firecracker snapshots) are the roadmap item that will make wake resume processes for `default` and `vm`; `mac` already has it through Lume suspend. The API will not change.
+- **Memory checkpoints** for `default` (gVisor checkpoint/restore) are the roadmap item that will make wake resume processes there too; `vm` has it through Firecracker snapshots and `mac` through Lume suspend. The API does not change.
 
 Design a long-running service inside an instance accordingly: start it from something the first request can trigger, or keep the instance awake with `auto_sleep: false`.
 

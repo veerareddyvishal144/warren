@@ -40,7 +40,9 @@ Not yet measured. [vm-instances.md](vm-instances.md) describes a container start
 | Operation | `default` (gVisor) | `vm` (Firecracker) |
 |---|---|---|
 | Create to `running` (image already pulled) | not yet measured | not yet measured |
-| Wake from sleep (fresh boot, disk intact) | not yet measured | not yet measured |
+| Wake from sleep (fresh boot, disk intact) | not yet measured | not applicable: `vm` wakes from a snapshot (a cold boot only when the snapshot is unusable) |
+| Sleep with memory (pause, full snapshot: a memory file as large as the guest's RAM) | not applicable | not yet measured |
+| Wake from the snapshot (processes and pids kept) | not applicable | not yet measured |
 | Fork | not yet measured | not yet measured |
 | Exec round trip (`true`) | not yet measured | not yet measured |
 | Host memory per idle instance | not yet measured | not yet measured |

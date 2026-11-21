@@ -26,6 +26,7 @@
 #   WARREN_E2E_IMAGE_TAG       set automatically to WARREN_IMAGE_TAG so the daemons use the images just built
 #   WARREN_E2E_KERNEL          kernel for --vm (default /data/sandbox-probe/vmlinux-6.1.155)
 #   WARREN_E2E_FIRECRACKER_BIN firecracker binary for --vm (default /data/sandbox-probe/firecracker)
+#   WARREN_E2E_FIRECRACKER_JAILER  jailer binary: when set, the vm daemons run with --firecracker-jailer
 #
 # make build and make images need the musl toolchain for the static gateway
 # (once: make musl-setup).
@@ -110,7 +111,9 @@ if [ "$VM" = 1 ]; then
     log "running the suite including vm_* under sudo"
     exec sudo -E env "PATH=$PATH" "CARGO_HOME=$CARGO_HOME" "RUSTUP_HOME=$RUSTUP_HOME" "TMPDIR=$TMPDIR" \
         "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" "WARREN_BIN=$WARREN_BIN" "WARREN_GATEWAY_BIN=$WARREN_GATEWAY_BIN" \
-        "WARREN_E2E_VM=1" "WARREN_E2E_IMAGE_TAG=$TAG" "WARREN_E2E_LOG=${WARREN_E2E_LOG:-info}" "${CMD[@]}"
+        "WARREN_E2E_VM=1" "WARREN_E2E_IMAGE_TAG=$TAG" "WARREN_E2E_LOG=${WARREN_E2E_LOG:-info}" \
+        "WARREN_E2E_KERNEL=${WARREN_E2E_KERNEL:-}" "WARREN_E2E_FIRECRACKER_BIN=${WARREN_E2E_FIRECRACKER_BIN:-}" \
+        "WARREN_E2E_FIRECRACKER_JAILER=${WARREN_E2E_FIRECRACKER_JAILER:-}" "${CMD[@]}"
 fi
 log "running the suite (vm_create_exec is skipped without --vm)"
 exec "${CMD[@]}"

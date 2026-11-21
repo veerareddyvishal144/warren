@@ -4,7 +4,15 @@ All notable changes to Warren are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- `vm` instances sleep with their memory: `Runtime::sleep` on the Firecracker runtime syncs the guest, pauses it and writes a full snapshot (`vm/snapshot/{vmstate,mem,meta.json}`, the memory file as large as the guest's RAM, `meta.json` recording the Firecracker version, shape, address and tap) before killing the process and removing the tap; `start` recreates the tap, starts a fresh process and loads the snapshot with `resume_vm`, so every process keeps running with its pid. A snapshot is single-use and removed after the restore; `stop`, a resize to another shape, `update`, `restore` and `delete` discard it; `fork` copies the disk only. A missing, incomplete, resized or other-Firecracker-version snapshot, or one Firecracker rejects, falls back to a cold boot with a warning; any other restore failure keeps the snapshot for a retry and reports `snapshot_kept`. `is_running` is false while asleep (it used to say true for every Firecracker instance, running or not); the instance's `disk_used_bytes` and `stats.disk_bytes` include the snapshot. Firecracker is now driven over its API socket (`vm/firecracker.sock`; `--no-api` is gone). End-to-end: `vm_sleep_keeps_memory`.
+- Opt-in Firecracker jailer: `--firecracker-jailer PATH` (`WARREN_FIRECRACKER_JAILER`) launches each microVM through `jailer --id <instance> --exec-file <firecracker> --uid/--gid <id> --chroot-base-dir <data>/firecracker/jail`, hard-linking the kernel, root filesystem and snapshot files into the chroot and using jail-relative paths; `--firecracker-jail-uid` and `--firecracker-jail-gid` (`WARREN_FIRECRACKER_JAIL_UID/GID`, default 61000, 0 refused) pick the unprivileged ids; the tap is created owned by them; seccomp stays on. `ready` refuses a jail directory on another filesystem than the instances. The default (no jailer) behaves as before. `WARREN_E2E_FIRECRACKER_JAILER` runs the e2e vm scenario through it.
+- Per-shape rate limits on every microVM's root drive and NIC (Firecracker token buckets: 2/4 gets 100 MB/s and 4,000 IOPS of disk and 100 Mbit/s each way, 4/8 double, 4/16 triple, 4/32 quadruple; 100 ms refill, one second of initial burst); `--firecracker-no-rate-limits` (`WARREN_FIRECRACKER_NO_RATE_LIMITS`) turns them off.
+
+### Changed
+
+- `docs/vm-instances.md` documents sleep with memory, the snapshot files and their sizes, restore fallbacks and caveats (guest clock, dead connections), the jailer flags and the rate-limit table; `docs/compare.md`, `docs/benchmarks.md`, `docs/instances.md`, `docs/API.md`, `docs/limits.md`, `docs/DESIGN.md`, `docs/TESTING.md`, `docs/self-hosting.md` and the README follow.
 
 ## [0.1.0] - 2026-11-21
 

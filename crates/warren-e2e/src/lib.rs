@@ -15,7 +15,9 @@
 //!   `<repo>/target/x86_64-unknown-linux-musl/release/warren-gateway`, then
 //!   `<repo>/target-musl/...`); starting a daemon fails when none exists.
 //! - `WARREN_E2E_VM=1`: start the daemon with `--firecracker --kernel ...` and
-//!   run the vm scenario (`WARREN_E2E_KERNEL`, `WARREN_E2E_FIRECRACKER_BIN`).
+//!   run the vm scenario (`WARREN_E2E_KERNEL`, `WARREN_E2E_FIRECRACKER_BIN`;
+//!   `WARREN_E2E_FIRECRACKER_JAILER=/path/to/jailer` adds `--firecracker-jailer`
+//!   so the scenario runs through the jailer).
 //! - `WARREN_E2E_KEEP=1`: keep each daemon's data dir and log after the test.
 //! - `WARREN_E2E_LOG`: daemon log filter (default `info`).
 //! - `WARREN_E2E_IMAGE_TAG`: tag of the built-in images the daemon should use
