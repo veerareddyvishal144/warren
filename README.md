@@ -88,12 +88,13 @@ Every crate depends on `warren-core` and nothing else in the workspace; `warrend
 
 ## Status
 
-- **Version 0.1.0, unreleased.** No tag and no published binaries yet; the launch work is tracked in [docs/launch-checklist.md](docs/launch-checklist.md).
+- **Version 0.2.0.** Binaries for Apple silicon Macs and x86_64 Linux are on the [releases page](https://github.com/veerareddyvishal144/warren/releases); the Homebrew tap and the install script fetch them. The remaining launch work is tracked in [docs/launch-checklist.md](docs/launch-checklist.md).
 - **Single node.** One daemon drives one host. Multi-node placement is roadmap.
-- **Linux `default` type** is exercised end to end in CI under Docker. **`vm` (Firecracker)** is experimental and tested on one machine.
-- **macOS Phase 1 is verified on one Mac**: a MacBook Pro (Apple silicon, 16 GiB) running `scripts/mac/e2e.sh` on 2026-11-19, twice in a row: create, exec, sleep and wake with processes intact, daemon restart with the VM adopted, fork, guest isolation, host capacity, delete. The numbers and their method are in [docs/benchmarks.md](docs/benchmarks.md). It has not run on a second Mac, a Mac mini, or any other macOS host version.
-- **New in this release and not yet exercised beyond the development machines**: `warren up`, `warren connect` and `warren run`; the egress allowlist and secret broker; the install path in [docs/install.md](docs/install.md). Treat them as fresh.
-- **Not done**: a screen for macOS instances, host-side egress enforcement for macOS guests (the guest applies its own policy with `pf`), memory checkpoints for gVisor (`default`) instances, TLS in the daemon (use a proxy), an audit log. The complete list is [docs/limits.md](docs/limits.md).
+- **Linux `default` type** is exercised end to end in CI under Docker. **`vm` (Firecracker)** boots, sleeps with its memory, wakes from the snapshot and runs through the jailer in the end-to-end suite on one KVM host; creates take about 3 s once the root filesystem cache is warm.
+- **macOS is verified on one Mac**: a MacBook Pro (Apple silicon, 16 GiB) running `scripts/mac/e2e.sh` on 2026-11-22: create, exec, screenshot, input, sleep and wake with processes intact, daemon restart with the VM adopted, fork, guest isolation, host capacity, delete. The numbers and their method are in [docs/benchmarks.md](docs/benchmarks.md). It has not run on a second Mac, a Mac mini, or any other macOS host version.
+- **Not yet exercised beyond the development machines**: `warren up`, `warren connect` and `warren run`; the egress allowlist and secret broker; the install path in [docs/install.md](docs/install.md); the screen API. Treat them as fresh.
+- **Memory checkpoints for gVisor (`default`) instances** need `--docker-checkpoints` and a Docker 27.x engine in experimental mode; Docker 28 and later cannot restore them yet ([docs/self-hosting.md](docs/self-hosting.md#sleep-with-memory-on-default-instances)).
+- **Not done**: a live view of the macOS screen through the edge, host-side egress enforcement for macOS guests (the guest applies its own policy with `pf`), TLS in the daemon (use a proxy), an audit log. The complete list is [docs/limits.md](docs/limits.md).
 
 ## Documentation
 
@@ -101,8 +102,8 @@ Every crate depends on `warren-core` and nothing else in the workspace; `warrend
 
 ## Roadmap
 
-- **Screen for macOS instances**: noVNC through the edge, then a screenshot and input API for agents that need to see.
-- **Memory checkpoints for `default` without going through Docker**: `--docker-checkpoints` uses the engine's checkpoint API (gVisor checkpoint/restore) and keeps processes across sleep on Docker 27.x; it needs `"experimental": true`, and Docker 28 and later cannot restore the checkpoint (moby/moby#50750), so there the wake boots cold ([docs/self-hosting.md](docs/self-hosting.md#sleep-with-memory-on-default-instances)). `runsc restore` works when driven directly; doing that from Warren lifts both the experimental-mode requirement and the engine bug. `mac` (Lume suspend) and `vm` (Firecracker snapshots) need no setting.
+- **Live view of macOS instances**: the screenshot and input API exists; next is a streamed view through the edge (noVNC) for a human watching the agent.
+- **Memory checkpoints for `default` without going through Docker**: `--docker-checkpoints` keeps processes across sleep on Docker 27.x with gVisor but needs experimental mode, and Docker 28 and later cannot restore (moby/moby#50750). Driving `runsc checkpoint` and `runsc restore` directly lifts both requirements.
 - **Linux guests on Mac hosts**, outside the two-guest limit, as cheap extra capacity on the same machine.
 - **Harden the Mac host**: host-side `pf` egress drops for the NAT subnet (today each guest enforces its own policy), one `lume serve` per instance, and in time a runtime on Virtualization.framework without Lume.
 - **Secrets at rest**: encrypt instance env and brokered secrets with a key kept outside the data directory.
