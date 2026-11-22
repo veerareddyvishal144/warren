@@ -1998,12 +1998,18 @@ async fn vm_sleep_keeps_memory_body(cx: Ctx) -> Result<()> {
     let inst = cx.ws.wait_running(&inst.id).await?;
     let id = inst.id.as_str();
     let vm_dir = cx.daemon.data_dir().join("instances").join(id).join("vm");
-    let vm_marker = vm_dir.to_string_lossy().into_owned();
+    // Plain launches name the vm directory on Firecracker's command line;
+    // through the jailer every path is jail-relative and the instance id is
+    // the `--id` argument instead.
+    let vm_marker = if std::env::var_os("WARREN_E2E_FIRECRACKER_JAILER").is_some() {
+        id.to_string()
+    } else {
+        vm_dir.to_string_lossy().into_owned()
+    };
     let snapshot = vm_dir.join("snapshot");
     ensure!(
         host_process_with(&vm_marker).is_some(),
-        "a firecracker process for {id} runs with {} on its command line",
-        vm_dir.display()
+        "a firecracker process for {id} runs with {vm_marker} on its command line"
     );
 
     // The marker, and its pid.

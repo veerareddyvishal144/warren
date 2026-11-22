@@ -137,9 +137,14 @@ impl FirecrackerRuntime {
     /// Build the runtime. Nothing privileged happens here; `ready` checks the
     /// host and brings the bridge network up.
     pub async fn new(cfg: Config) -> Result<FirecrackerRuntime> {
+        // No keep-alive reuse: a connection opened before a sleep points at a
+        // guest that has since been snapshotted, killed and restored from its
+        // memory, and the first request on it after the wake fails. A fresh
+        // connection per request costs one handshake on the local bridge.
         let http = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(0)
             .build()
             .map_err(|e| Error::internal(format!("http client: {e}")))?;
         Ok(FirecrackerRuntime {
