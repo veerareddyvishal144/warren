@@ -47,6 +47,8 @@ Not yet measured. [vm-instances.md](vm-instances.md) describes a container start
 | Exec round trip (`true`) | not yet measured | not yet measured |
 | Host memory per idle instance | not yet measured | not yet measured |
 
+On a Mac host the `default` type runs through a smolvm engine instead of Docker Desktop; those figures (first `docker run alpine` 1.3 s warm, `warren/base` booting as a microVM in 7.6 s including the engine adapter's start, an emulated amd64 `warren-claude` create in 23 s) are in [linux-on-mac.md](linux-on-mac.md#measured-here).
+
 ## What to measure next
 
 In rough priority order.
