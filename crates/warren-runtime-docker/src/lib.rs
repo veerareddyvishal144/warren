@@ -32,7 +32,9 @@
 //!   checkpoints the container through the engine's checkpoint API (gVisor's
 //!   `runsc checkpoint`) and `start` restores it, so processes keep running
 //!   with their pids across a sleep; see the `checkpoint` module. Otherwise
-//!   sleep stops the container and keeps the disk.
+//!   sleep stops the container and keeps the disk. While checkpoints are on,
+//!   `exec` goes through the gateway (pid 1) instead of Docker exec, because
+//!   gVisor restores the container's process tree but not exec sessions.
 //! - The gateway inside an instance runs as root, so the home can hold files a
 //!   non-root daemon may not touch. Storage operations that hit
 //!   `PermissionDenied` fall back to a short-lived root helper container

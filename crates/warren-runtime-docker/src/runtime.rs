@@ -50,6 +50,10 @@ pub struct DockerRuntime {
     pub(crate) checkpoints: AtomicBool,
     /// The "requested but the engine is not experimental" warning was logged.
     pub(crate) checkpoints_warned: AtomicBool,
+    /// Client for the gateway inside instances (exec while checkpoints are
+    /// on). No pooling: a restored container does not know the connections
+    /// opened before its checkpoint.
+    pub(crate) http: reqwest::Client,
 }
 
 /// Outcome of choosing the OCI runtime.
@@ -113,6 +117,12 @@ impl DockerRuntime {
     pub async fn new(cfg: Config) -> Result<DockerRuntime> {
         let docker = Docker::connect_with_local_defaults()
             .map_err(|e| Error::internal(format!("docker: cannot build a client: {e}")))?;
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(0)
+            .build()
+            .map_err(|e| Error::internal(format!("http client: {e}")))?;
         tracing::debug!(preference = %cfg.runtime, instances_dir = %cfg.instances_dir().display(), "docker client built");
         Ok(DockerRuntime {
             cfg,
@@ -124,6 +134,7 @@ impl DockerRuntime {
             egress_warned: AtomicBool::new(false),
             checkpoints: AtomicBool::new(false),
             checkpoints_warned: AtomicBool::new(false),
+            http,
         })
     }
 

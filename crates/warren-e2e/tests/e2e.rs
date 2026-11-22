@@ -2199,6 +2199,13 @@ async fn default_sleep_keeps_memory_body(cx: Ctx) -> Result<()> {
         !pid_before.is_empty(),
         "marker process not found right after starting it"
     );
+    // A request through the edge before the sleep, so its connection pool
+    // holds an upstream connection to the container that the checkpoint
+    // will cut.
+    let edge = cx.ws.edge(id);
+    let key = cx.ws.api_key();
+    let resp = edge.get(0, "/v1/health", Auth::Key(key)).await?;
+    expect_status(resp, 200, None).await?;
 
     // Sleep: the container is checkpointed and exits.
     let answer = sdk.sleep(id).await?;
@@ -2247,6 +2254,20 @@ async fn default_sleep_keeps_memory_body(cx: Ctx) -> Result<()> {
         pid_after == pid_before,
         "marker pid changed across sleep and wake: {pid_before} -> {pid_after}"
     );
+    // The gateway is reachable through the edge right after the restore: the
+    // first request must not fail on a connection pooled before the sleep.
+    for attempt in 1..=2 {
+        let resp = edge.get(0, "/v1/health", Auth::Key(key)).await?;
+        let body = expect_status(resp, 200, None)
+            .await
+            .map_err(|e| fail(format!("edge request {attempt} after the wake: {e}")))?;
+        let health: Value = serde_json::from_slice(&body)
+            .map_err(|e| fail(format!("gateway health JSON after the wake: {e}")))?;
+        ensure!(
+            health["healthy"] == true,
+            "gateway healthy through the edge after the wake (request {attempt}): {health}"
+        );
+    }
     let r = sdk
         .exec(
             id,
