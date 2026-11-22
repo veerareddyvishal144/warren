@@ -12,24 +12,24 @@
 class Warren < Formula
   desc "Self-hosted agent sandboxes: persistent Linux and macOS computers behind one API"
   homepage "https://github.com/veerareddyvishal144/warren"
-  version "0.1.0"
+  version "0.2.0"
   license "Apache-2.0"
 
   on_macos do
     # Apple silicon only: the macOS build hosts `mac` instances through
     # Virtualization.framework, and no Intel binaries are published.
     depends_on arch: :arm64
-    url "https://github.com/veerareddyvishal144/warren/releases/download/v0.1.0/warren-0.1.0-darwin-arm64.tar.gz"
-    sha256 "00af4632f94ef21bee0b3905c0714e894e738ee5b84bbc80d13b6185bf310577"
+    url "https://github.com/veerareddyvishal144/warren/releases/download/v0.2.0/warren-0.2.0-darwin-arm64.tar.gz"
+    sha256 "3c9cbe2432f4c8db3ec009b6eff261dcaef409d741bc23ecbdf8b232153b0f40"
   end
 
   on_linux do
     on_intel do
-      url "https://github.com/veerareddyvishal144/warren/releases/download/v0.1.0/warren-0.1.0-linux-x86_64.tar.gz"
-      sha256 "5cf7ff75f3aeacd7c9d5a91bc95430df1d545a6398c40d36367056bfef7d5b92"
+      url "https://github.com/veerareddyvishal144/warren/releases/download/v0.2.0/warren-0.2.0-linux-x86_64.tar.gz"
+      sha256 "348fe21032b352eafca2b30d4526e03c42e0684a97f94c83cb2fea1e4783278a"
     end
     on_arm do
-      url "https://github.com/veerareddyvishal144/warren/releases/download/v0.1.0/warren-0.1.0-linux-arm64.tar.gz"
+      url "https://github.com/veerareddyvishal144/warren/releases/download/v0.2.0/warren-0.2.0-linux-arm64.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
   end
