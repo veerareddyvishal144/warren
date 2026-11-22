@@ -216,16 +216,7 @@ pub fn gateway_url(endpoint: &str, port: u16) -> String {
 /// `code: message`, with the cause instead of the generic message for internal
 /// errors so the status says what actually went wrong.
 fn describe(e: &Error) -> String {
-    let cause = e
-        .details
-        .as_ref()
-        .and_then(|d| d.get("cause"))
-        .and_then(|c| c.as_str())
-        .filter(|c| !c.is_empty());
-    match cause {
-        Some(c) if e.is_internal() => format!("{}: {c}", e.code),
-        _ => format!("{}: {}", e.code, e.message),
-    }
+    e.describe()
 }
 
 /// The error and every source below it, joined with `: `, so a transport

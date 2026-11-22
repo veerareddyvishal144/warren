@@ -112,6 +112,23 @@ impl Error {
     pub fn is_internal(&self) -> bool {
         self.code == CODE_INTERNAL
     }
+    /// The cause an internal error was built from (`details.cause`), when
+    /// there is one. Clients never see it; logs should.
+    pub fn cause(&self) -> Option<&str> {
+        self.details
+            .as_ref()
+            .and_then(|d| d.get("cause"))
+            .and_then(|c| c.as_str())
+            .filter(|c| !c.is_empty())
+    }
+    /// `code: message` for logs, with the cause in place of the generic
+    /// message on internal errors (`Display` keeps the client-facing form).
+    pub fn describe(&self) -> String {
+        match self.cause() {
+            Some(c) if self.is_internal() => format!("{}: {c}", self.code),
+            _ => format!("{}: {}", self.code, self.message),
+        }
+    }
     /// The client-safe copy: internal errors lose their details.
     pub fn public(&self) -> Error {
         if self.is_internal() {
@@ -153,4 +170,23 @@ pub fn is_requires_restart(e: &Error) -> bool {
         .and_then(|d| d.get("requires_restart"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describe_shows_the_cause_of_internal_errors() {
+        let e = Error::internal("firecracker PUT /snapshot/create: HTTP 400: no space");
+        assert_eq!(e.to_string(), "internal: Internal error.");
+        assert_eq!(
+            e.describe(),
+            "internal: firecracker PUT /snapshot/create: HTTP 400: no space"
+        );
+        assert_eq!(e.public().cause(), None);
+        let c = Error::conflict("instance is stopped");
+        assert_eq!(c.describe(), "conflict: instance is stopped");
+        assert_eq!(c.cause(), None);
+    }
 }

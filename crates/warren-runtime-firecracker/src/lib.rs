@@ -431,7 +431,7 @@ impl FirecrackerRuntime {
     /// SIGKILL the process and wait for it to vanish.
     async fn terminate(&self, pid: i32, marker: &str) {
         if let Err(e) = process::signal(pid, nix::sys::signal::Signal::SIGKILL) {
-            tracing::warn!(pid, error = %e, "cannot kill firecracker");
+            tracing::warn!(pid, error = %e.describe(), "cannot kill firecracker");
         }
         if !process::wait_exit(pid, marker, KILL_WAIT).await {
             tracing::error!(pid, "firecracker survived SIGKILL");
@@ -463,7 +463,7 @@ impl FirecrackerRuntime {
         if let Some(j) = self.jail_for(inst)
             && let Err(e) = j.remove()
         {
-            tracing::warn!(instance = %inst.id, error = %e, "cannot remove the jail directory");
+            tracing::warn!(instance = %inst.id, error = %e.describe(), "cannot remove the jail directory");
         }
         let _ = std::fs::remove_file(self.paths(inst).api_sock());
         net
@@ -664,7 +664,7 @@ impl FirecrackerRuntime {
             return Err(self.abandon_start(inst, p, pid, &marker, ip, e).await);
         }
         if let Err(e) = snapshot::discard(&p.snapshot_dir()) {
-            tracing::warn!(instance = %inst.id, error = %e, "cannot remove the used snapshot");
+            tracing::warn!(instance = %inst.id, error = %e.describe(), "cannot remove the used snapshot");
         }
         if l.jail.is_some() {
             for f in [snapshot::VMSTATE, snapshot::MEM] {
@@ -693,7 +693,7 @@ impl FirecrackerRuntime {
                 tracing::warn!(instance = %inst.id, exit_code = r.exit_code, stderr = %r.stderr.trim(), "sync in the guest failed; its disk may lag the saved memory")
             }
             Err(e) => {
-                tracing::warn!(instance = %inst.id, error = %e, "cannot sync the guest disk before the snapshot")
+                tracing::warn!(instance = %inst.id, error = %e.describe(), "cannot sync the guest disk before the snapshot")
             }
         }
     }
@@ -739,7 +739,7 @@ impl FirecrackerRuntime {
         if result.is_err()
             && let Err(e) = fc.resume().await
         {
-            tracing::warn!(instance = %inst.id, error = %e, "cannot resume the VM after a failed snapshot");
+            tracing::warn!(instance = %inst.id, error = %e.describe(), "cannot resume the VM after a failed snapshot");
         }
         result
     }
@@ -1001,14 +1001,14 @@ impl Runtime for FirecrackerRuntime {
                         }
                         Err(e) if api::is_fault(&e) => {
                             tracing::error!(
-                                instance = %inst.id, error = %e, fault = api::fault_message(&e).unwrap_or_default(),
+                                instance = %inst.id, error = %e.describe(), fault = api::fault_message(&e).unwrap_or_default(),
                                 "firecracker rejected the snapshot; discarding it and booting cold (processes from before the sleep are lost)"
                             );
                             snapshot::discard(&p.snapshot_dir())?;
                         }
                         Err(mut e) => {
                             tracing::error!(
-                                instance = %inst.id, error = %e, dir = %p.snapshot_dir().display(),
+                                instance = %inst.id, error = %e.describe(), dir = %p.snapshot_dir().display(),
                                 "restore failed; the snapshot is kept for the next start (stop the instance to discard it)"
                             );
                             let mut details =
@@ -1049,7 +1049,7 @@ impl Runtime for FirecrackerRuntime {
                 match warren_gateway_client::shutdown(&self.http, ip, &inst.instance_token).await {
                     Ok(()) => tracing::debug!(instance = %inst.id, "shutdown requested"),
                     Err(e) => {
-                        tracing::debug!(instance = %inst.id, error = %e, "shutdown request failed; waiting then signalling")
+                        tracing::debug!(instance = %inst.id, error = %e.describe(), "shutdown request failed; waiting then signalling")
                     }
                 }
             }
@@ -1096,7 +1096,7 @@ impl Runtime for FirecrackerRuntime {
                 self.teardown(inst, ip).await
             }
             Err(e) => {
-                tracing::warn!(instance = %inst.id, error = %e, "snapshot failed; stopping the VM instead (this sleep keeps the disk only)");
+                tracing::warn!(instance = %inst.id, error = %e.describe(), "snapshot failed; stopping the VM instead (this sleep keeps the disk only)");
                 let _ = snapshot::discard(&p.snapshot_dir());
                 self.stop(inst, grace).await
             }
