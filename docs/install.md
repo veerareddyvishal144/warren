@@ -64,7 +64,7 @@ Settings, as environment variables or flags after `sh -s --`:
 | `WARREN_BASE_URL` | | Where the tarball and `SHA256SUMS` are fetched from, for mirrors and air-gapped hosts |
 
 ```sh
-curl -fsSL .../install.sh | WARREN_VERSION=0.1.0 sh
+curl -fsSL .../install.sh | WARREN_VERSION=0.2.0 sh
 curl -fsSL .../install.sh | sh -s -- --install-dir ~/bin
 ```
 
@@ -75,7 +75,7 @@ The script is POSIX `sh` (dash, bash, zsh and BusyBox ash all run it) and refuse
 1. Download the tarball for your platform and `SHA256SUMS` from the [releases page](https://github.com/veerareddyvishal144/warren/releases):
 
    ```sh
-   V=0.1.0
+   V=0.2.0
    P=linux-x86_64        # or darwin-arm64, linux-arm64
    curl -fsSLO https://github.com/veerareddyvishal144/warren/releases/download/v$V/warren-$V-$P.tar.gz
    curl -fsSLO https://github.com/veerareddyvishal144/warren/releases/download/v$V/SHA256SUMS
@@ -163,10 +163,10 @@ tail -f ~/Library/Logs/Warren/warrend.log
 ## Verifying an installation
 
 ```sh
-warren --version            # warren 0.1.0
-warrend --version           # warrend 0.1.0
-warren-gateway --version    # warren-gateway 0.1.0
-warren health               # once the daemon runs: {"healthy":true,"version":"0.1.0",...}
+warren --version            # warren 0.2.0
+warrend --version           # warrend 0.2.0
+warren-gateway --version    # warren-gateway 0.2.0
+warren health               # once the daemon runs: {"healthy":true,"version":"0.2.0",...}
 ```
 
 `warren-mcp` reads its settings before parsing flags and needs `WARREN_API_KEY` set, so it has no quick version check; `warren connect claude` configures it.
@@ -231,7 +231,7 @@ gh repo create veerareddyvishal144/homebrew-warren --public --description "Homeb
 git clone git@github.com:veerareddyvishal144/homebrew-warren.git
 mkdir -p homebrew-warren/Formula
 cp warren/packaging/homebrew/warren.rb homebrew-warren/Formula/warren.rb     # after the first release, see below
-cd homebrew-warren && git add Formula && git commit -m "warren 0.1.0" && git push
+cd homebrew-warren && git add Formula && git commit -m "warren 0.2.0" && git push
 ```
 
 Updating it for a release, from the Warren checkout:

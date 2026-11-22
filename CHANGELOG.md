@@ -4,6 +4,12 @@ All notable changes to Warren are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.0] - 2026-11-22
+
+The screen of macOS instances, memory for every type, and creates that take seconds: screenshots and input for `mac` instances, Firecracker `vm` instances that sleep with their memory and create in about 3 s from a cached root filesystem, and gVisor `default` instances that keep their processes across sleep on engines that can restore a checkpoint. Linux instances run on a Mac without Docker Desktop through smolvm.
+
 ### Added
 
 - The screen of `mac` instances: `GET /v1/instances/{id}/screenshot` (PNG, or `?format=json` with base64) and `POST /v1/instances/{id}/input` (`click`, `move`, `scroll`, `type`, `key` actions with chords such as `cmd+space`), served by the daemon over the VNC server Lume runs for each VM (`Runtime::screenshot` and `Runtime::input`, `not_supported` on other types; screenshots of a Retina framebuffer are halved to 960x720 and coordinates scaled back; uppercase and shifted characters are typed as Shift plus the base key, and Command and Option go in as `Alt_L` and `Meta_L`, which is what Apple's server understands). Lume's VNC is now on by default (`--mac-vnc false` turns it off; it binds 127.0.0.1 with a random password). CLI `warren screenshot` and `warren input`, SDK `screenshot` and `input`, MCP tools `screenshot` (an image block), `click`, `type_text`, `press_key` and `scroll`. The mac e2e takes a screenshot, logs in at the login window when the base VM's password file is at hand, opens Spotlight with `cmd+space`, types, and checks the screen changed. `warren mac init --auto-login` (`build-base.sh --auto-login`, `install.sh --auto-login`) builds a base image whose instances boot logged in (`/etc/kcpassword`); macOS 26 still shows the Setup Assistant once per user, which the docs explain how to dismiss.
@@ -92,5 +98,6 @@ The first release: a single-node platform in one Rust binary, free software you 
 - The `agent` user has passwordless sudo inside its own instance, and `exec` as `root` is allowed, both by design; there is no privilege boundary inside an instance.
 - See [docs/security.md](docs/security.md) for the full list (`runc` fallback, disk quotas, TLS, bearer URLs, side channels, audit log).
 
-[Unreleased]: https://github.com/veerareddyvishal144/warren/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/veerareddyvishal144/warren/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/veerareddyvishal144/warren/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/veerareddyvishal144/warren/releases/tag/v0.1.0

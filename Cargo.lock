@@ -3086,7 +3086,7 @@ dependencies = [
 
 [[package]]
 name = "warren-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3108,7 +3108,7 @@ dependencies = [
 
 [[package]]
 name = "warren-broker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures",
@@ -3127,7 +3127,7 @@ dependencies = [
 
 [[package]]
 name = "warren-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3146,7 +3146,7 @@ dependencies = [
 
 [[package]]
 name = "warren-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3164,7 +3164,7 @@ dependencies = [
 
 [[package]]
 name = "warren-cron"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3181,7 +3181,7 @@ dependencies = [
 
 [[package]]
 name = "warren-dashboard"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "http",
@@ -3190,7 +3190,7 @@ dependencies = [
 
 [[package]]
 name = "warren-e2e"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -3204,7 +3204,7 @@ dependencies = [
 
 [[package]]
 name = "warren-edge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3227,7 +3227,7 @@ dependencies = [
 
 [[package]]
 name = "warren-gateway"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3256,7 +3256,7 @@ dependencies = [
 
 [[package]]
 name = "warren-gateway-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "reqwest",
  "serde_json",
@@ -3266,7 +3266,7 @@ dependencies = [
 
 [[package]]
 name = "warren-lifecycle"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3285,7 +3285,7 @@ dependencies = [
 
 [[package]]
 name = "warren-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "rmcp",
@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "warren-runtime-docker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3325,7 +3325,7 @@ dependencies = [
 
 [[package]]
 name = "warren-runtime-firecracker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3353,7 +3353,7 @@ dependencies = [
 
 [[package]]
 name = "warren-runtime-mac"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3374,7 +3374,7 @@ dependencies = [
 
 [[package]]
 name = "warren-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3390,7 +3390,7 @@ dependencies = [
 
 [[package]]
 name = "warren-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3406,7 +3406,7 @@ dependencies = [
 
 [[package]]
 name = "warren-templates"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3419,7 +3419,7 @@ dependencies = [
 
 [[package]]
 name = "warrend"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
