@@ -55,6 +55,8 @@ sudo chmod 0700 /var/lib/warren
   secret                    HMAC secret for signed URLs, 0600, generated on first start
   instances/<id>/home       each instance's persistent disk
   instances/<id>/vm/        rootfs and logs of vm-type instances
+  firecracker/rootfs-cache/ packed root filesystems shared by vm instances of one image (bounded, rebuilt on demand)
+  firecracker/jail/         chroots of running microVMs when the jailer is on
   backups/<id>/<backupId>.tar.gz
 ```
 
@@ -82,6 +84,7 @@ WARREN_LOG=info                         # tracing filter, e.g. info,warren_edge=
 # WARREN_FIRECRACKER_JAIL_UID=61000     # unprivileged ids the jailer drops to
 # WARREN_FIRECRACKER_JAIL_GID=61000
 # WARREN_FIRECRACKER_NO_RATE_LIMITS=false   # true runs microVMs without the per-shape disk and NIC limits
+# WARREN_FIRECRACKER_ROOTFS_CACHE_GB=20     # disk budget for packed root filesystems shared by vm instances; 0 disables
 ```
 
 | Variable | Flag | Default | Notes |
@@ -101,6 +104,7 @@ WARREN_LOG=info                         # tracing filter, e.g. info,warren_edge=
 | `WARREN_ENABLE_FIRECRACKER`, `WARREN_FIRECRACKER_BIN`, `WARREN_KERNEL_IMAGE` | `--firecracker`, `--firecracker-bin`, `--kernel` | off | [vm-instances.md](vm-instances.md) |
 | `WARREN_FIRECRACKER_JAILER`, `WARREN_FIRECRACKER_JAIL_UID`, `WARREN_FIRECRACKER_JAIL_GID` | `--firecracker-jailer`, `--firecracker-jail-uid`, `--firecracker-jail-gid` | unset (no jailer), 61000, 61000 | Launch microVMs through the Firecracker jailer as an unprivileged user; [vm-instances.md](vm-instances.md#the-jailer) |
 | `WARREN_FIRECRACKER_NO_RATE_LIMITS` | `--firecracker-no-rate-limits` | false | Disable the per-shape disk and NIC limits on microVMs; [vm-instances.md](vm-instances.md#rate-limits) |
+| `WARREN_FIRECRACKER_ROOTFS_CACHE_GB` | `--firecracker-rootfs-cache-gb` | 20 | Disk budget for packed root filesystems shared by `vm` instances of one image; 0 disables the cache; [vm-instances.md](vm-instances.md#the-root-filesystem-cache) |
 | `WARREN_GATEWAY_BIN` | `--gateway-bin` | next to `warrend`, else `/usr/local/bin/warren-gateway` | Static gateway injected into registered images; the native build placed in `mac` VMs |
 | `WARREN_MAC_BASE_VM`, `WARREN_LUME_API`, `WARREN_LUME_BIN`, `WARREN_MAC_VNC` | `--mac-base-vm`, `--lume-api`, `--lume-bin`, `--mac-vnc` | off, `http://127.0.0.1:7777`, `lume`, off | `mac` instances on an Apple silicon host: [macos.md](macos.md) |
 | `WARREN_SIGNUP_ENABLED` | `--signup-enabled` | `true` | `false` makes `POST /v1/signup` answer 404 |

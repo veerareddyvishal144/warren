@@ -63,6 +63,27 @@ pub async fn inspect_digest(image: &str) -> Result<Option<String>> {
     })
 }
 
+/// The local content id of an image (`Id`, `sha256:...`), or `None` when it
+/// is not present. Unlike [`inspect_digest`] this never names a registry
+/// digest: two tags of one local image share it, two builds never do.
+pub async fn inspect_id(image: &str) -> Result<Option<String>> {
+    let Some(v) = inspect(image).await? else {
+        return Ok(None);
+    };
+    id_from_inspect(&v)
+        .map(Some)
+        .ok_or_else(|| Error::internal(format!("docker image inspect {image}: no id in output")))
+}
+
+/// `Id` from an inspect document.
+pub fn id_from_inspect(v: &serde_json::Value) -> Option<String> {
+    let img = v.as_array().and_then(|a| a.first()).unwrap_or(v);
+    img.get("Id")
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
 /// The argv a container of `image` would run: `Config.Entrypoint` followed by
 /// `Config.Cmd`, empty when the image declares neither. The image must be
 /// present locally (see [`ensure`]).

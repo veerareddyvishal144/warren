@@ -43,6 +43,7 @@ Flags or environment variables on `warrend`:
 | `--firecracker-jailer PATH` | `WARREN_FIRECRACKER_JAILER` | Launch every microVM through the jailer at this path (off by default) |
 | `--firecracker-jail-uid N`, `--firecracker-jail-gid N` | `WARREN_FIRECRACKER_JAIL_UID`, `WARREN_FIRECRACKER_JAIL_GID` | The unprivileged ids the jailer drops to (default 61000 for both; they need not exist in `/etc/passwd`) |
 | `--firecracker-no-rate-limits` | `WARREN_FIRECRACKER_NO_RATE_LIMITS=true` | Run microVMs without the per-shape disk and network limits |
+| `--firecracker-rootfs-cache-gb N` | `WARREN_FIRECRACKER_ROOTFS_CACHE_GB` | Disk budget for packed root filesystems shared by instances of one image (default 20; 0 builds every rootfs from its image), see [the root filesystem cache](#the-root-filesystem-cache) |
 
 ```bash
 sudo target/release/warrend --dev --data-dir ./data --firecracker --kernel /var/lib/warren/vmlinux --firecracker-bin /usr/local/bin/firecracker
@@ -67,10 +68,21 @@ Everything else works the same: URLs, signed URLs, the files API, exec, sleep an
 
 ## How it is built
 
-1. The template image is exported from Docker into a directory and packed into a sized ext4 image with `mkfs.ext4 -d` under `<data>/instances/<id>/vm/rootfs.ext4` (built as `rootfs.ext4.tmp` and renamed when complete).
+1. The template image is exported from Docker into a directory and packed into a sized ext4 image with `mkfs.ext4 -d`. The packed image goes into the [root filesystem cache](#the-root-filesystem-cache) and the instance gets a sparse copy with its own hostname, hosts and env written in, under `<data>/instances/<id>/vm/rootfs.ext4` (built as `rootfs.ext4.tmp` and renamed when complete). The next instance of the same image and disk size skips the export and the mkfs: its root filesystem is ready in well under a second and the create takes about 3 s.
 2. A tap device with a deterministic name and MAC is attached to the `warren-fc0` bridge; the guest's address on `172.30.0.0/24` is passed on the kernel command line with `ip=`, and NAT gives it egress (`deny-all` and `allowlist` drop the guest's forwarded traffic; an `allowlist` guest reaches the daemon's egress broker on `172.30.0.1` and nothing else directly).
 3. Firecracker boots the configured kernel with the rootfs; `warren-gateway` runs as PID 1 (`--init`), mounts what it needs, starts `ttyd` and serves the API on 3737. The daemon waits for `GET /v1/health` before reporting `running`, exactly as for containers.
 4. The VM's API socket (`vm/firecracker.sock`), config, pid and console log live next to the rootfs; `GET /v1/instances/{id}/logs` returns the console. The daemon keeps Firecracker's API on (no `--no-api`) because sleep uses it.
+
+## The root filesystem cache
+
+Exporting an image and packing it with `mkfs.ext4 -d` is most of a cold create (about 8 s and 6 s for `warren-base` on the development host, against 2.5 s for the boot itself). The daemon therefore packs each image once and keeps the result under `<data>/firecracker/rootfs-cache/<key>.ext4` with a `<key>.json` beside it (image reference and content id, disk size, created and last-used times). The key is a hash of the cache format, the image's content id (the `Id` from `docker image inspect`, so a rebuilt tag is a new entry), how the gateway gets in (the image's own, or the injected binary's hash plus the wrap command), the guest init path, the mount path and the disk size. The cached image carries placeholder identity files of fixed sizes (`/etc/hostname` 64 bytes, `/etc/hosts` 256 bytes, `/etc/warren.env` 16 KiB, padded with newlines), and the entry's `.json` records which blocks hold them. A create sparse-copies the image to the instance's `rootfs.ext4.tmp` (only the allocated extents are read), writes the instance's hostname, hosts and env straight into those blocks padded to the same sizes (the inodes never change, so nothing opens the filesystem and nothing forces the fresh copy to disk), reads them back the same way, renames the file into place and records the use. An env larger than its placeholder falls back to a `debugfs` write of the three files, which costs a few seconds because `debugfs` syncs the whole copy when it closes.
+
+- A miss packs the image into the cache first, then proceeds as a hit; two creates that miss at once both build and the first to publish wins, the other's copy is discarded.
+- `update`, `restore` and any rebuild that preserves a home directory take the full build path: their tree is instance-specific.
+- `--firecracker-rootfs-cache-gb N` (`WARREN_FIRECRACKER_ROOTFS_CACHE_GB`, default 20) bounds the allocated bytes of the cached images. After each new entry the least recently used ones beyond the budget are removed (never the one just used), along with entries whose image id is no longer in the engine and scratch files older than an hour. `0` disables the cache; every create then exports and packs as before.
+- Any problem on the cache path (an entry evicted between lookup and copy, a debugfs failure) logs a warning and falls back to the full build, so a create never fails because of the cache.
+
+On the development host a `warren-base` create takes about 18 s when it packs the cache entry and 3 s afterwards (0.65 s for the root filesystem, the rest the boot and the gateway's first health check); see [benchmarks.md](benchmarks.md).
 
 ## Sleep with memory
 

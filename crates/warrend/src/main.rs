@@ -100,6 +100,11 @@ struct Args {
         default_value_t = false
     )]
     firecracker_no_rate_limits: bool,
+    /// Disk budget in GiB for packed root filesystems of vm instances, kept
+    /// under <data-dir>/firecracker/rootfs-cache and shared by instances of
+    /// the same image; 0 disables the cache.
+    #[arg(long, env = "WARREN_FIRECRACKER_ROOTFS_CACHE_GB", default_value_t = warren_core::config::DEFAULT_FIRECRACKER_ROOTFS_CACHE_GB, value_name = "GB")]
+    firecracker_rootfs_cache_gb: u32,
     /// Static warren-gateway binary injected into registered images; found next to
     /// warrend or in /usr/local/bin when unset.
     #[arg(long, env = "WARREN_GATEWAY_BIN")]
@@ -162,6 +167,7 @@ impl Args {
             firecracker_jail_uid: self.firecracker_jail_uid,
             firecracker_jail_gid: self.firecracker_jail_gid,
             firecracker_rate_limits: !self.firecracker_no_rate_limits,
+            firecracker_rootfs_cache_gb: self.firecracker_rootfs_cache_gb,
             gateway_bin: Config::resolve_gateway_bin(self.gateway_bin),
             mac_base_vm: self.mac_base_vm.filter(|v| !v.trim().is_empty()),
             lume_api_url: self.lume_api,
