@@ -7,6 +7,7 @@ From an installed `warren` to a running instance with a coding agent inside, on 
 [install.md](install.md) has every method; the short version:
 
 ```sh
+brew tap veerareddyvishal144/warren && brew trust veerareddyvishal144/warren   # Homebrew 5+ asks you to trust third-party taps once
 brew install veerareddyvishal144/warren/warren                                      # macOS or Linux, Homebrew
 curl -fsSL https://raw.githubusercontent.com/veerareddyvishal144/warren/main/scripts/install.sh | sh   # or the install script
 warren --version

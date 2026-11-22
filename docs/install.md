@@ -38,7 +38,7 @@ brew tap veerareddyvishal144/warren
 brew install warren
 ```
 
-(or `brew install veerareddyvishal144/warren/warren` in one go). The formula installs the release tarball for your platform, so no Rust toolchain is downloaded. `brew services start warren` runs the daemon with its defaults (data under `$(brew --prefix)/var/warren`, the API at `http://api.warren.localhost:7337`); for `mac` instances the daemon needs `--mac-base-vm`, which the service block cannot take, so use `warren up` (it writes the [launchd agent](#macos-launchd) with the right flags) and `warren mac init` instead.
+(or `brew install veerareddyvishal144/warren/warren` in one go; Homebrew 5 and newer first ask you to trust the tap once with `brew trust veerareddyvishal144/warren`). The formula installs the release tarball for your platform, so no Rust toolchain is downloaded. `brew services start warren` runs the daemon with its defaults (data under `$(brew --prefix)/var/warren`, the API at `http://api.warren.localhost:7337`); for `mac` instances the daemon needs `--mac-base-vm`, which the service block cannot take, so use `warren up` (it writes the [launchd agent](#macos-launchd) with the right flags) and `warren mac init` instead.
 
 Upgrade with `brew upgrade warren`; remove with `brew uninstall warren` (and `brew untap veerareddyvishal144/warren`).
 
@@ -247,5 +247,6 @@ cp packaging/homebrew/warren.rb ../homebrew-warren/Formula/warren.rb
 ```sh
 brew tap veerareddyvishal144/warren
 brew audit --strict veerareddyvishal144/warren/warren
+brew tap veerareddyvishal144/warren && brew trust veerareddyvishal144/warren   # Homebrew 5+ asks you to trust third-party taps once
 brew install veerareddyvishal144/warren/warren && brew test veerareddyvishal144/warren/warren
 ```
