@@ -149,5 +149,5 @@ CI runs the suite with `--skip vm_` because hosted runners do not offer a stable
 - Root is required for the whole daemon, not only for the runtime; the jailer confines the VM process, not the daemon.
 - A sleeping instance holds a memory file as large as its RAM on the data volume.
 - The guest clock is not corrected after a restore (see the caveats above).
-- Sleep with memory and wake were verified on a KVM host (Azure, nested virtualization): a 4 GB guest sleeps in 24 to 25 s, bounded by writing its memory file, and resumes in 0.2 s with its processes and pids intact ([benchmarks.md](benchmarks.md)). The jailer launch boots and serves instances; see the status note on snapshots through the jailer below.
+- Sleep with memory and wake were verified on a KVM host (Azure, nested virtualization): a 4 GB guest sleeps in 24 to 25 s, bounded by writing its memory file, and resumes in 0.2 s with its processes and pids intact ([benchmarks.md](benchmarks.md)). The same scenario through the jailer (`WARREN_E2E_FIRECRACKER_JAILER`) passes too: a jailed guest sleeps with its memory and wakes with its processes intact, with the two vm scenarios taking 115 s together on that host.
 - x86_64 only, like the images.

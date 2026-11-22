@@ -11,6 +11,11 @@ All notable changes to Warren are recorded here. The format follows [Keep a Chan
 - Opt-in Firecracker jailer: `--firecracker-jailer PATH` (`WARREN_FIRECRACKER_JAILER`) launches each microVM through `jailer --id <instance> --exec-file <firecracker> --uid/--gid <id> --chroot-base-dir <data>/firecracker/jail`, hard-linking the kernel, root filesystem and snapshot files into the chroot and using jail-relative paths; `--firecracker-jail-uid` and `--firecracker-jail-gid` (`WARREN_FIRECRACKER_JAIL_UID/GID`, default 61000, 0 refused) pick the unprivileged ids; the tap is created owned by them; seccomp stays on. `ready` refuses a jail directory on another filesystem than the instances. The default (no jailer) behaves as before. `WARREN_E2E_FIRECRACKER_JAILER` runs the e2e vm scenario through it.
 - Per-shape rate limits on every microVM's root drive and NIC (Firecracker token buckets: 2/4 gets 100 MB/s and 4,000 IOPS of disk and 100 Mbit/s each way, 4/8 double, 4/16 triple, 4/32 quadruple; 100 ms refill, one second of initial burst); `--firecracker-no-rate-limits` (`WARREN_FIRECRACKER_NO_RATE_LIMITS`) turns them off.
 
+### Fixed
+
+- Through the jailer, the host-side path of the API socket (`<data>/firecracker/jail/firecracker/<id>/root/run/firecracker.socket`) can exceed the 108 bytes `connect(2)` accepts; every API call after the boot then failed and a sleep fell back to a plain stop. The runtime now reaches long socket paths through the socket directory's descriptor. A plain launch, where Firecracker binds `<data>/instances/<id>/vm/firecracker.sock` itself, is refused with `invalid_request` and a hint when that path is too long.
+- The Firecracker runtime's warnings and errors now carry the cause of an internal error (`Error::describe`), where they said only `Internal error.`.
+
 ### Changed
 
 - `docs/vm-instances.md` documents sleep with memory, the snapshot files and their sizes, restore fallbacks and caveats (guest clock, dead connections), the jailer flags and the rate-limit table; `docs/compare.md`, `docs/benchmarks.md`, `docs/instances.md`, `docs/API.md`, `docs/limits.md`, `docs/DESIGN.md`, `docs/TESTING.md`, `docs/self-hosting.md` and the README follow.
