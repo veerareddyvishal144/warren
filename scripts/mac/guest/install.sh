@@ -12,6 +12,9 @@
 #                                     password change without it (dscl: eDSAuthFailed)
 #   --with-agents                     install Node LTS under /usr/local and the claude, codex and opencode CLIs
 #   --node-version vX.Y.Z             Node version for --with-agents (default: the latest LTS at nodejs.org)
+#   --auto-login                      log the guest user in at boot (/etc/kcpassword with the new password,
+#                                     autoLoginUser), so the screen shows a desktop instead of the login
+#                                     window; needs --new-password
 #
 # What it does (every step is idempotent):
 #   - /usr/local/libexec/warren-gateway-launcher.sh and the two LaunchDaemons
@@ -22,6 +25,8 @@
 #   - the given public key appended to /Users/lume/.ssh/authorized_keys
 #   - with --new-password: the guest user's password is replaced (Lume's VMs come with
 #     lume/lume) and autologin, when it was on, is re-armed with the new password
+#   - with --auto-login: autologin is turned on for the guest user (and the Setup
+#     Assistant's first-login panes are marked as seen, for the macOS versions that honour it)
 #   - when a key is installed: /etc/ssh/sshd_config.d/100-warren.conf turns password
 #     and keyboard-interactive SSH authentication off (keys only), checked with sshd -T
 #   - with --with-agents: Node LTS from the official arm64 tarball (SHA256 checked against
@@ -37,6 +42,7 @@ die() { log "error: $*"; exit 1; }
 SRC="$(cd "$(dirname "$0")" && pwd)"
 SUBNET="" GATEWAY="" SSH_KEY="" SSH_KEY_FILE="" NEW_PASSWORD="" NEW_PASSWORD_FILE="" OLD_PASSWORD="" OLD_PASSWORD_FILE=""
 WITH_AGENTS=0 NODE_VERSION=""
+AUTO_LOGIN=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --subnet) SUBNET="${2:-}"; shift ;;
@@ -49,6 +55,7 @@ while [ $# -gt 0 ]; do
         --old-password-file) OLD_PASSWORD_FILE="${2:-}"; shift ;;
         --with-agents) WITH_AGENTS=1 ;;
         --node-version) NODE_VERSION="${2:-}"; shift ;;
+        --auto-login) AUTO_LOGIN=1 ;;
         -h|--help) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option $1 (try --help)" ;;
     esac
@@ -178,6 +185,33 @@ if [ -n "$SSH_KEY" ]; then
     chmod 600 "$AUTH"
 fi
 
+# arm_autologin USER PASSWORD: write /etc/kcpassword (the password XORed with
+# loginwindow's fixed key, zero-padded to a multiple of 12 bytes) and point
+# autoLoginUser at the user; the files sysadminctl -autologin writes, done
+# by hand because sysadminctl has been seen to return without arming anything
+# in a headless guest. Verified on macOS 26: the next boot lands on the desktop.
+arm_autologin() {
+    local user=$1 password=$2
+    if printf '%s' "$password" | perl -e '
+        my $pw = do { local $/; <STDIN> };
+        my @key = (0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F);
+        my @b = unpack("C*", $pw);
+        my $pad = 12 - (scalar(@b) % 12);
+        push @b, (0) x $pad;
+        my $out = "";
+        $out .= chr($b[$_] ^ $key[$_ % 11]) for 0 .. $#b;
+        open(my $fh, ">", "/etc/kcpassword.tmp") or die "open: $!";
+        binmode $fh; print $fh $out; close $fh;
+    ' && chmod 600 /etc/kcpassword.tmp && chown root:wheel /etc/kcpassword.tmp \
+        && mv -f /etc/kcpassword.tmp /etc/kcpassword \
+        && defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser -string "$user"; then
+        log "autologin for $user armed (/etc/kcpassword, autoLoginUser)"
+    else
+        rm -f /etc/kcpassword.tmp
+        log "warning: could not arm autologin for $user; the console will stop at the login window"
+    fi
+}
+
 # --- guest password -----------------------------------------------------------------
 # Lume's unattended install leaves the guest user with the password `lume`.
 # Every clone of this image inherits what is set here. dscl as root replaces the
@@ -204,13 +238,37 @@ if [ -n "$NEW_PASSWORD" ]; then
     dscl . -authonly "$GUEST_USER" "$NEW_PASSWORD" >/dev/null 2>&1 \
         || die "the new password of $GUEST_USER does not authenticate (dscl -authonly); the old password is probably still in place"
     log "new password verified with dscl -authonly"
-    if [ "$AUTOLOGIN_USER" = "$GUEST_USER" ]; then
-        if sysadminctl -autologin set -userName "$GUEST_USER" -password "$NEW_PASSWORD" 2>&1 | sed 's/^/  sysadminctl: /' >&2; then
-            log "autologin for $GUEST_USER re-armed with the new password"
-        else
-            log "warning: could not re-arm autologin for $GUEST_USER; the console will stop at the login window"
-        fi
+    if [ "$AUTOLOGIN_USER" = "$GUEST_USER" ] || [ "$AUTO_LOGIN" = 1 ]; then
+        arm_autologin "$GUEST_USER" "$NEW_PASSWORD"
     fi
+elif [ "$AUTO_LOGIN" = 1 ]; then
+    die "--auto-login needs --new-password (autologin stores the password)"
+fi
+
+# --- Setup Assistant --------------------------------------------------------------------
+# The first login of a user the unattended install created shows the Setup
+# Assistant's panes (software updates, Apple Account, FileVault, ...), which
+# cover the desktop until someone clicks through them. The per-user keys below
+# used to mark them as seen; on macOS 26 they no longer skip the panes (checked),
+# so docs/macos.md describes clicking through once. They are written anyway
+# for the versions that honour them.
+if [ "$AUTO_LOGIN" = 1 ]; then
+    log "marking the Setup Assistant as seen for $GUEST_USER"
+    PRODUCT_VERSION="$(sw_vers -productVersion)"
+    BUILD_VERSION="$(sw_vers -buildVersion)"
+    SA_PLIST="$GUEST_HOME/Library/Preferences/com.apple.SetupAssistant"
+    install -d -o "$GUEST_USER" -g staff -m 700 "$GUEST_HOME/Library/Preferences"
+    for key in DidSeeCloudSetup DidSeeSiriSetup DidSeePrivacy DidSeeAppearanceSetup DidSeeTrueTonePrivacy \
+        DidSeeScreenTime DidSeeTouchIDSetup DidSeeApplePaySetup DidSeeActivationLock DidSeeAccessibility \
+        DidSeeiCloudLoginForStorageServices DidSeeSyncSetup DidSeeSyncSetup2 DidSeeUpdateSetup \
+        DidSeeWallpaperSetup DidSeeIntelligence DidSeeLockdownMode DidSeeTermsOfAddress SkipFirstLoginOptimization; do
+        defaults write "$SA_PLIST" "$key" -bool TRUE
+    done
+    defaults write "$SA_PLIST" LastSeenCloudProductVersion -string "$PRODUCT_VERSION"
+    defaults write "$SA_PLIST" LastSeenBuddyBuildVersion -string "$BUILD_VERSION"
+    defaults write "$SA_PLIST" LastPrivacyBundleVersion -string "2"
+    chown "$GUEST_USER":staff "$SA_PLIST.plist"
+    touch /private/var/db/.AppleSetupDone
 fi
 
 # --- sshd: keys only -----------------------------------------------------------------

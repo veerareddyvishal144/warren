@@ -3,7 +3,11 @@ use std::{collections::BTreeMap, collections::HashMap, sync::Arc, time::Duration
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{Result, types::*};
+use crate::{
+    Error, Result,
+    screen::{InputAction, Screenshot},
+    types::*,
+};
 
 /// Runtimes keyed by the instance type they serve.
 pub type Runtimes = Arc<HashMap<InstanceType, Arc<dyn Runtime>>>;
@@ -161,6 +165,22 @@ pub trait Runtime: Send + Sync {
     async fn backup_storage(&self, inst: &Instance, dest_path: &std::path::Path) -> Result<i64>;
     async fn restore_storage(&self, inst: &Instance, src_path: &std::path::Path) -> Result<()>;
     async fn disk_usage(&self, inst: &Instance) -> Result<i64>;
+    /// A PNG of the instance's screen. Only types with a display have one
+    /// (`mac`, over the VM's VNC server); the default answers `not_supported`.
+    async fn screenshot(&self, inst: &Instance) -> Result<Screenshot> {
+        Err(Error::not_supported(format!(
+            "instances of type {} have no screen",
+            inst.kind
+        )))
+    }
+    /// Send pointer and keyboard actions to the instance's screen, in order.
+    /// The default answers `not_supported` like [`Runtime::screenshot`].
+    async fn input(&self, inst: &Instance, _actions: &[InputAction]) -> Result<()> {
+        Err(Error::not_supported(format!(
+            "instances of type {} have no screen",
+            inst.kind
+        )))
+    }
 }
 
 /// Body of `POST /v1/instances`. Every field is optional.
@@ -291,6 +311,17 @@ pub trait Lifecycle: Send + Sync {
     async fn backup(&self, workspace_id: &str, id: &str, note: &str) -> Result<Backup>;
     async fn list_backups(&self, workspace_id: &str, id: &str) -> Result<Vec<Backup>>;
     async fn restore(&self, workspace_id: &str, id: &str, backup_id: &str) -> Result<Instance>;
+    /// `GET /v1/instances/{id}/screenshot`: a PNG of the screen of a running
+    /// instance, waking a sleeping one first like `exec` does. Fakes without
+    /// a screen keep the default, `not_supported`.
+    async fn screenshot(&self, _workspace_id: &str, _id: &str) -> Result<Screenshot> {
+        Err(Error::not_supported("this instance has no screen"))
+    }
+    /// `POST /v1/instances/{id}/input`: pointer and keyboard actions, in
+    /// order, on a running instance (a sleeping one is woken first).
+    async fn input(&self, _workspace_id: &str, _id: &str, _actions: &[InputAction]) -> Result<()> {
+        Err(Error::not_supported("this instance has no screen"))
+    }
 
     /// The edge's wake-on-request hook: a sleeping instance is woken and the call
     /// blocks (bounded) until it is running; stopped or failed returns conflict;

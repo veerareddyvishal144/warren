@@ -21,13 +21,14 @@ use serde::Serialize;
 use serde_json::json;
 use warren_core::{
     Error, Instance, InstanceStatus, MAX_EXEC_OUTPUT_BYTES, Result as WarrenResult,
-    agentapi::ResponseStatus, json::List,
+    agentapi::ResponseStatus, json::List, screen::png_dimensions,
 };
 
 use crate::{
     args::{
-        ChatArgs, CreateInstanceArgs, ExecArgs, InstanceIdArgs, ListFilesArgs, ReadFileArgs,
-        SignedUrlArgs, WriteFileArgs, file_path,
+        ChatArgs, ClickArgs, CreateInstanceArgs, ExecArgs, InstanceIdArgs, ListFilesArgs,
+        PressKeyArgs, ReadFileArgs, ScrollArgs, SignedUrlArgs, TypeTextArgs, WriteFileArgs,
+        file_path,
     },
     backend::Backend,
 };
@@ -513,6 +514,87 @@ impl<B: Backend> WarrenServer<B> {
         let templates = self.backend.list_templates().await?;
         Ok(ok_json(&List::new(templates))?)
     }
+
+    #[tool(
+        description = "Capture the screen of a mac instance as a PNG image (the VM's display, 1024x768 by default; coordinates for click and scroll are pixels in this image, origin top left). Look before and after click, type_text, press_key and scroll to see dialogs, menus, Xcode, Safari or the Simulator. Wakes a sleeping instance. Linux instances have no screen and answer not_supported.",
+        annotations(title = "Screenshot", read_only_hint = true, idempotent_hint = true)
+    )]
+    async fn screenshot(&self, Parameters(args): Parameters<InstanceIdArgs>) -> ToolOutcome {
+        let id = args.id()?;
+        let png = self.backend.screenshot(id).await?;
+        let (width, height) = png_dimensions(&png).unwrap_or((0, 0));
+        let mut result = CallToolResult::success(vec![
+            ContentBlock::image(base64_encode(&png), "image/png"),
+            ContentBlock::text(format!("{width}x{height} PNG, {} bytes", png.len())),
+        ]);
+        result.structured_content = Some(json!({
+            "width": width,
+            "height": height,
+            "format": "png",
+            "bytes": png.len(),
+        }));
+        Ok(result)
+    }
+
+    #[tool(
+        description = "Click on the screen of a mac instance at (x, y) in screenshot pixels: button left (default), right or middle; count 2 for a double click, 3 for a triple. Take a screenshot first to find the target and afterwards to confirm the result.",
+        annotations(
+            title = "Click",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn click(&self, Parameters(args): Parameters<ClickArgs>) -> ToolOutcome {
+        let (id, action) = args.into_action()?;
+        self.backend.input(&id, vec![action.clone()]).await?;
+        Ok(ok_json(&json!({ "id": id, "done": [action] }))?)
+    }
+
+    #[tool(
+        description = "Type text on the keyboard of a mac instance into whatever has focus (click a field first). \"\\n\" presses Return and \"\\t\" Tab. For shortcuts use press_key instead.",
+        annotations(
+            title = "Type text",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn type_text(&self, Parameters(args): Parameters<TypeTextArgs>) -> ToolOutcome {
+        let (id, action) = args.into_action()?;
+        self.backend.input(&id, vec![action.clone()]).await?;
+        Ok(ok_json(&json!({ "id": id, "done": [action] }))?)
+    }
+
+    #[tool(
+        description = "Press a key or shortcut on a mac instance: \"enter\", \"escape\", \"tab\", \"space\", \"backspace\", \"delete\", arrows (\"up\", \"down\", \"left\", \"right\"), \"home\", \"end\", \"pageup\", \"pagedown\", \"f1\" to \"f12\", a single character, or modifiers joined with \"+\": \"cmd+space\" (Spotlight), \"cmd+tab\", \"cmd+q\", \"cmd+shift+4\", \"ctrl+c\", \"alt+tab\". Modifiers: cmd, ctrl, alt (option), shift.",
+        annotations(
+            title = "Press key",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn press_key(&self, Parameters(args): Parameters<PressKeyArgs>) -> ToolOutcome {
+        let (id, action) = args.into_action()?;
+        self.backend.input(&id, vec![action.clone()]).await?;
+        Ok(ok_json(&json!({ "id": id, "done": [action] }))?)
+    }
+
+    #[tool(
+        description = "Scroll on the screen of a mac instance with the pointer at (x, y): dy > 0 scrolls down (content moves up), dy < 0 up, dx for horizontal; one wheel step per unit, at most 50 per axis.",
+        annotations(
+            title = "Scroll",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn scroll(&self, Parameters(args): Parameters<ScrollArgs>) -> ToolOutcome {
+        let (id, action) = args.into_action()?;
+        self.backend.input(&id, vec![action.clone()]).await?;
+        Ok(ok_json(&json!({ "id": id, "done": [action] }))?)
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -559,7 +641,7 @@ mod tests {
     use std::{collections::BTreeMap, sync::Mutex};
 
     use warren_core::{
-        CreateInstanceRequest, ExecRequest, ExecResult, Shape, Template,
+        CreateInstanceRequest, ExecRequest, ExecResult, InputAction, Shape, Template,
         agentapi::{DirListing, FileEntry, ResponseObject, ResponsesRequest},
     };
 
@@ -575,6 +657,7 @@ mod tests {
         files: BTreeMap<String, Vec<u8>>,
         creates: Vec<CreateInstanceRequest>,
         execs: Vec<(String, ExecRequest)>,
+        inputs: Vec<(String, Vec<InputAction>)>,
         chats: Vec<(String, ResponsesRequest)>,
         calls: Vec<String>,
         /// After this many `get_instance` polls every instance takes this status.
@@ -761,6 +844,22 @@ mod tests {
         async fn list_templates(&self) -> WarrenResult<Vec<Template>> {
             Ok(self.enter("list_templates")?.templates.clone())
         }
+        async fn screenshot(&self, _id: &str) -> WarrenResult<Vec<u8>> {
+            drop(self.enter("screenshot")?);
+            // A PNG header for a 640x480 image; the pixel data is not inspected.
+            let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+            png.extend_from_slice(&13u32.to_be_bytes());
+            png.extend_from_slice(b"IHDR");
+            png.extend_from_slice(&640u32.to_be_bytes());
+            png.extend_from_slice(&480u32.to_be_bytes());
+            png.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+            Ok(png)
+        }
+        async fn input(&self, id: &str, actions: Vec<InputAction>) -> WarrenResult<()> {
+            let mut st = self.enter("input")?;
+            st.inputs.push((id.to_string(), actions));
+            Ok(())
+        }
     }
 
     fn server(fake: Fake) -> WarrenServer<Fake> {
@@ -783,8 +882,9 @@ mod tests {
             .expect("structured content")
     }
 
-    const TOOLS: [&str; 14] = [
+    const TOOLS: [&str; 19] = [
         "chat",
+        "click",
         "create_instance",
         "delete_instance",
         "exec",
@@ -792,11 +892,15 @@ mod tests {
         "list_files",
         "list_instances",
         "list_templates",
+        "press_key",
         "read_file",
+        "screenshot",
+        "scroll",
         "signed_url",
         "sleep_instance",
         "start_instance",
         "stop_instance",
+        "type_text",
         "write_file",
     ];
 
@@ -1051,6 +1155,89 @@ mod tests {
                 "delete_instance"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn screenshot_returns_an_image_block_with_its_size() {
+        let srv = server(Fake::default());
+        let args: InstanceIdArgs = serde_json::from_value(json!({ "id": ID })).unwrap();
+        let result = srv.screenshot(Parameters(args)).await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+        let out = structured(&result);
+        assert_eq!(out["width"], json!(640));
+        assert_eq!(out["height"], json!(480));
+        assert_eq!(out["format"], json!("png"));
+        let image = result
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::Image(i) => Some(i),
+                _ => None,
+            })
+            .expect("an image block");
+        assert_eq!(image.mime_type, "image/png");
+        assert!(
+            image.data.starts_with("iVBORw0KGgo"),
+            "base64 PNG signature"
+        );
+        assert_eq!(srv.backend().state().calls, vec!["screenshot"]);
+    }
+
+    #[tokio::test]
+    async fn screen_actions_are_validated_and_sent_one_per_call() {
+        let srv = server(Fake::default());
+        let click: ClickArgs =
+            serde_json::from_value(json!({ "id": ID, "x": 10, "y": 20, "button": "right" }))
+                .unwrap();
+        srv.click(Parameters(click)).await.unwrap();
+        let typed: TypeTextArgs =
+            serde_json::from_value(json!({ "id": ID, "text": "Terminal\n" })).unwrap();
+        srv.type_text(Parameters(typed)).await.unwrap();
+        let key: PressKeyArgs =
+            serde_json::from_value(json!({ "id": ID, "key": "cmd+space" })).unwrap();
+        srv.press_key(Parameters(key)).await.unwrap();
+        let scroll: ScrollArgs =
+            serde_json::from_value(json!({ "id": ID, "x": 1, "y": 2, "dy": -3 })).unwrap();
+        srv.scroll(Parameters(scroll)).await.unwrap();
+        let actions: Vec<InputAction> = srv
+            .backend()
+            .state()
+            .inputs
+            .iter()
+            .flat_map(|(_, a)| a.clone())
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                InputAction::Click {
+                    x: 10,
+                    y: 20,
+                    button: warren_core::MouseButton::Right,
+                    count: 1
+                },
+                InputAction::Type {
+                    text: "Terminal\n".into()
+                },
+                InputAction::Key {
+                    key: "cmd+space".into()
+                },
+                InputAction::Scroll {
+                    x: 1,
+                    y: 2,
+                    dx: 0,
+                    dy: -3
+                },
+            ]
+        );
+        // Bad arguments never reach the backend.
+        let bad: PressKeyArgs =
+            serde_json::from_value(json!({ "id": ID, "key": "hyper+x" })).unwrap();
+        let err = srv.press_key(Parameters(bad)).await.unwrap_err();
+        assert_eq!(err.0.code, "invalid_request");
+        let bad: ClickArgs =
+            serde_json::from_value(json!({ "id": ID, "x": 1, "y": 1, "button": "side" })).unwrap();
+        assert!(srv.click(Parameters(bad)).await.is_err());
+        assert_eq!(srv.backend().state().inputs.len(), 4);
     }
 
     #[tokio::test]

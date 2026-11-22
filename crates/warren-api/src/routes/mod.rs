@@ -62,6 +62,8 @@ pub fn build(state: Arc<Deps>) -> Router {
         .route("/v1/instances/{id}/update", post(instances::update))
         .route("/v1/instances/{id}/fork", post(instances::fork))
         .route("/v1/instances/{id}/exec", post(instances::exec))
+        .route("/v1/instances/{id}/screenshot", get(instances::screenshot))
+        .route("/v1/instances/{id}/input", post(instances::input))
         .route("/v1/instances/{id}/logs", get(instances::logs))
         .route("/v1/instances/{id}/metrics", get(instances::metrics))
         .route("/v1/instances/{id}/signed-url", get(instances::signed_url))

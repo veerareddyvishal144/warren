@@ -4,7 +4,7 @@
 use std::{collections::HashMap, sync::Mutex};
 
 use warren_core::{
-    CreateInstanceRequest, Error, ExecRequest, ExecResult, Instance, Result, Template,
+    CreateInstanceRequest, Error, ExecRequest, ExecResult, InputAction, Instance, Result, Template,
     agentapi::{DirListing, ResponseObject, ResponsesRequest},
 };
 use warren_sdk::AgentClient;
@@ -161,5 +161,13 @@ impl Backend for SdkBackend {
 
     async fn list_templates(&self) -> Result<Vec<Template>> {
         Ok(self.client.templates().await?)
+    }
+
+    async fn screenshot(&self, id: &str) -> Result<Vec<u8>> {
+        Ok(self.client.screenshot(id).await?.png)
+    }
+
+    async fn input(&self, id: &str, actions: Vec<InputAction>) -> Result<()> {
+        Ok(self.client.input(id, &actions).await?)
     }
 }

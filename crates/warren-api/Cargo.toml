@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
 warren-core = { workspace = true, features = ["axum"] }
 axum.workspace = true
 axum-extra.workspace = true

@@ -3,12 +3,14 @@
 use std::time::Duration;
 
 use reqwest::Method;
+use reqwest::header::ACCEPT;
 use serde_json::{Map, Value, json};
 use warren_core::json::List;
 use warren_core::{
     ApiKey, Backup, CreateInstanceRequest, Cron, DEFAULT_EXEC_TIMEOUT_SEC, ExecRequest, ExecResult,
-    ForkRequest, Instance, InstanceStatus, MetricPoint, PatchInstanceRequest,
-    RegisterTemplateRequest, ShapeRequest, Template,
+    ForkRequest, InputAction, InputRequest, Instance, InstanceStatus, MetricPoint,
+    PatchInstanceRequest, RegisterTemplateRequest, Screenshot, ShapeRequest, Template,
+    screen::png_dimensions,
 };
 
 use crate::agent::AgentClient;
@@ -332,6 +334,36 @@ impl Client {
             .timeout(Duration::from_secs(u64::from(secs) + 60))
             .json(req);
         h.json(rb).await
+    }
+
+    /// `GET /v1/instances/{id}/screenshot`: a PNG of the screen of a `mac`
+    /// instance (other types answer `not_supported`). A sleeping instance is
+    /// woken first.
+    pub async fn screenshot(&self, id: &str) -> Result<Screenshot, SdkError> {
+        let h = self.http();
+        let rb = h
+            .raw_request(
+                Method::GET,
+                &self.url(&instance_path(id, "/screenshot"), &[]),
+            )
+            .header(ACCEPT, "image/png")
+            .timeout(Duration::from_secs(60));
+        let png = h.bytes(rb).await?;
+        let (width, height) = png_dimensions(&png).unwrap_or((0, 0));
+        Ok(Screenshot { width, height, png })
+    }
+
+    /// `POST /v1/instances/{id}/input`: pointer and keyboard actions on the
+    /// screen of a `mac` instance, in order.
+    pub async fn input(&self, id: &str, actions: &[InputAction]) -> Result<(), SdkError> {
+        let h = self.http();
+        let rb = h
+            .json_request(Method::POST, &self.url(&instance_path(id, "/input"), &[]))
+            .timeout(Duration::from_secs(90))
+            .json(&InputRequest {
+                actions: actions.to_vec(),
+            });
+        h.empty(rb).await
     }
 
     /// `GET /v1/instances/{id}/logs?tail=&since=`. Zero means "not set".

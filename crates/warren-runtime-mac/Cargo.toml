@@ -18,6 +18,8 @@ reqwest.workspace = true
 sha2.workspace = true
 hex.workspace = true
 bytes.workspace = true
+des.workspace = true
+png.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

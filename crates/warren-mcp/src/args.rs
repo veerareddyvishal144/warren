@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
 use warren_core::{
-    CreateInstanceRequest, Error, ExecRequest, InstanceType, NetworkMode, Result, SecretSpec,
-    ShapeRequest, agentapi::ResponsesRequest, broker, ids,
+    CreateInstanceRequest, Error, ExecRequest, InputAction, InstanceType, MouseButton, NetworkMode,
+    Result, SecretSpec, ShapeRequest, agentapi::ResponsesRequest, broker, ids,
 };
 
 /// Lowest signed-URL lifetime the API accepts, in seconds.
@@ -236,6 +236,116 @@ impl ExecArgs {
             ..Default::default()
         };
         Ok((id, req))
+    }
+}
+
+/// `click`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ClickArgs {
+    /// Instance id (a mac instance).
+    pub id: String,
+    /// Horizontal position in screen pixels from the left edge (the screenshot's coordinates).
+    pub x: u32,
+    /// Vertical position in screen pixels from the top edge.
+    pub y: u32,
+    /// "left" (default), "right" or "middle".
+    pub button: Option<String>,
+    /// 1 (default) for a click, 2 for a double click, 3 for a triple click.
+    pub count: Option<u32>,
+}
+
+impl ClickArgs {
+    pub fn into_action(self) -> Result<(String, InputAction)> {
+        let id = instance_id(&self.id)?.to_string();
+        let button = match self.button.as_deref().map(str::trim).unwrap_or("left") {
+            "left" | "" => MouseButton::Left,
+            "right" => MouseButton::Right,
+            "middle" => MouseButton::Middle,
+            other => {
+                return Err(Error::invalid(format!(
+                    "button {other:?} is not left, right or middle"
+                )));
+            }
+        };
+        let action = InputAction::Click {
+            x: self.x,
+            y: self.y,
+            button,
+            count: self.count.unwrap_or(1),
+        };
+        action.validate()?;
+        Ok((id, action))
+    }
+}
+
+/// `type_text`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct TypeTextArgs {
+    /// Instance id (a mac instance).
+    pub id: String,
+    /// Text to type into whatever has keyboard focus; "\n" presses Return, "\t" Tab.
+    pub text: String,
+}
+
+impl TypeTextArgs {
+    pub fn into_action(self) -> Result<(String, InputAction)> {
+        let id = instance_id(&self.id)?.to_string();
+        let action = InputAction::Type { text: self.text };
+        action.validate()?;
+        Ok((id, action))
+    }
+}
+
+/// `press_key`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct PressKeyArgs {
+    /// Instance id (a mac instance).
+    pub id: String,
+    /// A key or chord: "enter", "escape", "tab", "space", "backspace", "delete", "up"/"down"/"left"/"right", "f1".."f12", a single character, or modifiers joined with "+": "cmd+space", "cmd+shift+a", "ctrl+c", "alt+tab".
+    pub key: String,
+}
+
+impl PressKeyArgs {
+    pub fn into_action(self) -> Result<(String, InputAction)> {
+        let id = instance_id(&self.id)?.to_string();
+        let action = InputAction::Key {
+            key: self.key.trim().to_string(),
+        };
+        action.validate()?;
+        Ok((id, action))
+    }
+}
+
+/// `scroll`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ScrollArgs {
+    /// Instance id (a mac instance).
+    pub id: String,
+    /// Horizontal position of the pointer while scrolling, in screen pixels.
+    pub x: u32,
+    /// Vertical position of the pointer while scrolling, in screen pixels.
+    pub y: u32,
+    /// Horizontal wheel steps: positive scrolls right. Default 0.
+    pub dx: Option<i32>,
+    /// Vertical wheel steps: positive scrolls down (content moves up), negative up. Default 0.
+    pub dy: Option<i32>,
+}
+
+impl ScrollArgs {
+    pub fn into_action(self) -> Result<(String, InputAction)> {
+        let id = instance_id(&self.id)?.to_string();
+        let action = InputAction::Scroll {
+            x: self.x,
+            y: self.y,
+            dx: self.dx.unwrap_or(0),
+            dy: self.dy.unwrap_or(0),
+        };
+        action.validate()?;
+        Ok((id, action))
     }
 }
 

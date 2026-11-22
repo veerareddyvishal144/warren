@@ -310,6 +310,9 @@ pub fn plan(args: &MacInitArgs, facts: &Facts, stage: &Path) -> Vec<Step> {
     if args.with_agents {
         argv.push("--with-agents".into());
     }
+    if args.auto_login {
+        argv.push("--auto-login".into());
+    }
     steps.push(Step::Run {
         title: format!(
             "clone the source into {} and install the gateway launcher, pf rules, your SSH key and a new guest password (stored in ~/.warren/mac/{}.password)",
@@ -521,6 +524,7 @@ mod tests {
             unattended: "tahoe".into(),
             target: "warren-macos-26".into(),
             with_agents: false,
+            auto_login: false,
             force: false,
             dry_run: true,
         }

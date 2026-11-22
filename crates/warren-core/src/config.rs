@@ -49,8 +49,10 @@ pub struct Config {
     /// Name of the stopped Lume VM every `mac` instance is cloned from. None
     /// leaves the `mac` type disabled.
     pub mac_base_vm: Option<String>,
-    /// Start `mac` instances with Lume's VNC server on (a random password per
-    /// run, reachable from the host only). Off by default.
+    /// Start `mac` instances with Lume's VNC server on: a random password
+    /// per run, bound to 127.0.0.1, the channel for `screenshot` and `input`.
+    /// On by default; off leaves those two endpoints answering
+    /// `not_supported`.
     pub mac_vnc: bool,
     /// Names of the runtimes that came up, as reported by `GET /v1/health`
     /// ("docker", "firecracker", "lume"). Filled by the daemon after startup.
@@ -118,7 +120,7 @@ impl Default for Config {
             lume_api_url: "http://127.0.0.1:7777".into(),
             lume_bin: PathBuf::from("lume"),
             mac_base_vm: None,
-            mac_vnc: false,
+            mac_vnc: true,
             runtime_names: Vec::new(),
             gateway_bin: None,
             dev_mode: false,

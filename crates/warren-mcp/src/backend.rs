@@ -8,7 +8,8 @@ use std::future::Future;
 
 use serde::{Deserialize, Serialize};
 use warren_core::{
-    CreateInstanceRequest, ExecRequest, ExecResult, Instance, InstanceStatus, Result, Template,
+    CreateInstanceRequest, ExecRequest, ExecResult, InputAction, Instance, InstanceStatus, Result,
+    Template,
     agentapi::{DirListing, ResponseObject, ResponsesRequest},
 };
 
@@ -87,4 +88,9 @@ pub trait Backend: Send + Sync + 'static {
     ) -> impl Future<Output = Result<SignedUrl>> + Send;
     /// `GET /v1/templates`.
     fn list_templates(&self) -> impl Future<Output = Result<Vec<Template>>> + Send;
+    /// `GET /v1/instances/{id}/screenshot`: PNG bytes (mac instances only).
+    fn screenshot(&self, id: &str) -> impl Future<Output = Result<Vec<u8>>> + Send;
+    /// `POST /v1/instances/{id}/input`: screen actions, in order.
+    fn input(&self, id: &str, actions: Vec<InputAction>)
+    -> impl Future<Output = Result<()>> + Send;
 }
