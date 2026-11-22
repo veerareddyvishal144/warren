@@ -45,6 +45,15 @@ pub struct DockerRuntime {
     egress_installed: AtomicBool,
     /// The "not root, no egress rules" warning was logged.
     egress_warned: AtomicBool,
+    /// Checkpoints are in use: requested by the config and the engine runs in
+    /// experimental mode (decided by `ready`); see the `checkpoint` module.
+    pub(crate) checkpoints: AtomicBool,
+    /// The "requested but the engine is not experimental" warning was logged.
+    pub(crate) checkpoints_warned: AtomicBool,
+    /// Client for the gateway inside instances (exec while checkpoints are
+    /// on). No pooling: a restored container does not know the connections
+    /// opened before its checkpoint.
+    pub(crate) http: reqwest::Client,
 }
 
 /// Outcome of choosing the OCI runtime.
@@ -108,6 +117,12 @@ impl DockerRuntime {
     pub async fn new(cfg: Config) -> Result<DockerRuntime> {
         let docker = Docker::connect_with_local_defaults()
             .map_err(|e| Error::internal(format!("docker: cannot build a client: {e}")))?;
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(0)
+            .build()
+            .map_err(|e| Error::internal(format!("http client: {e}")))?;
         tracing::debug!(preference = %cfg.runtime, instances_dir = %cfg.instances_dir().display(), "docker client built");
         Ok(DockerRuntime {
             cfg,
@@ -117,6 +132,9 @@ impl DockerRuntime {
             blocked_networks: Mutex::new(BTreeSet::new()),
             egress_installed: AtomicBool::new(false),
             egress_warned: AtomicBool::new(false),
+            checkpoints: AtomicBool::new(false),
+            checkpoints_warned: AtomicBool::new(false),
+            http,
         })
     }
 
@@ -223,11 +241,16 @@ impl DockerRuntime {
         self.ensure_network(NETWORK_PUBLIC, false).await?;
         self.ensure_network(NETWORK_INTERNAL, true).await?;
         self.install_egress_rules().await?;
+        self.note_checkpoint_support(
+            info.experimental_build.unwrap_or(false),
+            self.runtime_name(),
+        );
         tracing::info!(
             runtime = %self.runtime_name(),
             server = info.server_version.as_deref().unwrap_or("?"),
             offered = ?available,
             egress_rules = self.egress_rules_installed(),
+            checkpoints = self.checkpoints_enabled(),
             "docker runtime ready"
         );
         Ok(())
@@ -458,6 +481,20 @@ impl Runtime for DockerRuntime {
 
     async fn stop(&self, inst: &Instance, grace: Duration) -> Result<()> {
         self.stop_impl(inst, grace).await
+    }
+
+    async fn sleep(&self, inst: &Instance, grace: Duration) -> Result<()> {
+        self.sleep_impl(inst, grace).await
+    }
+
+    /// From the container's state, not its stats: the engine answers one-shot
+    /// stats (zeros) for an exited container too, which would read as alive.
+    async fn is_running(&self, inst: &Instance) -> Result<bool> {
+        match self.docker.inspect_container(&target(inst), None).await {
+            Ok(inspect) => Ok(crate::container::is_running(&inspect)),
+            Err(e) if error::is_not_found(&e) => Ok(false),
+            Err(e) => Err(error::map(e, "container")),
+        }
     }
 
     async fn destroy(&self, inst: &Instance, remove_storage: bool) -> Result<()> {

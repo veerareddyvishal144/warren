@@ -201,6 +201,15 @@ impl Daemon {
             .unwrap_or(false)
     }
 
+    /// `WARREN_E2E_DOCKER_CHECKPOINTS=1` asks for `--docker-checkpoints` on
+    /// every daemon (sleep with memory on Docker instances; the engine must
+    /// run in experimental mode).
+    pub fn checkpoints_requested() -> bool {
+        std::env::var("WARREN_E2E_DOCKER_CHECKPOINTS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
     /// Where the daemon binary is (see [`binary_path_from`]).
     pub fn binary_path() -> Result<PathBuf> {
         binary_path_from(
@@ -278,6 +287,9 @@ impl Daemon {
             {
                 cmd.args(["--firecracker-jailer", &jailer]);
             }
+        }
+        if Self::checkpoints_requested() {
+            cmd.arg("--docker-checkpoints");
         }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::from(log))

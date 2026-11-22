@@ -27,6 +27,9 @@
 #   WARREN_E2E_KERNEL          kernel for --vm (default /data/sandbox-probe/vmlinux-6.1.155)
 #   WARREN_E2E_FIRECRACKER_BIN firecracker binary for --vm (default /data/sandbox-probe/firecracker)
 #   WARREN_E2E_FIRECRACKER_JAILER  jailer binary: when set, the vm daemons run with --firecracker-jailer
+#   WARREN_E2E_DOCKER_CHECKPOINTS  1 starts every daemon with --docker-checkpoints and runs
+#                              default_sleep_keeps_memory; the Docker engine (DOCKER_HOST) must be in
+#                              experimental mode, e.g. a test engine started with "experimental": true
 #
 # make build and make images need the musl toolchain for the static gateway
 # (once: make musl-setup).

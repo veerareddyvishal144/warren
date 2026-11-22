@@ -7,7 +7,9 @@ repository.workspace = true
 
 [dependencies]
 warren-core.workspace = true
+warren-gateway-client.workspace = true
 bollard.workspace = true
+reqwest.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
@@ -17,6 +19,9 @@ tracing.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
 tar.workspace = true
 flate2.workspace = true
 walkdir.workspace = true

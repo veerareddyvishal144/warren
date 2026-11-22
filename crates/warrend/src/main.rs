@@ -55,6 +55,13 @@ struct Args {
     /// reachable. Default: on for macOS hosts.
     #[arg(long, env = "WARREN_DOCKER_PUBLISH_PORTS", default_value_t = cfg!(target_os = "macos"))]
     docker_publish_ports: bool,
+    /// Sleep Docker instances with their memory: checkpoint the container
+    /// through the engine's checkpoint API (gVisor's runsc checkpoint) and
+    /// restore it on wake, so processes keep running with their pids. The
+    /// engine must run in experimental mode ("experimental": true in
+    /// daemon.json); otherwise sleep keeps the disk only, as without the flag.
+    #[arg(long, env = "WARREN_DOCKER_CHECKPOINTS", default_value_t = false)]
+    docker_checkpoints: bool,
     /// Where the egress broker (allowlist proxy and secret routes) listens;
     /// it must be reachable from the instances' networks. `none` runs without
     /// a broker, which refuses `allowlist` instances and secrets.
@@ -149,6 +156,7 @@ impl Args {
             signup_enabled: self.signup_enabled,
             allow_private_egress: self.allow_private_egress,
             docker_publish_ports: self.docker_publish_ports,
+            docker_checkpoints: self.docker_checkpoints,
             broker_listen: self.broker_listen,
             broker_advertise_addr: self
                 .broker_advertise

@@ -8,6 +8,7 @@
 
 use std::{
     collections::BTreeMap,
+    net::Ipv4Addr,
     time::{Duration, Instant},
 };
 
@@ -18,8 +19,8 @@ use bollard::{
 };
 use futures::StreamExt;
 use warren_core::{
-    DEFAULT_EXEC_TIMEOUT_SEC, Error, ExecRequest, ExecResult, Instance, MAX_EXEC_OUTPUT_BYTES,
-    Result,
+    DEFAULT_EXEC_TIMEOUT_SEC, Error, ExecRequest, ExecResult, GATEWAY_PORT, Instance,
+    MAX_EXEC_OUTPUT_BYTES, Result,
 };
 
 use crate::{DockerRuntime, container::env_pairs, error, runtime::target, storage};
@@ -28,6 +29,22 @@ use crate::{DockerRuntime, container::env_pairs, error, runtime::target, storage
 const TAIL_BYTES: usize = 2048;
 /// How long to wait for Docker to record the exit code once the output closed.
 const EXIT_CODE_WAIT: Duration = Duration::from_secs(5);
+
+/// Where the daemon reaches the instance's gateway: the recorded address and
+/// the gateway port, or the loopback port it was published on. `None` for an
+/// instance without a gateway (no default port) or without an address.
+pub(crate) fn gateway_address(inst: &Instance) -> Option<(Ipv4Addr, u16)> {
+    if inst.default_port == 0 {
+        return None;
+    }
+    let ip: Ipv4Addr = inst.ip.parse().ok()?;
+    let port = inst
+        .published_ports
+        .get(&GATEWAY_PORT)
+        .copied()
+        .unwrap_or(GATEWAY_PORT);
+    Some((ip, port))
+}
 
 /// Who an exec runs as and with which environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +131,17 @@ impl DockerRuntime {
     pub(crate) async fn exec_impl(&self, inst: &Instance, req: &ExecRequest) -> Result<ExecResult> {
         if req.command.trim().is_empty() {
             return Err(Error::invalid("command must not be empty"));
+        }
+        // While checkpoints are on, exec through the gateway (pid 1) rather
+        // than Docker exec: a Docker exec session sits outside the container's
+        // init tree and gVisor does not carry it, or anything it started,
+        // across a checkpoint and restore. The gateway's children survive.
+        if self.checkpoints_enabled()
+            && let Some((ip, port)) = gateway_address(inst)
+        {
+            tracing::debug!(instance = %inst.id, %ip, port, "exec through the gateway (checkpoints on)");
+            return warren_gateway_client::exec_at(&self.http, ip, port, &inst.instance_token, req)
+                .await;
         }
         let reference = target(inst);
         let timeout_seconds = if req.timeout_seconds == 0 {
@@ -309,6 +337,31 @@ mod tests {
             assert_eq!(id.user.as_deref(), Some(user));
             assert_eq!(id.env, req.env, "no HOME is added for {user}");
         }
+    }
+
+    #[test]
+    fn gateway_address_needs_a_gateway_and_an_address() {
+        let mut inst = Instance {
+            default_port: GATEWAY_PORT,
+            ip: "172.18.0.5".into(),
+            ..Instance::default()
+        };
+        assert_eq!(
+            gateway_address(&inst),
+            Some(("172.18.0.5".parse().unwrap(), GATEWAY_PORT))
+        );
+        // Published on loopback (macOS hosts): the published port is used.
+        inst.ip = "127.0.0.1".into();
+        inst.published_ports.insert(GATEWAY_PORT, 49152);
+        assert_eq!(
+            gateway_address(&inst),
+            Some(("127.0.0.1".parse().unwrap(), 49152))
+        );
+        inst.ip.clear();
+        assert_eq!(gateway_address(&inst), None, "no address, no gateway route");
+        inst.ip = "172.18.0.5".into();
+        inst.default_port = 0;
+        assert_eq!(gateway_address(&inst), None, "no default port, no gateway");
     }
 
     #[test]
