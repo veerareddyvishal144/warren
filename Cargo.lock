@@ -3311,6 +3311,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "reqwest",
  "serde",
  "serde_json",
  "tar",
@@ -3319,6 +3320,7 @@ dependencies = [
  "tracing",
  "walkdir",
  "warren-core",
+ "warren-gateway-client",
 ]
 
 [[package]]
