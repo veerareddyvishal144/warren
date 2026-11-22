@@ -39,7 +39,7 @@ Not yet measured. [vm-instances.md](vm-instances.md) describes a container start
 
 | Operation | `default` (gVisor) | `vm` (Firecracker) |
 |---|---|---|
-| Create to `running` (image already pulled) | not yet measured | about 17 s on the Azure VM (rootfs built from the image, kernel boot, gateway up) |
+| Create to `running` (image already pulled) | not yet measured | 3.0 s on the Azure VM with the image's root filesystem already in the cache (0.65 s to copy and personalise it, then the boot and the gateway's first health check); 18 s when the cache has to pack the image first (8 s `docker export`, 6 s `mkfs.ext4 -d`). Before the cache every create took 17 s |
 | Wake from sleep (fresh boot, disk intact) | not yet measured | not applicable: `vm` wakes from a snapshot (a cold boot only when the snapshot is unusable) |
 | Sleep with memory (pause, full snapshot: a memory file as large as the guest's RAM) | not applicable | 24 to 25 s for a 4 GB guest on the Azure VM (writing the 4 GB memory file dominates) |
 | Wake from the snapshot (processes and pids kept) | not applicable | 0.2 s to a reachable gateway (204 and 227 ms measured); the marker process kept its pid |

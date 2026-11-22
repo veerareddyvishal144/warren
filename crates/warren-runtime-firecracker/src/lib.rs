@@ -39,6 +39,7 @@
 #![warn(missing_docs)]
 
 mod api;
+mod cache;
 mod host;
 mod image;
 mod inject;
@@ -88,6 +89,8 @@ const CONSOLE_TAIL_BYTES: u64 = 4 << 20;
 const KILL_WAIT: Duration = Duration::from_secs(5);
 /// Time allowed for `sync` inside the guest before a snapshot.
 const GUEST_SYNC_TIMEOUT_SECS: u32 = 30;
+/// `rootfs::ENV_FILE` as a guest path.
+const GUEST_ENV_FILE: &str = "/etc/warren.env";
 
 /// How a root filesystem gets the gateway that serves the Warren API. The
 /// daemon decides through the template's scope; see [`inject`].
@@ -127,6 +130,9 @@ pub struct FirecrackerRuntime {
     cfg: Config,
     http: reqwest::Client,
     guest_init: String,
+    /// Packed root filesystems shared by instances of one image; `None`
+    /// when `firecracker_rootfs_cache_gb` is 0.
+    cache: Option<cache::Cache>,
     /// Serialises guest ip allocation.
     alloc: tokio::sync::Mutex<()>,
     /// Last CPU sample per instance id, for `stats`.
@@ -147,10 +153,15 @@ impl FirecrackerRuntime {
             .pool_max_idle_per_host(0)
             .build()
             .map_err(|e| Error::internal(format!("http client: {e}")))?;
+        let cache = cache::Cache::new(
+            cfg.firecracker_rootfs_cache_dir(),
+            cfg.firecracker_rootfs_cache_gb,
+        );
         Ok(FirecrackerRuntime {
             cfg,
             http,
             guest_init: GUEST_INIT.to_string(),
+            cache,
             alloc: tokio::sync::Mutex::new(()),
             cpu: Mutex::new(HashMap::new()),
         })
@@ -343,11 +354,13 @@ impl FirecrackerRuntime {
 
     /// Everything the exported tree at `dir` needs before it is packed: the
     /// gateway and wrap file as `plan` says, `preserved_home` moved to the
-    /// mount path, then the identity files and the env.
+    /// mount path, then the identity files (hostname `identity`: the
+    /// instance id, or a placeholder for a cached image) and the env.
     fn stage_rootfs_dir(
         &self,
         dir: &Path,
         inst: &Instance,
+        identity: &str,
         env: &BTreeMap<String, String>,
         preserved_home: Option<PathBuf>,
         plan: &GatewayPlan,
@@ -381,7 +394,7 @@ impl FirecrackerRuntime {
                 ))
             })?;
         }
-        rootfs::write_identity_files(dir, &inst.id, &inst.mount_path)?;
+        rootfs::write_identity_files(dir, identity, &inst.mount_path)?;
         rootfs::write_env_file(dir, env)?;
         Ok(())
     }
@@ -389,7 +402,10 @@ impl FirecrackerRuntime {
     /// Export `image`, stage the tree (gateway, preserved home, identity files,
     /// env) and pack everything into a fresh `rootfs.ext4`. The old image stays
     /// in place until the new one is complete. `inject_gateway` is the daemon's
-    /// decision for this image: true for workspace templates.
+    /// decision for this image: true for workspace templates. Without a
+    /// preserved home the packed image comes from the cache when one is on
+    /// (a sparse copy plus the instance's own files), and a cache problem
+    /// falls back to this full build with a warning.
     async fn build_rootfs(
         &self,
         inst: &Instance,
@@ -410,11 +426,27 @@ impl FirecrackerRuntime {
         let tmp = p.rootfs_tmp();
         rootfs::remove_tree(&dir)?;
         let _ = std::fs::remove_file(&tmp);
+        let plan = Self::plan_gateway(image, inject_gateway).await?;
+        if preserved_home.is_none()
+            && let Some(cache) = &self.cache
+        {
+            match self
+                .rootfs_from_cache(inst, p, image, env, &plan, cache)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => tracing::warn!(
+                    instance = %inst.id, error = %e.describe(),
+                    "root filesystem cache unusable; building from the image"
+                ),
+            }
+            let _ = rootfs::remove_tree(&dir);
+            let _ = std::fs::remove_file(&tmp);
+        }
         let result = async {
-            let plan = Self::plan_gateway(image, inject_gateway).await?;
             tracing::info!(instance = %inst.id, image, "exporting image");
             image::export_rootfs(image, &dir).await?;
-            self.stage_rootfs_dir(&dir, inst, env, preserved_home, &plan)?;
+            self.stage_rootfs_dir(&dir, inst, &inst.id, env, preserved_home, &plan)?;
             tracing::info!(instance = %inst.id, disk_gb = inst.shape.disk, "packing root filesystem");
             rootfs::mkfs(&dir, &tmp, inst.shape.disk).await?;
             std::fs::rename(&tmp, p.rootfs()).map_err(|e| Error::internal(format!("install rootfs: {e}")))?;
@@ -426,6 +458,311 @@ impl FirecrackerRuntime {
             let _ = std::fs::remove_file(&tmp);
         }
         result
+    }
+
+    /// The cache key of `image` packed for this instance's disk size, with
+    /// `plan` for the gateway.
+    fn cache_key(&self, inst: &Instance, image_id: &str, plan: &GatewayPlan) -> String {
+        let gateway = match plan {
+            GatewayPlan::ImageProvides => "image".to_string(),
+            GatewayPlan::Inject { command } => format!(
+                "inject:{}:{}",
+                self.cfg
+                    .gateway_bin
+                    .as_deref()
+                    .and_then(cache::file_hash)
+                    .unwrap_or_else(|| "none".to_string()),
+                inject::render_wrap(command).trim_end()
+            ),
+        };
+        cache::key(&cache::KeyInput {
+            image_id,
+            gateway: &gateway,
+            guest_init: &self.guest_init,
+            mount_path: &inst.mount_path,
+            disk_gb: inst.shape.disk,
+        })
+    }
+
+    /// Install `rootfs.ext4` from the cache: look the key up, pack and
+    /// publish the image on a miss, then sparse-copy the entry and write the
+    /// instance's own hostname, hosts and env into the copy.
+    async fn rootfs_from_cache(
+        &self,
+        inst: &Instance,
+        p: &Paths,
+        image: &str,
+        env: &BTreeMap<String, String>,
+        plan: &GatewayPlan,
+        cache: &cache::Cache,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let image_id = image::inspect_id(image)
+            .await?
+            .ok_or_else(|| Error::internal(format!("image {image} is not present locally")))?;
+        let inspect_ms = started.elapsed().as_millis() as u64;
+        let key = self.cache_key(inst, &image_id, plan);
+        let now = Self::now_unix();
+        let (cached, patch, hit) = match cache.lookup(&key) {
+            Some((path, meta)) => (path, meta.patch, true),
+            None => {
+                let build_started = Instant::now();
+                let dir = p.rootfs_dir();
+                let scratch = cache.scratch(&key)?;
+                let built = async {
+                    tracing::info!(instance = %inst.id, image, key = %key, "exporting image for the root filesystem cache");
+                    image::export_rootfs(image, &dir).await?;
+                    self.stage_rootfs_dir(
+                        &dir,
+                        inst,
+                        cache::PLACEHOLDER_ID,
+                        &BTreeMap::new(),
+                        None,
+                        plan,
+                    )?;
+                    Self::write_placeholders(&dir)?;
+                    rootfs::mkfs(&dir, &scratch, inst.shape.disk).await?;
+                    Self::locate_placeholders(&scratch).await
+                }
+                .await;
+                let _ = rootfs::remove_tree(&dir);
+                let patch = match built {
+                    Ok(patch) => patch,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&scratch);
+                        return Err(e);
+                    }
+                };
+                let path = cache.insert(
+                    &key,
+                    &scratch,
+                    cache::Meta {
+                        format: cache::FORMAT_VERSION,
+                        image_ref: image.to_string(),
+                        image_id: image_id.clone(),
+                        disk_gb: inst.shape.disk,
+                        created_at: now,
+                        last_used: now,
+                        patch: patch.clone(),
+                    },
+                )?;
+                tracing::info!(
+                    instance = %inst.id, image, key = %key, disk_gb = inst.shape.disk,
+                    build_ms = build_started.elapsed().as_millis() as u64,
+                    "root filesystem packed into the cache"
+                );
+                (path, patch, false)
+            }
+        };
+        let tmp = p.rootfs_tmp();
+        let (src, dst) = (cached.clone(), tmp.clone());
+        let copy_started = Instant::now();
+        let copied = tokio::task::spawn_blocking(move || rootfs::sparse_copy(&src, &dst))
+            .await
+            .map_err(|e| Error::internal(format!("copy task failed: {e}")))?;
+        if let Err(e) = copied {
+            // The entry vanished (evicted by another create) or is unreadable;
+            // the caller builds from the image instead.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        let copy_ms = copy_started.elapsed().as_millis() as u64;
+        let personalise_started = Instant::now();
+        if let Err(e) = self
+            .personalise_rootfs(inst, env, &tmp, patch.as_ref())
+            .await
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        let personalise_ms = personalise_started.elapsed().as_millis() as u64;
+        std::fs::rename(&tmp, p.rootfs())
+            .map_err(|e| Error::internal(format!("install rootfs: {e}")))?;
+        cache.touch(&key, now);
+        tracing::info!(
+            instance = %inst.id, image, key = %key, hit,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            inspect_ms, copy_ms, personalise_ms,
+            "root filesystem installed from the cache"
+        );
+        if !hit {
+            self.trim_cache(cache, &key).await;
+        }
+        Ok(())
+    }
+
+    /// The three files a copy gets its own version of, with their
+    /// placeholder sizes and modes: hostname, hosts and the env file.
+    fn placeholder_files() -> [(&'static str, usize, u32); 3] {
+        [
+            ("/etc/hostname", cache::PLACEHOLDER_HOSTNAME_BYTES, 0o644),
+            ("/etc/hosts", cache::PLACEHOLDER_HOSTS_BYTES, 0o644),
+            (GUEST_ENV_FILE, cache::PLACEHOLDER_ENV_BYTES, 0o600),
+        ]
+    }
+
+    /// Replace the identity files of a staged tree with newline-padded
+    /// placeholders of fixed sizes, so every copy can overwrite their blocks.
+    fn write_placeholders(dir: &Path) -> Result<()> {
+        let texts = [
+            rootfs::render_hostname(cache::PLACEHOLDER_ID),
+            rootfs::render_hosts(cache::PLACEHOLDER_ID),
+            String::new(),
+        ];
+        for ((guest_path, size, mode), text) in Self::placeholder_files().iter().zip(texts) {
+            let padded = rootfs::pad_with_newlines(&text, *size).ok_or_else(|| {
+                Error::internal(format!("placeholder for {guest_path} too small"))
+            })?;
+            rootfs::write_file(&rootfs::guest_to_host(dir, guest_path), &padded, *mode)?;
+        }
+        Ok(())
+    }
+
+    /// Where the placeholders landed in the packed image, or `None` (with a
+    /// warning) when debugfs cannot say; copies then use debugfs writes.
+    async fn locate_placeholders(image: &Path) -> Result<Option<cache::Patch>> {
+        let block_size = rootfs::block_size(image).await?;
+        let mut files = BTreeMap::new();
+        for (guest_path, size, _) in Self::placeholder_files() {
+            let Some(blocks) = rootfs::file_blocks(image, guest_path).await? else {
+                tracing::warn!(
+                    path = guest_path,
+                    "placeholder missing from the packed image; copies will use debugfs"
+                );
+                return Ok(None);
+            };
+            if blocks.len() * (block_size as usize) < size {
+                tracing::warn!(
+                    path = guest_path,
+                    blocks = blocks.len(),
+                    "placeholder has too few blocks; copies will use debugfs"
+                );
+                return Ok(None);
+            }
+            files.insert(
+                guest_path.to_string(),
+                cache::FilePlace {
+                    blocks,
+                    size: size as u32,
+                },
+            );
+        }
+        Ok(Some(cache::Patch { block_size, files }))
+    }
+
+    /// Give a copy of a cached image this instance's identity: hostname,
+    /// hosts and the env file. With `patch` the contents are written straight
+    /// into the placeholder blocks (padded to their size; no filesystem
+    /// open, so no fsync of the fresh copy) and read back the same way;
+    /// without it, or when the env outgrows its placeholder, debugfs writes
+    /// them. Resolvers and the mount path directory are the same for every
+    /// copy and already in the cached image.
+    async fn personalise_rootfs(
+        &self,
+        inst: &Instance,
+        env: &BTreeMap<String, String>,
+        image: &Path,
+        patch: Option<&cache::Patch>,
+    ) -> Result<()> {
+        let texts = [
+            rootfs::render_hostname(&inst.id),
+            rootfs::render_hosts(&inst.id),
+            rootfs::render_env(env),
+        ];
+        let files = Self::placeholder_files();
+        if let Some(patch) = patch {
+            let padded: Option<Vec<(&str, String)>> = files
+                .iter()
+                .zip(&texts)
+                .map(|((guest_path, _, _), text)| {
+                    let place = patch.files.get(*guest_path)?;
+                    rootfs::pad_with_newlines(text, place.size as usize).map(|p| (*guest_path, p))
+                })
+                .collect();
+            match padded {
+                Some(padded) => {
+                    for (guest_path, text) in &padded {
+                        let place = &patch.files[*guest_path];
+                        rootfs::patch_blocks(
+                            image,
+                            &place.blocks,
+                            patch.block_size,
+                            text.as_bytes(),
+                        )?;
+                    }
+                    // Read back through the same blocks, not through debugfs:
+                    // even a read-only debugfs run syncs the file on close,
+                    // which on a fresh copy means flushing all of it to disk.
+                    for (guest_path, text) in &padded {
+                        let place = &patch.files[*guest_path];
+                        let back = rootfs::read_blocks(
+                            image,
+                            &place.blocks,
+                            patch.block_size,
+                            place.size as usize,
+                        )?;
+                        if back != text.as_bytes() {
+                            return Err(Error::internal(format!(
+                                "{guest_path} does not read back after patching {}",
+                                image.display()
+                            )));
+                        }
+                    }
+                    return Ok(());
+                }
+                None => tracing::info!(
+                    instance = %inst.id,
+                    "env larger than the cached placeholder; writing the identity files with debugfs"
+                ),
+            }
+        }
+        let [hostname, hosts, env_text] = &texts;
+        rootfs::put_files(
+            image,
+            &[
+                (files[0].0, hostname.as_str(), files[0].2),
+                (files[1].0, hosts.as_str(), files[1].2),
+                (files[2].0, env_text.as_str(), files[2].2),
+            ],
+        )
+        .await
+    }
+
+    /// After a new entry: drop entries whose image has left the engine, then
+    /// the least recently used ones beyond the budget (never `keep`).
+    async fn trim_cache(&self, cache: &cache::Cache, keep: &str) {
+        for (key, meta) in cache.entries() {
+            if key == keep {
+                continue;
+            }
+            match image::inspect(&meta.image_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tracing::info!(key = %key, image = %meta.image_ref, "dropping a cached root filesystem; its image is gone");
+                    if let Err(e) = cache.remove(&key) {
+                        tracing::warn!(key = %key, error = %e.describe(), "cannot remove the cache entry");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e.describe(), "cannot check cached images against the engine");
+                    break;
+                }
+            }
+        }
+        match cache.evict(keep, Self::now_unix()) {
+            Ok(removed) if !removed.is_empty() => {
+                tracing::info!(
+                    removed = removed.len(),
+                    budget_bytes = cache.budget_bytes(),
+                    total_bytes = cache.total_bytes(),
+                    "root filesystem cache trimmed to its budget"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e.describe(), "cannot trim the root filesystem cache")
+            }
+        }
     }
 
     /// SIGKILL the process and wait for it to vanish.
@@ -2010,8 +2347,15 @@ mod tests {
         // System image: nothing but the identity files and the env.
         let dir = tmp.path().join("system");
         fake_export(&dir);
-        rt.stage_rootfs_dir(&dir, &inst, &env, None, &GatewayPlan::ImageProvides)
-            .unwrap();
+        rt.stage_rootfs_dir(
+            &dir,
+            &inst,
+            &inst.id,
+            &env,
+            None,
+            &GatewayPlan::ImageProvides,
+        )
+        .unwrap();
         assert!(!dir.join(gateway).exists());
         assert!(!dir.join(WRAP_FILE).exists());
         assert_eq!(
@@ -2030,7 +2374,7 @@ mod tests {
         let plan = GatewayPlan::Inject {
             command: vec!["/bin/sh".to_string()],
         };
-        rt.stage_rootfs_dir(&dir, &inst, &env, Some(keep.clone()), &plan)
+        rt.stage_rootfs_dir(&dir, &inst, &inst.id, &env, Some(keep.clone()), &plan)
             .unwrap();
         let injected = dir.join(gateway);
         assert_eq!(
@@ -2066,7 +2410,8 @@ mod tests {
         let own = GatewayPlan::Inject {
             command: vec![GUEST_INIT.to_string(), "--serve".to_string()],
         };
-        rt.stage_rootfs_dir(&dir, &inst, &env, None, &own).unwrap();
+        rt.stage_rootfs_dir(&dir, &inst, &inst.id, &env, None, &own)
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join(gateway)).unwrap(),
             "image gateway"
@@ -2086,18 +2431,164 @@ mod tests {
         let dir = tmp.path().join("bare");
         fake_export(&dir);
         let err = rt
-            .stage_rootfs_dir(&dir, &inst, &env, None, &plan)
+            .stage_rootfs_dir(&dir, &inst, &inst.id, &env, None, &plan)
             .unwrap_err();
         assert_eq!(err.code, CODE_NOT_SUPPORTED);
         assert!(err.message.contains("--gateway-bin"), "{}", err.message);
         assert!(!dir.join(WRAP_FILE).exists() && !dir.join("etc/hostname").exists());
-        rt.stage_rootfs_dir(&dir, &inst, &env, None, &GatewayPlan::ImageProvides)
-            .unwrap();
+        rt.stage_rootfs_dir(
+            &dir,
+            &inst,
+            &inst.id,
+            &env,
+            None,
+            &GatewayPlan::ImageProvides,
+        )
+        .unwrap();
         assert!(dir.join("etc/hostname").is_file());
         std::fs::create_dir_all(dir.join("usr/local/bin")).unwrap();
         std::fs::write(dir.join(gateway), "image gateway").unwrap();
-        rt.stage_rootfs_dir(&dir, &inst, &env, None, &plan).unwrap();
+        rt.stage_rootfs_dir(&dir, &inst, &inst.id, &env, None, &plan)
+            .unwrap();
         assert!(dir.join(WRAP_FILE).is_file());
+    }
+
+    /// Two instances of one image share a cached packed root filesystem:
+    /// the second create copies it and writes its own identity in, and the
+    /// cache holds one entry. Needs Docker and e2fsprogs, not root.
+    #[tokio::test]
+    async fn creates_reuse_the_cached_root_filesystem_with_docker() {
+        let Some(image) = docker_test_image().await else {
+            eprintln!("skipping: docker unavailable");
+            return;
+        };
+        if !have_e2fsprogs() {
+            eprintln!("skipping: e2fsprogs not installed");
+            return;
+        }
+        let tmp = TempDir::new("fc-cache-create");
+        let rt = FirecrackerRuntime::new(test_config(tmp.path()))
+            .await
+            .unwrap();
+        assert!(rt.cache.is_some(), "the cache is on by default");
+        let tpl = template(&image);
+        let cache_dir = rt.config().firecracker_rootfs_cache_dir();
+
+        let mut a = instance("aa12cd34ef", &tpl);
+        rt.create(&mut a, &tpl).await.unwrap();
+        let entries = |dir: &Path| -> Vec<PathBuf> {
+            std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().is_some_and(|x| x == "ext4"))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(entries(&cache_dir).len(), 1, "the miss packed one entry");
+        let key_path = entries(&cache_dir)[0].clone();
+        let key = key_path.file_stem().unwrap().to_str().unwrap().to_string();
+        let meta = rt.cache.as_ref().unwrap().read_meta(&key).unwrap();
+        assert_eq!(meta.image_ref, image);
+        assert_eq!(meta.disk_gb, 1);
+        assert!(meta.image_id.starts_with("sha256:"), "{}", meta.image_id);
+        let patch = meta
+            .patch
+            .clone()
+            .expect("the entry records where its placeholders are");
+        assert_eq!(patch.block_size, 4096);
+        assert_eq!(
+            patch.files["/etc/hostname"].size as usize,
+            cache::PLACEHOLDER_HOSTNAME_BYTES
+        );
+        assert_eq!(
+            patch.files[GUEST_ENV_FILE].blocks.len(),
+            cache::PLACEHOLDER_ENV_BYTES / 4096
+        );
+        // The entry carries the padded placeholder, the instance its own
+        // name padded the same way (the inode is never touched).
+        assert_eq!(
+            rootfs::cat(&key_path, "/etc/hostname").await.unwrap(),
+            rootfs::pad_with_newlines(
+                &format!("{}\n", cache::PLACEHOLDER_ID),
+                cache::PLACEHOLDER_HOSTNAME_BYTES
+            )
+        );
+        let pa = rt.paths(&a);
+        assert_eq!(
+            rootfs::cat(&pa.rootfs(), "/etc/hostname").await.unwrap(),
+            rootfs::pad_with_newlines("aa12cd34ef\n", cache::PLACEHOLDER_HOSTNAME_BYTES)
+        );
+
+        let mut b = instance("bb12cd34ef", &tpl);
+        rt.create(&mut b, &tpl).await.unwrap();
+        assert_eq!(entries(&cache_dir).len(), 1, "the hit added no entry");
+        let pb = rt.paths(&b);
+        assert_eq!(
+            rootfs::cat(&pb.rootfs(), "/etc/hostname")
+                .await
+                .unwrap()
+                .map(|t| t.trim_end().to_string()),
+            Some("bb12cd34ef".to_string())
+        );
+        let hosts = rootfs::cat(&pb.rootfs(), "/etc/hosts")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(hosts.contains("127.0.1.1\tbb12cd34ef"), "{hosts}");
+        let env = rootfs::parse_env(
+            &rootfs::cat(&pb.rootfs(), &format!("/{}", rootfs::ENV_FILE))
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(
+            env.get(warren_core::ENV_INSTANCE_ID).map(String::as_str),
+            Some("bb12cd34ef")
+        );
+        assert_eq!(
+            env.get("INST_VAR").map(String::as_str),
+            Some("from-instance")
+        );
+        assert_eq!(
+            env.get("TPL_VAR").map(String::as_str),
+            Some("from-template")
+        );
+        assert_eq!(
+            rootfs::stat_mode(&pb.rootfs(), &format!("/{}", rootfs::ENV_FILE))
+                .await
+                .unwrap(),
+            Some(0o600)
+        );
+        assert!(rootfs::exists(&pb.rootfs(), "/home/agent").await.unwrap());
+        assert!(
+            !pb.rootfs_tmp().exists() && !pb.rootfs_dir().exists(),
+            "no scratch left behind"
+        );
+        assert_eq!(rootfs::size_gb(&pb.rootfs()).unwrap(), 1);
+
+        // A different disk size is another entry; the cache's budget is kept.
+        let mut c = instance("cc12cd34ef", &tpl);
+        c.shape.disk = 2;
+        rt.create(&mut c, &tpl).await.unwrap();
+        assert_eq!(entries(&cache_dir).len(), 2);
+        assert_eq!(rootfs::size_gb(&rt.paths(&c).rootfs()).unwrap(), 2);
+
+        // With the cache off, create still works the old way and adds nothing.
+        let mut cfg = test_config(tmp.path());
+        cfg.firecracker_rootfs_cache_gb = 0;
+        let plain = FirecrackerRuntime::new(cfg).await.unwrap();
+        assert!(plain.cache.is_none());
+        let mut d = instance("dd12cd34ef", &tpl);
+        plain.create(&mut d, &tpl).await.unwrap();
+        assert_eq!(entries(&cache_dir).len(), 2);
+        assert_eq!(
+            rootfs::cat(&plain.paths(&d).rootfs(), "/etc/hostname")
+                .await
+                .unwrap(),
+            Some("dd12cd34ef\n".to_string())
+        );
     }
 
     /// Workspace templates come from images without a gateway: the daemon's

@@ -5,6 +5,8 @@ use crate::{InstanceType, Shape, Template, TemplateScope, types::*};
 /// Default uid and gid the Firecracker jailer drops to: a dedicated id above
 /// the ranges distributions hand to system and login users, below `nobody`.
 pub const DEFAULT_FIRECRACKER_JAIL_ID: u32 = 61000;
+/// Default `firecracker_rootfs_cache_gb`.
+pub const DEFAULT_FIRECRACKER_ROOTFS_CACHE_GB: u32 = 20;
 
 /// Daemon configuration. Built by `warrend` from flags and `WARREN_*` variables;
 /// defaults are safe for a single developer machine.
@@ -36,6 +38,10 @@ pub struct Config {
     /// Apply the per-shape token-bucket limits to each microVM's block device
     /// and NIC. On by default; `--firecracker-no-rate-limits` turns it off.
     pub firecracker_rate_limits: bool,
+    /// Disk budget in GiB for packed root filesystems kept under
+    /// `firecracker_rootfs_cache_dir()` and shared by `vm` instances of the
+    /// same image; 0 builds every root filesystem from its image.
+    pub firecracker_rootfs_cache_gb: u32,
     /// Base URL of the Lume API server (`lume serve`) that hosts `mac` instances.
     pub lume_api_url: String,
     /// The `lume` executable, started as `lume serve` when the API is down.
@@ -102,6 +108,7 @@ impl Default for Config {
             firecracker_jail_uid: DEFAULT_FIRECRACKER_JAIL_ID,
             firecracker_jail_gid: DEFAULT_FIRECRACKER_JAIL_ID,
             firecracker_rate_limits: true,
+            firecracker_rootfs_cache_gb: DEFAULT_FIRECRACKER_ROOTFS_CACHE_GB,
             lume_api_url: "http://127.0.0.1:7777".into(),
             lume_bin: PathBuf::from("lume"),
             mac_base_vm: None,
@@ -359,6 +366,10 @@ impl Config {
     /// under the data directory so the instance files can be hard-linked in.
     pub fn firecracker_jail_dir(&self) -> PathBuf {
         self.data_dir.join("firecracker").join("jail")
+    }
+    /// Packed root filesystems shared by `vm` instances of one image.
+    pub fn firecracker_rootfs_cache_dir(&self) -> PathBuf {
+        self.data_dir.join("firecracker").join("rootfs-cache")
     }
     /// Per-instance state of `mac` instances (the shared folder each VM mounts).
     pub fn mac_dir(&self) -> PathBuf {

@@ -26,3 +26,5 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 http.workspace = true
 bytes.workspace = true
+sha2.workspace = true
+hex.workspace = true
