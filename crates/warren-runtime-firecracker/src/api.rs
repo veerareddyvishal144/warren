@@ -99,6 +99,44 @@ pub fn fault_message(e: &Error) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Longest socket path handed to `connect(2)` as is. `sun_path` holds 108
+/// bytes on Linux (104 on macOS) including the terminator; anything longer
+/// goes through [`connect_unix`]'s descriptor route.
+pub const MAX_DIRECT_SOCKET_PATH: usize = 100;
+
+/// Connect to the Unix socket at `path` whatever the length of the path.
+/// `connect(2)` takes at most `sun_path` bytes, and the jailer's socket sits
+/// deep under the chroot base (`<data>/firecracker/jail/firecracker/<id>/
+/// root/run/firecracker.socket`), so a long path is reached through its
+/// directory's descriptor as `/proc/self/fd/<n>/<name>`, which is short.
+pub async fn connect_unix(path: &Path) -> std::io::Result<tokio::net::UnixStream> {
+    if path.as_os_str().len() <= MAX_DIRECT_SOCKET_PATH {
+        return tokio::net::UnixStream::connect(path).await;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let dir = path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .ok_or_else(|| std::io::Error::other("socket path has no directory"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("socket path has no file name"))?;
+        let dirfd = std::fs::File::open(dir)?;
+        let short = PathBuf::from(format!("/proc/self/fd/{}", dirfd.as_raw_fd())).join(name);
+        let stream = tokio::net::UnixStream::connect(&short).await;
+        drop(dirfd);
+        stream
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err(std::io::Error::other(format!(
+        "socket path {} is longer than this platform allows ({} bytes)",
+        path.display(),
+        path.as_os_str().len()
+    )))
+}
+
 impl Api {
     /// An API client for the socket at `sock` (a host path).
     pub fn new(sock: impl Into<PathBuf>) -> Api {
@@ -212,11 +250,9 @@ impl Api {
     ) -> Result<Bytes> {
         let what = format!("firecracker {method} {path}");
         let fut = async {
-            let stream = tokio::net::UnixStream::connect(&self.sock)
-                .await
-                .map_err(|e| {
-                    Error::internal(format!("{what}: connect {}: {e}", self.sock.display()))
-                })?;
+            let stream = connect_unix(&self.sock).await.map_err(|e| {
+                Error::internal(format!("{what}: connect {}: {e}", self.sock.display()))
+            })?;
             let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
                 .await
                 .map_err(|e| Error::internal(format!("{what}: handshake: {e}")))?;
@@ -382,6 +418,30 @@ pub mod tests {
 
     pub fn running_info() -> Value {
         json!({"app_name": "Firecracker", "id": "anonymous-instance", "state": "Running", "vmm_version": "1.18.0"})
+    }
+
+    /// The jailed socket path can exceed `sun_path`; the client still
+    /// reaches it (through the directory's descriptor on Linux).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reaches_a_socket_whose_path_is_too_long_for_connect() {
+        let fake = FakeApi::start();
+        fake.answer("GET /", 200, running_info());
+        let tmp = crate::testutil::TempDir::new("fcapi-long");
+        let mut deep = tmp.path().to_path_buf();
+        while deep.as_os_str().len() < 120 {
+            deep.push("a-directory-with-a-long-name-for-this-test");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let long = deep.join("firecracker.socket");
+        std::os::unix::fs::symlink(&fake.sock, &long).unwrap();
+        assert!(long.as_os_str().len() > 108);
+        assert!(
+            tokio::net::UnixStream::connect(&long).await.is_err(),
+            "a direct connect to the long path fails, which is what the route works around"
+        );
+        let info = Api::new(&long).info().await.unwrap();
+        assert_eq!(info.vmm_version, "1.18.0");
     }
 
     #[tokio::test]

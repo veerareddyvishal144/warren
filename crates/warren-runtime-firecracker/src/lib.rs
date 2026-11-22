@@ -544,6 +544,15 @@ impl FirecrackerRuntime {
                 l.api_sock.display()
             )));
         }
+        if l.jail.is_none() && l.fc_api_sock.as_os_str().len() > api::MAX_DIRECT_SOCKET_PATH {
+            // Firecracker binds this path itself and cannot take a long one;
+            // the jailer binds a short jail-relative path instead.
+            return Err(Error::invalid(format!(
+                "the API socket path {} is {} bytes, more than a Unix socket allows; use a shorter --data-dir or launch through the jailer (--firecracker-jailer)",
+                l.fc_api_sock.display(),
+                l.fc_api_sock.as_os_str().len()
+            )));
+        }
         if let Some(j) = &l.jail {
             let cfg =
                 self.render_config(inst, Path::new(jail::KERNEL), Path::new(jail::ROOTFS), ip);
