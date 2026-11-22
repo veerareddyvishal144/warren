@@ -17,6 +17,8 @@
 #   --gateway IP         host address the pf anchor allows (default 192.168.64.1)
 #   --with-agents        also install Node LTS and the claude, codex and opencode CLIs (guest needs internet)
 #   --node-version V     Node version for --with-agents (default: the latest LTS at nodejs.org)
+#   --auto-login         log the guest user in at boot and skip the Setup Assistant, so instances show a
+#                        desktop the screenshot and input API can drive (otherwise: the login window)
 #   --force              stop and delete an existing target first
 #   -h, --help           this text
 #
@@ -41,7 +43,7 @@ die() { log "error: $*"; exit 1; }
 
 SOURCE=base TARGET=warren-macos-26 GUEST_USER=lume PASSWORD=lume NEW_PASSWORD=""
 SSH_KEY="$HOME/.ssh/id_ed25519" SUBNET=192.168.64.0/24 GATEWAY=192.168.64.1 FORCE=0
-WITH_AGENTS=0 NODE_VERSION=""
+WITH_AGENTS=0 NODE_VERSION="" AUTO_LOGIN=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --source) SOURCE="${2:-}"; shift ;;
@@ -54,6 +56,7 @@ while [ $# -gt 0 ]; do
         --gateway) GATEWAY="${2:-}"; shift ;;
         --with-agents) WITH_AGENTS=1 ;;
         --node-version) NODE_VERSION="${2:-}"; shift ;;
+        --auto-login) AUTO_LOGIN=1 ;;
         --force) FORCE=1 ;;
         -h|--help) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option $1 (try --help)" ;;
@@ -266,6 +269,9 @@ if [ "$WITH_AGENTS" = 1 ]; then
     INSTALL_CMD="$INSTALL_CMD --with-agents"
     [ -n "$NODE_VERSION" ] && INSTALL_CMD="$INSTALL_CMD --node-version '$NODE_VERSION'"
     log "--with-agents: the guest downloads Node and the CLIs through the NAT; expect several minutes"
+fi
+if [ "$AUTO_LOGIN" = 1 ]; then
+    INSTALL_CMD="$INSTALL_CMD --auto-login"
 fi
 printf '%s\n' "$PASSWORD" | ssh "${SSH_OPTS[@]}" "$REMOTE" "$INSTALL_CMD" \
     || die "install.sh failed inside the guest (see the output above). The guest password may already be the one in $PASSWORD_FILE, or still the old one; the ssh session is still open: ssh ${SSH_OPTS[*]} $REMOTE"

@@ -72,6 +72,9 @@ rmcp = { version = "3", features = ["server", "transport-io", "macros"] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
 # .gitignore-aware directory walks for `warren sync`.
 ignore = "0.4"
+# VNC authentication (DES on the challenge) and PNG screenshots of mac instances.
+des = "0.8"
+png = "0.18"
 
 [profile.release]
 lto = "thin"

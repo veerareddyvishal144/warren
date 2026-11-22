@@ -115,8 +115,8 @@ struct Args {
     /// The lume executable.
     #[arg(long, env = "WARREN_LUME_BIN", default_value = "lume")]
     lume_bin: PathBuf,
-    /// Start mac instances with Lume's VNC server on (host-only, random password).
-    #[arg(long, env = "WARREN_MAC_VNC", default_value_t = false)]
+    /// Start mac instances with Lume's VNC server on (bound to 127.0.0.1, random password); it is how screenshots and input reach the screen. `--mac-vnc false` turns it off.
+    #[arg(long, env = "WARREN_MAC_VNC", value_name = "BOOL", default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     mac_vnc: bool,
     /// HMAC secret for signed URLs; generated into the data dir when unset.
     #[arg(long, env = "WARREN_SECRET")]

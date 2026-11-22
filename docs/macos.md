@@ -30,7 +30,8 @@ On the Mac (Apple silicon, macOS 14 or newer, [Lume](https://github.com/trycua/c
 2. Turn it into Warren's base image: `warren mac init` (`--source base` to
    name an existing stock VM, `--target` for another name than
    `warren-macos-26`, `--force` to replace an existing target, `--dry-run`
-   to see the commands). It runs `scripts/mac/build-base.sh`, embedded in
+   to see the commands, `--auto-login` for a base image whose
+   instances boot to a logged-in desktop for the screen tools). It runs `scripts/mac/build-base.sh`, embedded in
    the binary, which clones the VM, installs the gateway LaunchDaemon and
    launcher, the `pf` isolation rules and your SSH key (`~/.ssh/id_ed25519`,
    generated when missing), replaces the guest user's stock password
@@ -97,7 +98,8 @@ usage grows as the disk diverges; the guest user is `lume`, its password the
 one `build-base.sh` generated (SSH takes keys only, the VM is reachable only
 from the Mac itself and blocked between guests by `pf`), and Lume's own
 `lume ssh`, `lume shutdown` and `lume restart`, which assume the stock
-password, do not work on instances; screen access is not exposed yet.
+password, do not work on instances. The screen is reachable through the
+API ([below](#the-screen-screenshots-and-input)).
 
 ### The macOS Application Firewall and the broker
 
@@ -117,6 +119,68 @@ use the broker and are unaffected.
 
 Linux instances on the same Mac, through Docker Desktop or the smolvm
 engine, are covered in [linux-on-mac.md](linux-on-mac.md).
+
+### The screen: screenshots and input
+
+Every `mac` instance has a display (1024x768 unless the base VM says
+otherwise), and the daemon reaches it through the VNC server Lume runs next
+to each VM (Apple's own, from Virtualization.framework): bound to
+127.0.0.1, a random password per run, reported to the daemon as `vncUrl`.
+Nothing inside the guest is involved, so no Screen Recording or
+Accessibility permission is asked for, and the guest cannot tell a
+screenshot from an idle display.
+
+- `GET /v1/instances/{id}/screenshot` answers a PNG (`X-Warren-Width` and
+  `X-Warren-Height` carry the size; `?format=json` gives
+  `{ width, height, format: "png", data: <base64> }`). The framebuffer is
+  the Retina rendering of the display (1920x1440 for 1024x768); the daemon
+  halves anything wider than 1280 px, so the usual screenshot is 960x720
+  and about 0.5 to 0.8 MB.
+- `POST /v1/instances/{id}/input` with `{ "actions": [...] }` runs pointer
+  and keyboard actions in order and answers `204`: `click {x, y, button?,
+  count?}`, `move {x, y}`, `scroll {x, y, dx?, dy?}`, `type {text}` and
+  `key {key}` with chords such as `cmd+space`, `cmd+shift+4`, `ctrl+c`,
+  `enter`, `escape`, `f5`, `down`. Coordinates are pixels of the screenshot
+  with the origin at the top left; the daemon scales them back to the
+  framebuffer. A sleeping instance is woken first, like `exec`.
+- CLI: `warren screenshot <id> -o shot.png`, `warren input <id> click 480
+  360`, `warren input <id> type "open -a Safari"`, `warren input <id> key
+  cmd+space`, `warren input <id> scroll 480 360 --dy 5`.
+- MCP: `screenshot` (returns an image block the model can look at),
+  `click`, `type_text`, `press_key`, `scroll`.
+
+Keys go in as X11 keysyms the way Apple's server wants them, which is the
+Apple Remote Desktop convention: `Alt_L` is Command and `Meta_L` is Option
+(`Super_L` and `Hyper_L` are ignored), and an uppercase letter or a shifted
+symbol is Shift held around the base key (`A` is Shift plus `a`, `!` is
+Shift plus `1`). The daemon does all of this for you; keysyms the server
+does not know are dropped silently.
+
+Two things to know. First, a base image built without `--auto-login` boots
+to the login window, so a fresh instance shows a password prompt rather
+than a desktop: either log in once with `warren input <id> click 480 640`
+followed by `warren input <id> type "<the password from
+~/.warren/mac/<base>.password>\n"` (five wrong attempts lock the account
+for a minute), or build the image with `warren mac init --auto-login`
+(`build-base.sh --auto-login`), which arms automatic login for the guest
+user (`/etc/kcpassword` plus `autoLoginUser`, the same files
+`sysadminctl -autologin` writes) so instances boot logged in. The first
+login of that user still shows the Setup Assistant's panes on macOS 26
+(Update Mac Automatically, Apple Account, FileVault); the per-user
+`com.apple.SetupAssistant` keys that used to skip them are written too but
+no longer do. Dismiss them once in the base VM before cloning (`lume run
+<base>`, click through, `lume stop <base>`), or once per instance with
+`warren input <id> click 795 622` (Continue), `warren input <id> click 190
+622` then `key down`, `key down`, `key enter`, `click 538 463` (skip the
+Apple Account), `click 651 622` then `key enter` (no FileVault); after that
+the desktop is yours. Second, Lume's server is Apple's and it is fragile: a VNC client that
+sends `SetEncodings` makes it drop the connection and take the `lume
+serve` process, and with it every running VM, down (Lume 0.7.2, macOS 26).
+Warren's client therefore negotiates nothing and reads the native format
+with the Raw encoding; keep other VNC clients away from instance VMs, or
+accept that risk. `--mac-vnc false` on the daemon starts VMs without the
+VNC server; both endpoints then answer `not_supported`. A VM started while
+VNC was off keeps running without it until it is stopped and started again.
 
 ## Constraints that shape everything
 
@@ -411,6 +475,7 @@ add `/etc/hosts` entries for the few names used in testing.
 
 ### Phase 2 candidates
 
+- Automatic login on by default in `warren mac init` (today it is the opt-in `--auto-login`), once a rebuilt base image has been exercised with it.
 - Screen: noVNC through the edge (WebSocket to the VM's VNC port).
 - Linux guests through Lume on Mac hosts (not subject to the two-guest
   limit) as cheap extra capacity on the same machine.

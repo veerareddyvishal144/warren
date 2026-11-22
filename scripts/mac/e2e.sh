@@ -4,7 +4,7 @@
 # walks the product on real macOS VMs (docs/macos.md, "Acceptance for Phase 1"):
 #
 #   health (runtime lume) -> signup -> create warren-macos/mac -> running
-#   -> health through the edge -> exec sw_vers -> marker process
+#   -> health through the edge -> exec sw_vers -> screenshot and input -> marker process
 #   -> sleep (lume savedState true) -> wake (marker still alive, same pid)
 #   -> restart warrend (the VM keeps running, the reconciler adopts it, same marker pid, no second VM)
 #   -> fork -> VM-to-VM isolation (nc from one guest to the other fails)
@@ -101,6 +101,9 @@ lume_vm_names() { lume ls -f json 2>/dev/null | jq -r '.. | objects | select(has
 # Instance VMs are warren-<instance id> (a letter and nine lowercase alphanumerics);
 # the base VM and other warren-* names are not leftovers.
 instance_vm_names() { lume_vm_names | grep -E '^warren-[a-z][a-z0-9]{9}$' | grep -vxF "$BASE_VM" || true; }
+# own_vm_names: the instance VMs this data directory created (their share folder
+# is under $DATA/mac/<id>); another daemon's VMs on the same Mac are not listed.
+own_vm_names() { for vm in $(instance_vm_names); do [ -d "$DATA/mac/${vm#warren-}" ] && echo "$vm"; done; true; }
 # Only VMs this data directory created are ours to remove: a VM whose share
 # folder lives under $DATA/mac/<id> came from an earlier run of this script
 # with the same --data-dir. Any other warren-* VM belongs to another daemon on
@@ -175,7 +178,7 @@ finish() {
         if [ -n "$WARREND_PID" ] && kill -0 "$WARREND_PID" 2>/dev/null; then
             # Give the deletes a moment to tear the VMs down before the daemon goes.
             local waited=0
-            while [ "$waited" -lt 60 ] && [ -n "$(instance_vm_names)" ]; do sleep 2; waited=$((waited + 2)); done
+            while [ "$waited" -lt 60 ] && [ -n "$(own_vm_names)" ]; do sleep 2; waited=$((waited + 2)); done
             log "stopping warrend (pid $WARREND_PID)"
             kill -TERM "$WARREND_PID" 2>/dev/null
             waited=0
@@ -183,7 +186,7 @@ finish() {
             kill -0 "$WARREND_PID" 2>/dev/null && { log "warrend did not exit; SIGKILL"; kill -KILL "$WARREND_PID" 2>/dev/null; }
         fi
         local left
-        left="$(instance_vm_names)"
+        left="$(own_vm_names)"
         [ -n "$left" ] && log "warning: VMs still listed by lume after cleanup: $(printf '%s ' $left)"
     fi
     print_table
@@ -325,6 +328,59 @@ case "$OUT" in *macOS*) ;; *) fail "$STEP" "stdout does not mention macOS: $OUT"
 log "exec output: $(printf '%s' "$OUT" | tr '\n' ' ' | tr -s '\t ' ' ')"
 pass "$STEP"
 
+STEP="screenshot (PNG, display size)"
+start=$SECONDS
+SHOT_CODE="$(curl -s -S -o "$WORK/shot1.png" -w '%{http_code}' -m 60 -H "Host: $API_HOST" -H "Authorization: Bearer $KEY" "http://127.0.0.1:$PORT/v1/instances/$ID/screenshot" 2>"$WORK/curl.err")" || SHOT_CODE=000
+[ "$SHOT_CODE" = 200 ] || fail "$STEP" "expected 200, got $SHOT_CODE: $(head -c 300 "$WORK/shot1.png" 2>/dev/null)"
+SIG="$(head -c 8 "$WORK/shot1.png" | xxd -p)"
+[ "$SIG" = 89504e470d0a1a0a ] || fail "$STEP" "the body is not a PNG (first bytes $SIG)"
+DIMS="$(sips -g pixelWidth -g pixelHeight "$WORK/shot1.png" 2>/dev/null | awk '/pixelWidth/ {w=$2} /pixelHeight/ {h=$2} END {print w "x" h}')"
+# The framebuffer is the Retina-scaled display (1920x1440 for 1024x768) and
+# the daemon halves it, so compare aspect ratios, not sizes.
+DISPLAY_SIZE="$(lume_vm_field "warren-$ID" display)"
+if [ -n "$DISPLAY_SIZE" ]; then
+    SW=${DIMS%x*} SH=${DIMS#*x} DW=${DISPLAY_SIZE%x*} DH=${DISPLAY_SIZE#*x}
+    [ $((SW * DH)) -eq $((SH * DW)) ] || fail "$STEP" "the screenshot is $DIMS, not the aspect ratio of the $DISPLAY_SIZE display"
+    [ "$SW" -ge 640 ] || fail "$STEP" "the screenshot is only $DIMS"
+fi
+T_SHOT=$((SECONDS - start))
+log "screenshot $DIMS, $(wc -c <"$WORK/shot1.png" | tr -d ' ') bytes"
+pass "$STEP" "$T_SHOT"
+
+STEP="input: click, type and Return change the screen"
+# A base image without --auto-login boots to the login window. With the base
+# VM's password at hand (build-base.sh wrote it) the step clicks the field,
+# types the password and Return, and the login window gives way to the
+# first-login desktop; without it, the typed text shows up as dots. Either
+# way two screenshots that differ prove the pointer and key events reached
+# the guest's window server. cmd+space (Command is Alt_L to Apple's server)
+# is sent too, without an assertion: the Setup Assistant may be covering the
+# desktop on a first login.
+PASSWORD_FILE="${WARREN_MAC_DIR:-$HOME/.warren/mac}/$BASE_VM.password"
+if [ -r "$PASSWORD_FILE" ]; then
+    LOGIN_PAYLOAD="$(jq -cn --arg p "$(tr -d '\n' <"$PASSWORD_FILE")" '{actions: [{type: "click", x: 480, y: 640}, {type: "type", text: ($p + "\n")}]}')"
+    api POST "/v1/instances/$ID/input" "$LOGIN_PAYLOAD"
+    [ "$HTTP_CODE" = 204 ] || fail "$STEP" "typing the password: expected 204, got $HTTP_CODE: $BODY"
+    log "typed the guest password at the login window; waiting for the desktop"
+    sleep 12
+else
+    log "no $PASSWORD_FILE; typing at the login window instead of logging in"
+    api POST "/v1/instances/$ID/input" '{"actions":[{"type":"click","x":480,"y":640},{"type":"type","text":"Terminal"}]}'
+    [ "$HTTP_CODE" = 204 ] || fail "$STEP" "type: expected 204, got $HTTP_CODE: $BODY"
+    sleep 2
+fi
+SHOT_CODE="$(curl -s -S -o "$WORK/shot2.png" -w '%{http_code}' -m 60 -H "Host: $API_HOST" -H "Authorization: Bearer $KEY" "http://127.0.0.1:$PORT/v1/instances/$ID/screenshot" 2>"$WORK/curl.err")" || SHOT_CODE=000
+[ "$SHOT_CODE" = 200 ] || fail "$STEP" "second screenshot: expected 200, got $SHOT_CODE"
+if cmp -s "$WORK/shot1.png" "$WORK/shot2.png"; then
+    fail "$STEP" "the screen did not change after clicking and typing (screenshots in $WORK)"
+fi
+[ "$KEEP" = 1 ] && log "screenshots kept: $WORK/shot1.png $WORK/shot2.png"
+api POST "/v1/instances/$ID/input" '{"actions":[{"type":"key","key":"cmd+space"},{"type":"key","key":"escape"}]}'
+[ "$HTTP_CODE" = 204 ] || fail "$STEP" "cmd+space, escape: expected 204, got $HTTP_CODE: $BODY"
+api POST "/v1/instances/$ID/input" '{"actions":[{"type":"key","key":"hyper+x"}]}'
+[ "$HTTP_CODE" = 400 ] || fail "$STEP" "an unknown modifier should answer 400, got $HTTP_CODE"
+pass "$STEP"
+
 STEP="start marker process"
 # nohup on purpose, the way an agent starts a server: Apple's nohup fails with
 # "can't detach from console" when the gateway runs in launchd's system domain
@@ -373,8 +429,8 @@ STEP="restart warrend -> instance adopted"
 start=$SECONDS
 LOG_LINES_BEFORE="$(wc -l <"$LOG" | tr -d ' ')"
 stop_warrend "$STEP"
-VMS="$(instance_vm_names | tr '\n' ' ')"
-[ "$VMS" = "warren-$ID " ] || fail "$STEP" "after the daemon exit lume lists [$VMS], expected only warren-$ID"
+VMS="$(own_vm_names | tr '\n' ' ')"
+[ "$VMS" = "warren-$ID " ] || fail "$STEP" "after the daemon exit lume lists [$VMS] for this data dir, expected only warren-$ID"
 [ "$(lume_vm_field "warren-$ID" status)" = running ] || fail "$STEP" "VM warren-$ID is not running after the daemon exit"
 log "warrend exited and VM warren-$ID is still running; starting warrend again"
 start_warrend
@@ -394,8 +450,8 @@ run_exec "$ID" "pgrep -f '[s]leep 100000'"
 [ "$HTTP_CODE" = 200 ] || fail "$STEP" "exec after the restart failed (HTTP $HTTP_CODE)"
 PID_ADOPTED="$(jget .stdout | tr -d '[:space:]')"
 [ "$PID_ADOPTED" = "$PID_BEFORE" ] || fail "$STEP" "marker pid is '$PID_ADOPTED' after the restart, was $PID_BEFORE (the VM was rebooted or re-created)"
-VMS="$(instance_vm_names | tr '\n' ' ')"
-[ "$VMS" = "warren-$ID " ] || fail "$STEP" "after the restart lume lists [$VMS], expected only warren-$ID"
+VMS="$(own_vm_names | tr '\n' ' ')"
+[ "$VMS" = "warren-$ID " ] || fail "$STEP" "after the restart lume lists [$VMS] for this data dir, expected only warren-$ID"
 T_RESTART=$((SECONDS - start))
 log "adopted: VM warren-$ID, marker pid $PID_ADOPTED unchanged"
 pass "$STEP" "$T_RESTART"
@@ -473,5 +529,5 @@ T_DELETE=$((SECONDS - start))
 pass "$STEP" "$T_DELETE"
 
 echo
-echo "timings: create->running ${T_CREATE}s, sleep ${T_SLEEP}s, wake ${T_WAKE}s, daemon restart ${T_RESTART}s, fork ${T_FORK}s, delete ${T_DELETE}s"
+echo "timings: create->running ${T_CREATE}s, screenshot ${T_SHOT}s, sleep ${T_SLEEP}s, wake ${T_WAKE}s, daemon restart ${T_RESTART}s, fork ${T_FORK}s, delete ${T_DELETE}s"
 exit 0

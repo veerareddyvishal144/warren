@@ -1,6 +1,6 @@
 # warren-mcp: Warren as an MCP server
 
-`warren-mcp` speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio and gives any MCP client (Claude Code, Cursor, Claude Desktop, Windsurf, ...) tools to create and drive Warren instances: persistent Linux computers with a shell, a files API, an optional built-in agent and a browser terminal.
+`warren-mcp` speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio and gives any MCP client (Claude Code, Cursor, Claude Desktop, Windsurf, ...) tools to create and drive Warren instances: persistent Linux or macOS computers with a shell, a files API, an optional built-in agent, a browser terminal and, on macOS, a screen to look at and click on.
 
 It is a thin layer over the Rust SDK (`warren-sdk`): every tool is one Sandbox API or Agent API call, and errors come back with the API's error code so the model can react (`instance_limit_reached`, `not_found`, `conflict`, ...).
 
@@ -76,6 +76,11 @@ Cursor picks it up under Settings > MCP; enable the server and its tools appear 
 | `chat` | `id`, `message`, `session_id?` | `{ output_text, session_id, response_id, status }` (agent templates only) |
 | `signed_url` | `id`, `port?`, `ttl?` | `{ url, expires_at }` |
 | `list_templates` | none | `{ data: [template...] }` |
+| `screenshot` | `id` | an `image/png` content block plus `{ width, height, format, bytes }` (mac instances; others answer `not_supported`) |
+| `click` | `id`, `x`, `y`, `button?` (`left`/`right`/`middle`), `count?` (1..3) | `{ id, done: [action] }` |
+| `type_text` | `id`, `text` (`\n` is Return) | `{ id, done: [action] }` |
+| `press_key` | `id`, `key` (`enter`, `escape`, `cmd+space`, `ctrl+c`, `f5`, ...) | `{ id, done: [action] }` |
+| `scroll` | `id`, `x`, `y`, `dx?`, `dy?` (wheel steps, positive is right and down) | `{ id, done: [action] }` |
 
 Every result is returned both as pretty-printed JSON text and as `structuredContent`. Paths are relative to the instance's persistent home directory. A non-zero `exit_code` from `exec` is data, not an error.
 

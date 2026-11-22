@@ -14,8 +14,8 @@ use warren_cli::config::Settings;
 use warren_cli::output::list_envelope;
 use warren_core::agentapi::ResponsesRequest;
 use warren_core::{
-    CreateInstanceRequest, Error, ExecRequest, ExecResult, ForkRequest, PatchInstanceRequest,
-    RegisterTemplateRequest, ShapeRequest,
+    CreateInstanceRequest, Error, ExecRequest, ExecResult, ForkRequest, InputAction,
+    PatchInstanceRequest, RegisterTemplateRequest, Screenshot, ShapeRequest,
 };
 use warren_sdk::{AgentClient, Client, CronRequest, SdkError};
 
@@ -178,6 +178,15 @@ impl Api {
     /// Typed, because the exit code and the two output streams are used directly.
     pub async fn exec(&self, id: &str, req: &ExecRequest) -> Result<ExecResult, Failure> {
         self.client.exec(id, req).await.map_err(fail)
+    }
+
+    /// The PNG bytes with their size.
+    pub async fn screenshot(&self, id: &str) -> Result<Screenshot, Failure> {
+        self.client.screenshot(id).await.map_err(fail)
+    }
+
+    pub async fn input(&self, id: &str, actions: &[InputAction]) -> Result<(), Failure> {
+        self.client.input(id, actions).await.map_err(fail)
     }
 
     /// `{ "logs": "..." }`, as on the wire.

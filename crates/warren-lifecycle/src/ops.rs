@@ -12,10 +12,10 @@ use async_trait::async_trait;
 use tokio::sync::OwnedMutexGuard;
 use warren_core::{
     Backup, CreateInstanceRequest, DEFAULT_EXEC_TIMEOUT_SEC, DEFAULT_IDLE_TIMEOUT_SEC, Error,
-    ExecRequest, ExecResult, ForkRequest, Instance, InstanceStatus, InstanceType, Lifecycle,
-    LogsOptions, MAX_BACKUP_BYTES_PER_WORKSPACE, MAX_BACKUPS_PER_INSTANCE, MetricPoint,
-    NetworkMode, PatchInstanceRequest, Result, Runtime, STOP_GRACE_SECS, SecretSpec, ShapeRequest,
-    Template, Workspace, broker,
+    ExecRequest, ExecResult, ForkRequest, InputAction, Instance, InstanceStatus, InstanceType,
+    Lifecycle, LogsOptions, MAX_BACKUP_BYTES_PER_WORKSPACE, MAX_BACKUPS_PER_INSTANCE, MetricPoint,
+    NetworkMode, PatchInstanceRequest, Result, Runtime, STOP_GRACE_SECS, Screenshot, SecretSpec,
+    ShapeRequest, Template, Workspace, broker,
     errors::{CODE_HOST_CAPACITY_REACHED, is_requires_restart},
     ids, join_host_port, shapes,
 };
@@ -334,6 +334,20 @@ impl Manager {
                 }
             }
         }
+    }
+
+    /// The running instance behind an exec, screenshot or input: a sleeping
+    /// or transitioning one is woken (and waited for), a stopped or failed
+    /// one is a conflict.
+    async fn awake_for_io(&self, workspace_id: &str, id: &str) -> Result<Instance> {
+        let inst = self.load(workspace_id, id).await?;
+        if inst.status == InstanceStatus::Running {
+            return Ok(inst);
+        }
+        if inst.status == InstanceStatus::Sleeping || transitional(inst.status) {
+            return self.ensure_awake(id).await;
+        }
+        Err(conflict_for(&inst))
     }
 
     fn fill_exec_defaults(req: &ExecRequest) -> ExecRequest {
@@ -1022,17 +1036,29 @@ impl Lifecycle for Manager {
         if req.command.trim().is_empty() {
             return Err(Error::invalid("command is required"));
         }
-        let mut inst = self.load(workspace_id, id).await?;
-        if inst.status != InstanceStatus::Running {
-            if inst.status == InstanceStatus::Sleeping || transitional(inst.status) {
-                inst = self.ensure_awake(id).await?;
-            } else {
-                return Err(conflict_for(&inst));
-            }
-        }
+        let inst = self.awake_for_io(workspace_id, id).await?;
         let rt = self.runtime_for(&inst)?;
         self.record_activity(id);
         let out = rt.exec(&inst, &Self::fill_exec_defaults(req)).await;
+        self.record_activity(id);
+        out
+    }
+
+    async fn screenshot(&self, workspace_id: &str, id: &str) -> Result<Screenshot> {
+        let inst = self.awake_for_io(workspace_id, id).await?;
+        let rt = self.runtime_for(&inst)?;
+        self.record_activity(id);
+        rt.screenshot(&inst).await
+    }
+
+    async fn input(&self, workspace_id: &str, id: &str, actions: &[InputAction]) -> Result<()> {
+        if actions.is_empty() {
+            return Err(Error::invalid("actions must contain at least one action"));
+        }
+        let inst = self.awake_for_io(workspace_id, id).await?;
+        let rt = self.runtime_for(&inst)?;
+        self.record_activity(id);
+        let out = rt.input(&inst, actions).await;
         self.record_activity(id);
         out
     }

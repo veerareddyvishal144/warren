@@ -15,10 +15,10 @@ use std::{
 
 use warren_core::{
     ApiKey, Backup, Clock, Config, CreateInstanceRequest, Cron, DEFAULT_IDLE_TIMEOUT_SEC, Error,
-    ExecRequest, ExecResult, ForkRequest, Instance, InstanceSecret, InstanceStatus, InstanceType,
-    Lifecycle, LogsOptions, MetricPoint, PatchInstanceRequest, RegisterTemplateRequest, Result,
-    SecretSpec, Shape, ShapeRequest, Store, Template, TemplateScope, TemplateService, Workspace,
-    broker, ids, shapes,
+    ExecRequest, ExecResult, ForkRequest, InputAction, Instance, InstanceSecret, InstanceStatus,
+    InstanceType, Lifecycle, LogsOptions, MetricPoint, PatchInstanceRequest,
+    RegisterTemplateRequest, Result, Screenshot, SecretSpec, Shape, ShapeRequest, Store, Template,
+    TemplateScope, TemplateService, Workspace, broker, ids, shapes,
 };
 
 /// Stored rows for request secrets, the way the real lifecycle writes them.
@@ -674,6 +674,36 @@ impl Lifecycle for FakeLifecycle {
                 return Err(Error::conflict("instance is stopped"));
             }
             Ok(ExecResult { exit_code: 0, stdout: format!("ran: {}", req.command), stderr: String::new(), duration_ms: 1, truncated: false })
+        }
+        fn screenshot<'a, 'b, 'c>(&'a self, workspace_id: &'b str, id: &'c str) -> Result<Screenshot> {
+            self.enter("screenshot")?;
+            let inst = self.store.get_instance_for_workspace(workspace_id, id).await?;
+            if inst.status == InstanceStatus::Stopped {
+                return Err(Error::conflict("instance is stopped"));
+            }
+            if inst.kind != InstanceType::Mac {
+                return Err(Error::not_supported("instances of type default have no screen"));
+            }
+            // A 2x1 PNG: signature, IHDR, IDAT, IEND (the pixel data is not inspected).
+            let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+            png.extend_from_slice(&13u32.to_be_bytes());
+            png.extend_from_slice(b"IHDR");
+            png.extend_from_slice(&2u32.to_be_bytes());
+            png.extend_from_slice(&1u32.to_be_bytes());
+            png.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+            Ok(Screenshot { width: 2, height: 1, png })
+        }
+        fn input<'a, 'b, 'c, 'd>(&'a self, workspace_id: &'b str, id: &'c str, actions: &'d [InputAction]) -> Result<()> {
+            self.enter("input")?;
+            let inst = self.store.get_instance_for_workspace(workspace_id, id).await?;
+            if inst.status == InstanceStatus::Stopped {
+                return Err(Error::conflict("instance is stopped"));
+            }
+            if inst.kind != InstanceType::Mac {
+                return Err(Error::not_supported("instances of type default have no screen"));
+            }
+            self.calls.lock().unwrap().push(format!("input:{}", actions.len()));
+            Ok(())
         }
         fn logs<'a, 'b, 'c>(&'a self, workspace_id: &'b str, id: &'c str, opts: LogsOptions) -> Result<String> {
             self.enter("logs")?;

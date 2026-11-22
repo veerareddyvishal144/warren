@@ -44,6 +44,12 @@ CLI: `warren instances create --template warren-base --wait`, `warren instances 
 - Fork copies disk, template and env into a new instance: `warren instances fork <id> --name copy` (no MCP tool yet).
 - `list_instances`, `get_instance`, `list_templates` to look around; `warren instances list`, `warren templates list`.
 
+## The macOS screen
+
+- `mac` instances have a display. `screenshot` (`id`) returns a PNG image to look at: take one before acting to find coordinates and after acting to confirm. `click` (`id`, `x`, `y`, `button?`, `count?`), `type_text` (`id`, `text`; `\n` is Return), `press_key` (`id`, `key`: `enter`, `escape`, `cmd+space`, `cmd+q`, `ctrl+c`, `f5`, arrows) and `scroll` (`id`, `x`, `y`, `dx?`, `dy?`) drive it. Coordinates are pixels of the screenshot, origin top left.
+- Prefer `exec` for anything a shell can do (`open -a Safari https://...`, `xcodebuild`, `osascript`); use the screen for dialogs, the Simulator, sign-in flows and to verify what the user would see. Linux instances have no screen (`not_supported`).
+- CLI: `warren screenshot <id> -o shot.png`, `warren input <id> click X Y`, `warren input <id> type "text"`, `warren input <id> key cmd+space`.
+
 ## Limits to respect
 
 - A Mac runs at most **two macOS guests** at once: a third `mac` create or wake answers `409 host_capacity_reached`. Sleep or delete a `mac` instance you are done with before creating another.

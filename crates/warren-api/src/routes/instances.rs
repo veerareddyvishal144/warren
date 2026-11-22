@@ -7,13 +7,15 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::{Path, State},
-    response::Response,
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
 };
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 use warren_core::{
-    Backup, CreateInstanceRequest, Error, ExecRequest, ExecResult, ForkRequest, Instance,
-    InstanceStatus, LogsOptions, MetricPoint, PatchInstanceRequest, QUERY_TOKEN, Result,
-    ShapeRequest, json::List, signer::DEFAULT_TTL_SECS,
+    Backup, CreateInstanceRequest, Error, ExecRequest, ExecResult, ForkRequest, InputRequest,
+    Instance, InstanceStatus, LogsOptions, MetricPoint, PatchInstanceRequest, QUERY_TOKEN, Result,
+    ScreenshotJson, ShapeRequest, json::List, signer::DEFAULT_TTL_SECS,
 };
 
 use crate::{
@@ -212,6 +214,64 @@ pub async fn exec(
         d.lifecycle.exec(caller.workspace_id(), &id, &req).await?,
     ))
 }
+
+/// `GET /v1/instances/{id}/screenshot[?format=png|json]`: the screen of a
+/// `mac` instance as a PNG body (with `X-Warren-Width` and `X-Warren-Height`
+/// headers), or as `{ width, height, format: "png", data: <base64> }` with
+/// `format=json`. A sleeping instance is woken first, like `exec`.
+pub async fn screenshot(
+    State(d): State<Arc<Deps>>,
+    caller: Caller,
+    Path(id): Path<String>,
+    q: Query,
+) -> Result<Response> {
+    check_instance_id(&id)?;
+    let format = q.get("format").unwrap_or("png");
+    if format != "png" && format != "json" {
+        return Err(Error::invalid("format must be png or json"));
+    }
+    let shot = d.lifecycle.screenshot(caller.workspace_id(), &id).await?;
+    if format == "json" {
+        return Ok(Json(ScreenshotJson {
+            width: shot.width,
+            height: shot.height,
+            format: "png".into(),
+            data: BASE64.encode(&shot.png),
+        })
+        .into_response());
+    }
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png".to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+            (HEADER_WIDTH, shot.width.to_string()),
+            (HEADER_HEIGHT, shot.height.to_string()),
+        ],
+        shot.png,
+    )
+        .into_response())
+}
+
+/// `POST /v1/instances/{id}/input` body `{ "actions": [...] }` -> `204`.
+/// Actions run in order on the instance's screen; a sleeping instance is
+/// woken first.
+pub async fn input(
+    State(d): State<Arc<Deps>>,
+    caller: Caller,
+    Path(id): Path<String>,
+    JsonBody(req): JsonBody<InputRequest>,
+) -> Result<StatusCode> {
+    check_instance_id(&id)?;
+    req.validate()?;
+    d.lifecycle
+        .input(caller.workspace_id(), &id, &req.actions)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Headers carrying a screenshot's size next to the PNG body.
+pub const HEADER_WIDTH: header::HeaderName = header::HeaderName::from_static("x-warren-width");
+pub const HEADER_HEIGHT: header::HeaderName = header::HeaderName::from_static("x-warren-height");
 
 /// `GET /v1/instances/{id}/logs?tail=200&since=<unix>`
 pub async fn logs(

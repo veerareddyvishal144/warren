@@ -7,6 +7,7 @@ mod account;
 mod agent;
 mod api;
 mod instances;
+mod screen;
 mod templates;
 // Interactive terminal and workspace sync (`shell`, `run`, `sync`).
 mod runcmd;
@@ -91,6 +92,8 @@ pub async fn run(cli: Cli) -> Result<i32, Failure> {
         Command::Login => account::login(&ctx, api_key.as_deref()),
         Command::Whoami => account::whoami(&ctx).await,
         Command::Health => account::health(&ctx).await,
+        Command::Screenshot(args) => screen::screenshot(&ctx, args).await,
+        Command::Input(args) => screen::input(&ctx, args).await,
         Command::Keys { cmd } => account::keys(&ctx, cmd).await,
         Command::Templates { cmd } => templates::run(&ctx, cmd).await,
         Command::Instances { cmd } => instances::run(&ctx, cmd).await,

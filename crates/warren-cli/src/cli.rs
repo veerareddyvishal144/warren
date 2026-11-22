@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use warren_core::{InstanceType, NetworkMode};
+use warren_core::{InputAction, InstanceType, MouseButton, NetworkMode};
 
 /// Sandbox API base URL used when neither a flag, an environment variable nor
 /// the config file names one.
@@ -87,6 +87,11 @@ pub enum Command {
     },
     /// Daemon health (no authentication).
     Health,
+    // ----- the screen of a mac instance (screen.rs) -----
+    /// Save a PNG screenshot of a mac instance's screen.
+    Screenshot(ScreenshotArgs),
+    /// Click, type, press keys or scroll on a mac instance's screen.
+    Input(InputArgs),
     // ----- interactive terminal and workspace sync (shell.rs, runcmd.rs, sync.rs) -----
     /// Open an interactive shell, or run a command on a terminal, inside an instance.
     Shell(ShellArgs),
@@ -118,6 +123,98 @@ pub enum Command {
         #[command(subcommand)]
         cmd: SkillCmd,
     },
+}
+
+/// Arguments of `warren screenshot`.
+#[derive(Debug, Args)]
+pub struct ScreenshotArgs {
+    /// Instance id.
+    pub id: String,
+    /// Where to write the PNG (`-` for stdout). Default: `screenshot-<id>-<unix time>.png` in the current directory.
+    #[arg(short, long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+}
+
+/// Arguments of `warren input`.
+#[derive(Debug, Args)]
+pub struct InputArgs {
+    /// Instance id.
+    pub id: String,
+    #[command(subcommand)]
+    pub action: InputCmd,
+}
+
+/// One screen action; `warren input <id> <action> ...`.
+#[derive(Debug, Subcommand, PartialEq)]
+pub enum InputCmd {
+    /// Click at X Y (framebuffer pixels, origin top left).
+    Click {
+        x: u32,
+        y: u32,
+        /// left, middle or right.
+        #[arg(long, default_value = "left", value_parser = parse_button)]
+        button: MouseButton,
+        /// Clicks: 2 for a double click, 3 for a triple.
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+    },
+    /// Move the pointer to X Y without clicking.
+    Move { x: u32, y: u32 },
+    /// Type text (several arguments are joined with spaces; `\n` is Return).
+    Type {
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        text: Vec<String>,
+    },
+    /// Press a key or chord: enter, escape, tab, cmd+space, shift+a, ctrl+c, f5, down.
+    Key { key: String },
+    /// Turn the wheel at X Y: DY > 0 scrolls down, DX > 0 right, one step per unit.
+    Scroll {
+        x: u32,
+        y: u32,
+        #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
+        dx: i32,
+        #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
+        dy: i32,
+    },
+}
+
+impl InputCmd {
+    /// The action to send.
+    pub fn action(&self) -> InputAction {
+        match self {
+            InputCmd::Click {
+                x,
+                y,
+                button,
+                count,
+            } => InputAction::Click {
+                x: *x,
+                y: *y,
+                button: *button,
+                count: *count,
+            },
+            InputCmd::Move { x, y } => InputAction::Move { x: *x, y: *y },
+            InputCmd::Type { text } => InputAction::Type {
+                text: text.join(" ").replace("\\n", "\n").replace("\\t", "\t"),
+            },
+            InputCmd::Key { key } => InputAction::Key { key: key.clone() },
+            InputCmd::Scroll { x, y, dx, dy } => InputAction::Scroll {
+                x: *x,
+                y: *y,
+                dx: *dx,
+                dy: *dy,
+            },
+        }
+    }
+}
+
+fn parse_button(s: &str) -> Result<MouseButton, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "left" => Ok(MouseButton::Left),
+        "middle" => Ok(MouseButton::Middle),
+        "right" => Ok(MouseButton::Right),
+        _ => Err(format!("{s:?} is not left, middle or right")),
+    }
 }
 
 /// Container runtime choice of `warren up`.
@@ -207,6 +304,9 @@ pub struct MacInitArgs {
     /// Also install Node LTS and the claude, codex and opencode CLIs in the image (needs internet in the VM).
     #[arg(long)]
     pub with_agents: bool,
+    /// Log the guest user in at boot and skip the Setup Assistant, so instances show a desktop that `warren screenshot` and `warren input` can drive (otherwise they boot to the login window).
+    #[arg(long)]
+    pub auto_login: bool,
     /// Replace the target VM when it already exists.
     #[arg(long)]
     pub force: bool,
@@ -1250,6 +1350,63 @@ mod tests {
 
     #[test]
     fn shell_run_and_sync() {
+        let Command::Screenshot(a) = parse(&["screenshot", "i", "-o", "shot.png"]).command else {
+            panic!("expected screenshot");
+        };
+        assert_eq!(a.id, "i");
+        assert_eq!(a.output.as_deref(), Some(std::path::Path::new("shot.png")));
+        let Command::Input(a) = parse(&[
+            "input", "i", "click", "10", "20", "--button", "right", "--count", "2",
+        ])
+        .command
+        else {
+            panic!("expected input");
+        };
+        assert_eq!(
+            a.action.action(),
+            InputAction::Click {
+                x: 10,
+                y: 20,
+                button: MouseButton::Right,
+                count: 2
+            }
+        );
+        let Command::Input(a) = parse(&["input", "i", "type", "hello", "world\\n"]).command else {
+            panic!("expected input");
+        };
+        assert_eq!(
+            a.action.action(),
+            InputAction::Type {
+                text: "hello world\n".into()
+            }
+        );
+        let Command::Input(a) = parse(&["input", "i", "key", "cmd+space"]).command else {
+            panic!("expected input");
+        };
+        assert_eq!(
+            a.action.action(),
+            InputAction::Key {
+                key: "cmd+space".into()
+            }
+        );
+        let Command::Input(a) = parse(&["input", "i", "scroll", "5", "6", "--dy", "-3"]).command
+        else {
+            panic!("expected input");
+        };
+        assert_eq!(
+            a.action.action(),
+            InputAction::Scroll {
+                x: 5,
+                y: 6,
+                dx: 0,
+                dy: -3
+            }
+        );
+        assert!(
+            fails(&["input", "i", "click", "1"])
+                .to_string()
+                .contains("required")
+        );
         let Command::Shell(s) = parse(&["shell", "i"]).command else {
             panic!()
         };

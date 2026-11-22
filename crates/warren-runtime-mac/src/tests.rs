@@ -57,18 +57,20 @@ struct Mock {
     calls: Vec<String>,
     run_delay_ms: u64,
     location_path: String,
+    /// Reported as `vncUrl` for running VMs (a fake VNC server in tests).
+    vnc_url: Option<String>,
 }
 
 type Shared = Arc<Mutex<Mock>>;
 
-fn details(name: &str, vm: &Vm) -> Value {
+fn details(name: &str, vm: &Vm, vnc_url: Option<&str>) -> Value {
     json!({
         "name": name, "os": vm.os, "cpuCount": vm.cpu, "memorySize": vm.memory,
         "diskSize": { "allocated": 20u64 << 30, "total": vm.disk_total },
         "display": "1024x768",
         "status": if vm.running { "running" } else { "stopped" },
         "provisioningOperation": null,
-        "vncUrl": null,
+        "vncUrl": if vm.running { vnc_url } else { None },
         "ipAddress": if vm.running { Some("127.0.0.1") } else { None },
         "sshAvailable": vm.running,
         "locationName": "home",
@@ -121,14 +123,17 @@ async fn config(State(s): State<Shared>) -> Json<Value> {
 async fn list(State(s): State<Shared>) -> Json<Value> {
     let m = s.lock().unwrap();
     Json(Value::Array(
-        m.vms.iter().map(|(n, v)| details(n, v)).collect(),
+        m.vms
+            .iter()
+            .map(|(n, v)| details(n, v, m.vnc_url.as_deref()))
+            .collect(),
     ))
 }
 
 async fn get_vm(State(s): State<Shared>, AxPath(name): AxPath<String>) -> axum::response::Response {
     let m = s.lock().unwrap();
     match m.vms.get(&name) {
-        Some(v) => Json(details(&name, v)).into_response(),
+        Some(v) => Json(details(&name, v, m.vnc_url.as_deref())).into_response(),
         None => not_found(&name),
     }
 }
@@ -603,7 +608,7 @@ async fn start_waits_for_the_gateway_then_exec_logs_and_stats_work() {
     let c = calls(&e);
     assert!(
         c.iter()
-            .any(|l| l == "run warren-ab12cd34ef noDisplay=true vnc=\"disabled\" shares=1"),
+            .any(|l| l == "run warren-ab12cd34ef noDisplay=true vnc=\"enabled\" shares=1"),
         "{c:?}"
     );
 
@@ -952,4 +957,68 @@ fn share_host_path_is_absolute_even_for_a_relative_data_dir() {
         super::absolute_path(std::path::Path::new("/tmp/x/share")),
         std::path::PathBuf::from("/tmp/x/share")
     );
+}
+
+#[tokio::test]
+async fn screenshot_and_input_go_through_the_vms_vnc_server() {
+    let seen = Arc::new(Mutex::new(crate::vnc::fake::Seen::default()));
+    let port = crate::vnc::fake::server("hunter2", seen.clone()).await;
+    let mut m = base_mock();
+    m.vnc_url = Some(format!("vnc://:hunter2@127.0.0.1:{port}"));
+    let e = env_with(m).await;
+    let mut inst = instance("ab12cd34ef");
+    e.rt.create(&mut inst, &template()).await.unwrap();
+    // Not running yet: a conflict, not a VNC error.
+    let err = e.rt.screenshot(&inst).await.unwrap_err();
+    assert_eq!(err.code, errors::CODE_CONFLICT, "{}", err.message);
+
+    e.rt.start(&mut inst).await.unwrap();
+    let shot = e.rt.screenshot(&inst).await.unwrap();
+    assert_eq!((shot.width, shot.height), (4, 3));
+    assert_eq!(warren_core::screen::png_dimensions(&shot.png), Some((4, 3)));
+
+    e.rt.input(
+        &inst,
+        &[
+            warren_core::InputAction::Click {
+                x: 1,
+                y: 1,
+                button: warren_core::MouseButton::Left,
+                count: 1,
+            },
+            warren_core::InputAction::Key {
+                key: "cmd+space".into(),
+            },
+        ],
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let s = seen.lock().unwrap();
+    assert!(s.auth_ok);
+    assert_eq!(s.pointer, vec![(1, 1, 0), (1, 1, 1), (1, 1, 0)]);
+    assert_eq!(
+        s.keys,
+        vec![
+            (crate::vnc::COMMAND_KEYSYM, true),
+            (0x20, true),
+            (0x20, false),
+            (crate::vnc::COMMAND_KEYSYM, false)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_vm_without_vnc_answers_not_supported() {
+    let e = env_with(base_mock()).await;
+    let mut inst = instance("ab12cd34ef");
+    e.rt.create(&mut inst, &template()).await.unwrap();
+    e.rt.start(&mut inst).await.unwrap();
+    let err = e.rt.screenshot(&inst).await.unwrap_err();
+    assert_eq!(err.code, CODE_NOT_SUPPORTED, "{}", err.message);
+    let err =
+        e.rt.input(&inst, &[warren_core::InputAction::Move { x: 1, y: 1 }])
+            .await
+            .unwrap_err();
+    assert_eq!(err.code, CODE_NOT_SUPPORTED);
 }

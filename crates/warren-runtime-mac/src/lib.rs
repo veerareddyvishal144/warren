@@ -13,12 +13,18 @@
 //! next start resumes it. A Mac runs at most two macOS guests at a time
 //! ([`lume::MAX_MACOS_GUESTS`]); a start on a full host is refused with
 //! `host_capacity_reached`.
+//!
+//! The screen is reached through the VNC server Lume runs for each VM
+//! (`Config::mac_vnc`, on by default; bound to 127.0.0.1 with a random
+//! password): `screenshot` grabs one frame and `input` sends pointer and key
+//! events ([`vnc`]).
 
 pub mod lume;
 pub mod serve;
 pub mod share;
 #[cfg(test)]
 mod tests;
+pub mod vnc;
 
 use std::{
     net::Ipv4Addr,
@@ -29,8 +35,8 @@ use std::{
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use warren_core::{
-    Config, Error, ExecRequest, ExecResult, GATEWAY_PORT, Instance, LogsOptions, Result, RunInfo,
-    Runtime, STOP_GRACE_SECS, Shape, Stats, Template, errors,
+    Config, Error, ExecRequest, ExecResult, GATEWAY_PORT, InputAction, Instance, LogsOptions,
+    Result, RunInfo, Runtime, STOP_GRACE_SECS, Screenshot, Shape, Stats, Template, errors,
 };
 
 use lume::{GIB, LumeClient, MIN_LUME_VERSION, RunRequest, SetRequest, SharedDirectory, VmDetails};
@@ -222,6 +228,22 @@ impl MacRuntime {
         })?;
         tracing::info!(instance = %inst.id, vm, ip = %ip, "gateway healthy");
         Ok(ip)
+    }
+
+    /// The VNC URL of a running instance's VM, or why there is none: a
+    /// stopped or sleeping VM is a conflict; a VM started with VNC off is
+    /// `not_supported` until it is restarted with it on.
+    async fn vnc_url(&self, inst: &Instance) -> Result<String> {
+        let d = self.details(inst).await?;
+        self.running_ip(inst, &d)?;
+        d.vnc_url
+            .filter(|u| !u.trim().is_empty())
+            .ok_or_else(|| {
+                Error::not_supported(format!(
+                    "instance {} runs without a VNC server (the daemon has --mac-vnc false, or the VM was started by one that had); stop and start it with VNC on to use the screen",
+                    inst.id
+                ))
+            })
     }
 
     fn now_unix() -> i64 {
@@ -764,6 +786,32 @@ impl Runtime for MacRuntime {
 
     async fn disk_usage(&self, inst: &Instance) -> Result<i64> {
         Ok(self.details(inst).await?.disk_size.allocated as i64)
+    }
+
+    async fn screenshot(&self, inst: &Instance) -> Result<Screenshot> {
+        let url = self.vnc_url(inst).await?;
+        let started = Instant::now();
+        let mut client = vnc::VncClient::connect(&url).await?;
+        let frame = client.capture().await?;
+        client.close().await;
+        let png = vnc::encode_png(&frame)?;
+        tracing::debug!(
+            instance = %inst.id, width = frame.width, height = frame.height, bytes = png.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64, "screenshot taken"
+        );
+        Ok(Screenshot {
+            width: frame.width,
+            height: frame.height,
+            png,
+        })
+    }
+
+    async fn input(&self, inst: &Instance, actions: &[InputAction]) -> Result<()> {
+        let url = self.vnc_url(inst).await?;
+        let mut client = vnc::VncClient::connect(&url).await?;
+        let result = client.perform_all(actions).await;
+        client.close().await;
+        result
     }
 }
 
