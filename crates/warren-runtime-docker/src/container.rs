@@ -323,13 +323,22 @@ impl DockerRuntime {
         Ok(())
     }
 
-    /// Start the container, find its IP and wait for the gateway port.
+    /// Start the container, find its IP and wait for the gateway port. A
+    /// container that holds a sleep checkpoint is restored from it (every
+    /// process continues with its pid); the checkpoint is single use and
+    /// removed afterwards. A failed restore discards the checkpoint and
+    /// starts cold with a warning.
     pub(crate) async fn start_impl(&self, inst: &mut Instance) -> Result<RunInfo> {
         let reference = target(inst);
-        match self.docker.start_container(&reference, None).await {
-            Ok(()) => {}
-            Err(e) if error::is_not_found(&e) => return Err(Error::not_found("container")),
-            Err(e) => return Err(error::map(e, "container")),
+        let restored = self.checkpoints_enabled()
+            && self.has_checkpoint(&reference).await
+            && self.restore_or_warn(inst, &reference).await?;
+        if !restored {
+            match self.docker.start_container(&reference, None).await {
+                Ok(()) => {}
+                Err(e) if error::is_not_found(&e) => return Err(Error::not_found("container")),
+                Err(e) => return Err(error::map(e, "container")),
+            }
         }
         let inspect = self.inspect(&reference).await?;
         if inst.runtime_ref.is_empty()
@@ -395,6 +404,36 @@ impl DockerRuntime {
         })
     }
 
+    /// Restore the container from its sleep checkpoint. `Ok(true)` when it
+    /// runs again from where it was; `Ok(false)` when the restore failed and
+    /// the caller should start cold (the checkpoint is gone either way);
+    /// `Err(not_found)` when the container itself is gone.
+    async fn restore_or_warn(&self, inst: &Instance, reference: &str) -> Result<bool> {
+        let started = Instant::now();
+        match self.start_from_checkpoint(reference).await {
+            Ok(()) => {
+                tracing::info!(
+                    instance = %inst.id, container = %reference,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "container restored from its checkpoint (processes and pids kept)"
+                );
+                if !self.discard_checkpoint(reference).await {
+                    tracing::warn!(instance = %inst.id, container = %reference, "cannot remove the used checkpoint");
+                }
+                Ok(true)
+            }
+            Err(e) if e.is_not_found() => Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    instance = %inst.id, container = %reference, error = %e.describe(),
+                    "restore from the checkpoint failed; discarding it and starting cold (processes from before the sleep are lost)"
+                );
+                self.discard_checkpoint(reference).await;
+                Ok(false)
+            }
+        }
+    }
+
     /// Poll `ip:port` until it accepts a TCP connection. A container that exits
     /// first yields `bad_gateway` with its last log lines (a template problem the
     /// caller can show the user); one that never listens yields `timeout` after
@@ -450,11 +489,12 @@ impl DockerRuntime {
     }
 
     /// Stop the container with `grace` before SIGKILL. A missing or already
-    /// stopped container is not an error.
+    /// stopped container is not an error. A sleep checkpoint, if any, is
+    /// discarded: the next start boots cold.
     pub(crate) async fn stop_impl(&self, inst: &Instance, grace: Duration) -> Result<()> {
         let reference = target(inst);
         let t = i32::try_from(grace.as_secs()).unwrap_or(i32::MAX);
-        match self
+        let outcome = match self
             .docker
             .stop_container(
                 &reference,
@@ -471,14 +511,18 @@ impl DockerRuntime {
             }
             Err(e) if error::is_not_found(&e) => {
                 tracing::warn!(instance = %inst.id, container = %reference, "stop: container does not exist");
-                Ok(())
+                return Ok(());
             }
             Err(e) if error::is_conflict(&e) && error::message(&e).contains("not running") => {
                 tracing::debug!(instance = %inst.id, container = %reference, "stop: container was not running");
                 Ok(())
             }
             Err(e) => Err(error::map(e, "container")),
+        };
+        if self.checkpoints_enabled() && self.discard_checkpoint(&reference).await {
+            tracing::info!(instance = %inst.id, container = %reference, "stop discarded the saved memory; the next start boots cold");
         }
+        outcome
     }
 
     /// Force-remove the container (by id and by name) and optionally the storage directory.
@@ -515,6 +559,9 @@ impl DockerRuntime {
             Ok(()) => {
                 tracing::info!(instance = %inst.id, container = %reference, from = %inst.shape, to = %shape, "container resized");
                 inst.shape = shape;
+                if self.checkpoints_enabled() && self.discard_checkpoint(&reference).await {
+                    tracing::info!(instance = %inst.id, container = %reference, "resize discarded the saved memory; the next start boots cold");
+                }
                 Ok(())
             }
             Err(e) if error::is_not_found(&e) => Err(Error::not_found("container")),

@@ -33,7 +33,7 @@ use warren_core::{
 
 use crate::{
     DockerRuntime, HOME_DIR, LABEL_INJECTED, LABEL_SCOPE, NETWORK_INTERNAL, NETWORK_PUBLIC,
-    OPT_ENABLE_ICC,
+    OPT_ENABLE_ICC, runtime::target,
 };
 
 const IMAGE: &str = "alpine:3.20";
@@ -92,13 +92,30 @@ impl Fixture {
 
     /// A runtime that injects `gateway_bin` into workspace-template containers.
     async fn with_gateway(gateway_bin: Option<PathBuf>) -> Fixture {
+        Self::build(Config {
+            gateway_bin,
+            ..Config::default()
+        })
+        .await
+    }
+
+    /// A runtime asked to sleep with checkpoints (`--docker-checkpoints`);
+    /// whether it can depends on the engine (see `checkpoints_enabled`).
+    async fn with_checkpoints() -> Fixture {
+        Self::build(Config {
+            docker_checkpoints: true,
+            ..Config::default()
+        })
+        .await
+    }
+
+    async fn build(cfg: Config) -> Fixture {
         let data_dir = scratch_dir("fixture");
         let cfg = Config {
             data_dir: data_dir.clone(),
             runtime: "auto".into(),
             dev_mode: true,
-            gateway_bin,
-            ..Config::default()
+            ..cfg
         };
         let rt = DockerRuntime::new(cfg).await.expect("docker client");
         rt.ready().await.expect("docker runtime ready");
@@ -207,6 +224,178 @@ async fn destroy_quietly(rt: &DockerRuntime, inst: &Instance) {
     if let Err(e) = rt.destroy(inst, true).await {
         eprintln!("cleanup of {} failed: {e}", inst.id);
     }
+}
+
+/// `is_running` follows the container's state: an exited container answers
+/// false even though the engine still serves one-shot stats for it.
+#[tokio::test]
+async fn is_running_follows_the_container_state() {
+    require_docker!();
+    let f = Fixture::new().await;
+    let tpl = template();
+    let mut inst = instance(&tpl);
+    let outcome = async {
+        f.rt.create_with(&mut inst, &tpl, keepalive())
+            .await
+            .map_err(|e| format!("create: {}", e.describe()))?;
+        ensure!(
+            !f.rt.is_running(&inst).await.map_err(|e| e.describe())?,
+            "created but not started reads as not running"
+        );
+        f.rt.start(&mut inst)
+            .await
+            .map_err(|e| format!("start: {}", e.describe()))?;
+        ensure!(
+            f.rt.is_running(&inst).await.map_err(|e| e.describe())?,
+            "running after start"
+        );
+        f.rt.stop(&inst, Duration::from_secs(1))
+            .await
+            .map_err(|e| format!("stop: {}", e.describe()))?;
+        ensure!(
+            !f.rt.is_running(&inst).await.map_err(|e| e.describe())?,
+            "not running after stop"
+        );
+        Ok::<(), String>(())
+    }
+    .await;
+    destroy_quietly(&f.rt, &inst).await;
+    outcome.unwrap();
+    assert!(
+        !f.rt.is_running(&inst).await.unwrap(),
+        "a destroyed container reads as not running"
+    );
+}
+
+/// `<count> <pid>` written every second by the counter command below.
+async fn read_counter(rt: &DockerRuntime, inst: &Instance) -> Result<(u64, u64), String> {
+    let r = rt
+        .exec(inst, &exec("cat /tmp/counter"))
+        .await
+        .map_err(|e| format!("exec: {}", e.describe()))?;
+    let mut parts = r.stdout.split_whitespace();
+    let n = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("counter output: {r:?}"))?;
+    let pid = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("counter output: {r:?}"))?;
+    Ok((n, pid))
+}
+
+/// With `--docker-checkpoints`: on an engine in experimental mode, sleep
+/// checkpoints the container and start restores it, the counter process
+/// continuing with its pid; the checkpoint is single use and a stop discards
+/// it. On an engine whose restore is broken (Docker 28 and later on bridge
+/// networks) the wake boots cold and the checkpoint is discarded; on an
+/// engine without experimental mode sleep stops the container as before.
+#[tokio::test]
+async fn sleep_keeps_memory_through_a_checkpoint() {
+    require_docker!();
+    let f = Fixture::with_checkpoints().await;
+    let tpl = template();
+    let mut inst = instance(&tpl);
+    let counter = "i=0; while :; do i=$((i+1)); echo \"$i $$\" > /tmp/counter; sleep 1; done";
+    let outcome = async {
+        f.rt.create_with(&mut inst, &tpl, cmd(&["/bin/sh", "-c", counter]))
+            .await
+            .map_err(|e| format!("create: {}", e.describe()))?;
+        f.rt.start(&mut inst)
+            .await
+            .map_err(|e| format!("start: {}", e.describe()))?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let before = read_counter(&f.rt, &inst).await?;
+        f.rt.sleep(&inst, Duration::from_secs(5))
+            .await
+            .map_err(|e| format!("sleep: {}", e.describe()))?;
+        ensure!(
+            !f.rt.is_running(&inst).await.map_err(|e| e.describe())?,
+            "not running while asleep"
+        );
+        let reference = target(&inst);
+        if !f.rt.checkpoints_enabled() {
+            eprintln!(
+                "the engine is not in experimental mode: checked only that sleep stopped the container"
+            );
+            ensure!(
+                !f.rt.has_checkpoint(&reference).await,
+                "no checkpoint without experimental mode"
+            );
+            return Ok(());
+        }
+        ensure!(
+            f.rt.has_checkpoint(&reference).await,
+            "a sleep checkpoint exists while asleep"
+        );
+        // Whether the engine can restore at all: Docker 28 and later answer
+        // `start?checkpoint=` with "bind-mount /proc/0/ns/net" on bridge
+        // networks and never run `runsc restore` (moby/moby#50750); the
+        // runtime then discards the checkpoint and boots cold.
+        let engine_restores = match f.rt.start_from_checkpoint(&reference).await {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "the engine cannot restore from its checkpoint ({}); checking the cold-start fallback only",
+                    e.describe()
+                );
+                false
+            }
+        };
+        if engine_restores {
+            // The runtime's start would have done this restore; finish what it
+            // does after one and drop the used checkpoint.
+            f.rt.discard_checkpoint(&reference).await;
+        } else {
+            f.rt.start(&mut inst)
+                .await
+                .map_err(|e| format!("cold start after a failed restore: {}", e.describe()))?;
+        }
+        ensure!(
+            !f.rt.has_checkpoint(&reference).await,
+            "the checkpoint is single use: removed after a restore, discarded after a failed one"
+        );
+        ensure!(
+            f.rt.is_running(&inst).await.map_err(|e| e.describe())?,
+            "running again after the wake"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let after = read_counter(&f.rt, &inst).await?;
+        if engine_restores {
+            ensure!(
+                after.1 == before.1,
+                "the shell keeps its pid across sleep and wake: {before:?} -> {after:?}"
+            );
+            ensure!(
+                after.0 > before.0,
+                "the counter continued after the restore: {before:?} -> {after:?}"
+            );
+        } else {
+            ensure!(
+                after.0 < before.0 + 2,
+                "a cold start restarts the counter: {before:?} -> {after:?}"
+            );
+        }
+        f.rt.sleep(&inst, Duration::from_secs(5))
+            .await
+            .map_err(|e| format!("second sleep: {}", e.describe()))?;
+        ensure!(
+            f.rt.has_checkpoint(&reference).await,
+            "asleep again with a checkpoint"
+        );
+        f.rt.stop(&inst, Duration::from_secs(1))
+            .await
+            .map_err(|e| format!("stop: {}", e.describe()))?;
+        ensure!(
+            !f.rt.has_checkpoint(&reference).await,
+            "a stop while asleep discards the checkpoint"
+        );
+        Ok::<(), String>(())
+    }
+    .await;
+    destroy_quietly(&f.rt, &inst).await;
+    outcome.unwrap();
 }
 
 #[tokio::test]

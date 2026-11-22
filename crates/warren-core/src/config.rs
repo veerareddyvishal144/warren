@@ -66,6 +66,12 @@ pub struct Config {
     /// hosts (Docker Desktop, the smolvm engine), where the host has no route
     /// to the container networks. Defaults to on for macOS hosts.
     pub docker_publish_ports: bool,
+    /// Sleep Docker instances with their memory: checkpoint the container
+    /// through the engine's checkpoint API (gVisor's `runsc checkpoint`) and
+    /// restore it on wake, so processes keep running with their pids. Needs
+    /// an engine in experimental mode; otherwise sleep keeps the disk only.
+    /// Off by default.
+    pub docker_checkpoints: bool,
     /// Where the egress broker listens (`host:port`); it must be reachable from
     /// the instances' networks (the Docker bridge, `warren-fc0`, the Lume NAT).
     /// Empty or `none` runs the daemon without a broker, which refuses
@@ -112,6 +118,7 @@ impl Default for Config {
             signup_enabled: true,
             allow_private_egress: false,
             docker_publish_ports: cfg!(target_os = "macos"),
+            docker_checkpoints: false,
             broker_listen: crate::broker::DEFAULT_BROKER_LISTEN.into(),
             broker_advertise_addr: None,
             min_idle_timeout_sec: MIN_IDLE_TIMEOUT_SEC,

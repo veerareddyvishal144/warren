@@ -18,6 +18,9 @@
 //!   run the vm scenario (`WARREN_E2E_KERNEL`, `WARREN_E2E_FIRECRACKER_BIN`;
 //!   `WARREN_E2E_FIRECRACKER_JAILER=/path/to/jailer` adds `--firecracker-jailer`
 //!   so the scenario runs through the jailer).
+//! - `WARREN_E2E_DOCKER_CHECKPOINTS=1`: start every daemon with
+//!   `--docker-checkpoints` and run `default_sleep_keeps_memory` (the Docker
+//!   engine must be in experimental mode; point `DOCKER_HOST` at one).
 //! - `WARREN_E2E_KEEP=1`: keep each daemon's data dir and log after the test.
 //! - `WARREN_E2E_LOG`: daemon log filter (default `info`).
 //! - `WARREN_E2E_IMAGE_TAG`: tag of the built-in images the daemon should use

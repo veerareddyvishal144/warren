@@ -28,6 +28,11 @@
 //! - `logs`, `stats` and `resize` use the Docker API; `clone_storage`,
 //!   `backup_storage` and `restore_storage` are file-system operations on the
 //!   storage directory (tar.gz for backups).
+//! - With `Config::docker_checkpoints` and an engine in experimental mode, `sleep`
+//!   checkpoints the container through the engine's checkpoint API (gVisor's
+//!   `runsc checkpoint`) and `start` restores it, so processes keep running
+//!   with their pids across a sleep; see the `checkpoint` module. Otherwise
+//!   sleep stops the container and keeps the disk.
 //! - The gateway inside an instance runs as root, so the home can hold files a
 //!   non-root daemon may not touch. Storage operations that hit
 //!   `PermissionDenied` fall back to a short-lived root helper container
@@ -35,7 +40,8 @@
 //!   only ever works on validated paths under the instances directory.
 //!
 //! Module map: `runtime` (connection, readiness, the trait impl), `container`
-//! (create, start, stop, destroy, resize, recreate), `inject` (gateway injection:
+//! (create, start, stop, destroy, resize, recreate), `checkpoint` (sleep with
+//! memory through the engine's checkpoint API), `inject` (gateway injection:
 //! the decision, the wrapped entrypoint, the start-failure hint), `exec`,
 //! `observe` (logs and stats), `image` (pulls), `storage` (disk usage, copies,
 //! backups), `helper` (the root helper container) and `error` (Docker error
@@ -43,6 +49,7 @@
 
 use std::time::Duration;
 
+mod checkpoint;
 mod container;
 mod error;
 mod exec;
@@ -57,6 +64,7 @@ mod storage;
 #[cfg(test)]
 mod tests;
 
+pub use checkpoint::CHECKPOINT_ID;
 pub use netpolicy::{LINK_LOCAL, OPT_ENABLE_ICC, PIDS_LIMIT, PRIVATE_RANGES};
 pub use runtime::DockerRuntime;
 

@@ -102,7 +102,7 @@ Every crate depends on `warren-core` and nothing else in the workspace; `warrend
 ## Roadmap
 
 - **Screen for macOS instances**: noVNC through the edge, then a screenshot and input API for agents that need to see.
-- **Memory checkpoints for `default`**: gVisor checkpoint/restore so sleep keeps processes and memory on every type (`mac` does through Lume suspend, `vm` through Firecracker snapshots). The API does not change.
+- **Memory checkpoints for `default` without going through Docker**: `--docker-checkpoints` uses the engine's checkpoint API (gVisor checkpoint/restore), which needs `"experimental": true` and, on current Docker (29.x), writes the checkpoint but fails to restore it inside the engine, so the wake boots cold ([docs/self-hosting.md](docs/self-hosting.md#sleep-with-memory-on-default-instances)). `runsc restore` works when driven directly; doing that from Warren lifts both the experimental-mode requirement and the engine bug. `mac` (Lume suspend) and `vm` (Firecracker snapshots) need no setting.
 - **Linux guests on Mac hosts**, outside the two-guest limit, as cheap extra capacity on the same machine.
 - **Harden the Mac host**: host-side `pf` egress drops for the NAT subnet (today each guest enforces its own policy), one `lume serve` per instance, and in time a runtime on Virtualization.framework without Lume.
 - **Secrets at rest**: encrypt instance env and brokered secrets with a key kept outside the data directory.

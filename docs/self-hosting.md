@@ -26,6 +26,21 @@ docker run --rm --runtime=runsc alpine uname -r        # prints a gVisor kernel 
 
 The script downloads the release tarball, verifies its SHA-512, installs `runsc` and `containerd-shim-runsc-v1` into `/usr/local/bin`, merges the `runsc` runtime (with `--platform=systrap`) into `/etc/docker/daemon.json` without touching other keys, reloads Docker and runs the smoke test. Re-run it to upgrade. Set `WARREN_RUNTIME=runsc` in production so a missing gVisor is a startup error rather than a silent fallback to `runc`.
 
+### Sleep with memory on `default` instances
+
+Sleep stops a `default` container and keeps its disk. To keep its processes and memory too, let the engine checkpoint it: Docker keeps its checkpoint API behind experimental mode, and gVisor serves it with `runsc checkpoint` and `runsc restore` (nothing else to install; `runc` would need CRIU). Add the key to `/etc/docker/daemon.json` next to the `runsc` runtime the install script wrote, and restart Docker:
+
+```json
+{
+  "experimental": true,
+  "runtimes": { "runsc": { "path": "/usr/local/bin/runsc", "runtimeArgs": ["--platform=systrap"] } }
+}
+```
+
+Then start `warrend` with `--docker-checkpoints` (`WARREN_DOCKER_CHECKPOINTS=1`). The startup line `docker runtime ready` shows `checkpoints=true`; on an engine without experimental mode the daemon warns once and sleep keeps the disk only, as without the flag. Each sleep writes one checkpoint named `sleep` into the container's directory under Docker's data root (`docker checkpoint ls warren-<id>` lists it); the next start restores from it and removes it, and stop, resize, update and delete discard it. A restore the engine refuses falls back to a cold start with a warning in the log, so the flag is never worse than a plain stop. Checkpoint and restore times are in [benchmarks.md](benchmarks.md).
+
+**Known engine limitation (2026-11-22).** On Docker 29.1.3 with containerd 2.2.1 the checkpoint itself works (`runsc checkpoint`, 0.28 s and 1.4 MB for a `warren-base` container), but the engine's restore does not: `POST /containers/{id}/start?checkpoint=sleep` fails inside Docker with `bind-mount /proc/0/ns/net ... no such file or directory` and `runsc restore` is never invoked (the same happens with `--network none` and with the `docker` CLI, so it is not Warren's request). The daemon logs `restore from the checkpoint failed; discarding it and starting cold`, and the instance comes back without its processes. `runsc restore` itself works on the same host (0.08 s for the same image when driven directly). Docker tracks this as [moby/moby#50750](https://github.com/moby/moby/issues/50750) ("docker checkpoint and gVisor only work with `--network=host` since v28.0", open as of this writing); Warren's instances sit on a bridge network, so until Docker's restore is fixed, or Warren drives `runsc` directly, treat this flag as inert on Docker 28 and later. Watch the daemon log after the first wake before relying on it.
+
 ## 4. Build
 
 ```bash
@@ -92,6 +107,7 @@ WARREN_LOG=info                         # tracing filter, e.g. info,warren_edge=
 | `WARREN_PUBLIC_PORT` | `--public-port` | `7337` | Port in URLs; 443 or 80 are omitted; 0 omits always |
 | `WARREN_DATA_DIR` | `--data-dir` | `/var/lib/warren` | Everything persistent |
 | `WARREN_RUNTIME` | `--runtime` | `auto` | Docker OCI runtime for `default` instances (`auto`, `runsc`, `runc`), or `none` to run without Docker (a Mac serving only `mac` instances) |
+| `WARREN_DOCKER_CHECKPOINTS` | `--docker-checkpoints` | `false` | Sleep `default` instances with their memory through the engine's checkpoint API (gVisor `runsc checkpoint`); needs Docker in experimental mode, else sleep keeps the disk only ([above](#sleep-with-memory-on-default-instances)) |
 | `WARREN_REGION` | `--region` | `local` | Reported on instances; the multi-node scheduler will use it |
 | `WARREN_DEV` | `--dev` | `false` | 5 s minimum idle timeout and `host.docker.internal` inside instances; never in production |
 | `WARREN_MAX_AWAKE_INSTANCES` | `--max-awake-instances` | unset | Cap on awake instances per workspace; unset means unlimited ([quotas.md](quotas.md)) |

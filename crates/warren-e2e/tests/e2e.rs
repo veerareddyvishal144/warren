@@ -2146,3 +2146,151 @@ async fn vm_sleep_keeps_memory_body(cx: Ctx) -> Result<()> {
     ensure!(!vm_dir.exists(), "delete removes the vm directory");
     Ok(())
 }
+
+// --- default_sleep_keeps_memory ---------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn default_sleep_keeps_memory() {
+    if !Daemon::checkpoints_requested() {
+        eprintln!(
+            "default_sleep_keeps_memory: skipped; set WARREN_E2E_DOCKER_CHECKPOINTS=1 (needs a Docker engine in experimental mode with gVisor, or runc with CRIU)"
+        );
+        return;
+    }
+    run_case(
+        "default_sleep_keeps_memory",
+        default_sleep_keeps_memory_body,
+    )
+    .await
+}
+
+/// Sleep with memory on a Docker (gVisor) instance through the engine's
+/// checkpoint API: a background process started before the sleep is alive
+/// with the same pid after the wake, the restored container's disk is
+/// writable, and a stop while asleep discards the checkpoint so the next
+/// start boots cold.
+async fn default_sleep_keeps_memory_body(cx: Ctx) -> Result<()> {
+    // Message text only: the log's key=value fields carry colour codes.
+    ensure!(
+        cx.daemon
+            .log_tail(200)
+            .contains("docker checkpoints on: sleep saves each container's memory"),
+        "the daemon did not enable checkpoints (is the engine in experimental mode?); log tail:\n{}",
+        cx.daemon.log_tail(40)
+    );
+    let sdk = cx.ws.sdk();
+    let req = CreateInstanceRequest {
+        template: Some("warren-base".into()),
+        ..Default::default()
+    };
+    let inst = sdk.create_instance(&req).await?;
+    let inst = cx.ws.wait_running(&inst.id).await?;
+    let id = inst.id.as_str();
+
+    // The marker, and its pid.
+    let r = sdk.exec(id, &cmd(MARKER_START)).await?;
+    ensure!(
+        r.exit_code == 0 && r.stdout.contains("started"),
+        "start the marker: {r:?}"
+    );
+    let pid_before = marker_pid(&cx, id).await?;
+    ensure!(
+        !pid_before.is_empty(),
+        "marker process not found right after starting it"
+    );
+
+    // Sleep: the container is checkpointed and exits.
+    let answer = sdk.sleep(id).await?;
+    ensure!(
+        answer.status == InstanceStatus::Sleeping,
+        "sleep answers sleeping: {answer:?}"
+    );
+    cx.ws
+        .wait_for_status(id, InstanceStatus::Sleeping, TRANSITION_TIMEOUT)
+        .await?;
+    ensure!(
+        cx.daemon
+            .log_tail(200)
+            .contains("container checkpointed and exited"),
+        "the daemon logged the checkpoint; log tail:\n{}",
+        cx.daemon.log_tail(40)
+    );
+
+    // Wake: the same process tree, the same pid.
+    let answer = sdk.start(id).await?;
+    ensure!(
+        matches!(
+            answer.status,
+            InstanceStatus::Waking | InstanceStatus::Starting | InstanceStatus::Running
+        ),
+        "start answers waking: {answer:?}"
+    );
+    let woke = cx.ws.wait_running(id).await?;
+    ensure!(
+        woke.status == InstanceStatus::Running,
+        "running after the wake"
+    );
+    ensure!(
+        cx.daemon
+            .log_tail(200)
+            .contains("container restored from its checkpoint"),
+        "the daemon logged the restore; log tail:\n{}",
+        cx.daemon.log_tail(40)
+    );
+    let pid_after = marker_pid(&cx, id).await?;
+    ensure!(
+        !pid_after.is_empty(),
+        "marker process is gone after the wake (memory was not preserved)"
+    );
+    ensure!(
+        pid_after == pid_before,
+        "marker pid changed across sleep and wake: {pid_before} -> {pid_after}"
+    );
+    let r = sdk
+        .exec(
+            id,
+            &cmd(&format!(
+                "echo awake > {0}/awake.txt && cat {0}/awake.txt",
+                inst.mount_path
+            )),
+        )
+        .await?;
+    ensure!(
+        r.stdout.trim() == "awake",
+        "the restored container's disk is writable: {r:?}"
+    );
+
+    // A stop while asleep discards the checkpoint; the next start boots cold.
+    sdk.sleep(id).await?;
+    cx.ws
+        .wait_for_status(id, InstanceStatus::Sleeping, TRANSITION_TIMEOUT)
+        .await?;
+    let answer = sdk.stop(id).await?;
+    ensure!(
+        settles(
+            answer.status,
+            InstanceStatus::Stopping,
+            InstanceStatus::Stopped
+        ),
+        "stop answers stopping: {answer:?}"
+    );
+    cx.ws
+        .wait_for_status(id, InstanceStatus::Stopped, TRANSITION_TIMEOUT)
+        .await?;
+    sdk.start(id).await?;
+    cx.ws.wait_running(id).await?;
+    ensure!(
+        marker_pid(&cx, id).await?.is_empty(),
+        "a cold start after a stop has no marker process"
+    );
+    let r = sdk
+        .exec(id, &cmd(&format!("cat {}/awake.txt", inst.mount_path)))
+        .await?;
+    ensure!(
+        r.stdout.trim() == "awake",
+        "files written after the wake survive the stop: {r:?}"
+    );
+    cx.ws.delete_and_wait(id).await?;
+    Ok(())
+}
