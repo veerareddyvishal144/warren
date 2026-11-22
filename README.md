@@ -23,7 +23,7 @@ On an Apple silicon Mac with Lume and a base image, `warren up` serves macOS ins
 | Persistent computers | Linux: Debian 12 with Node 24, Python 3, git and build tools, `/home/agent` persists across sleep, stop, restart, resize and template updates. macOS: a full macOS guest whose disk is the home. |
 | Linux sandboxes on a Mac | Without Docker Desktop: the [smolvm engine](docs/linux-on-mac.md) runs each Linux instance as its own microVM on Apple silicon; Docker Desktop works too. The daemon publishes instance ports on loopback where the host cannot route to containers. |
 | Real macOS instances | A macOS VM per instance on an Apple silicon Mac (`warren-macos` template, type `mac`): Xcode, the Simulator, Safari, anything that needs macOS. Same API, URLs, gateway and crons as every other instance. |
-| Sleep with memory | macOS instances suspend in 3 to 4 s and resume in 5 to 11 s with every process intact and the same pids. Linux instances keep their disk across sleep; memory checkpoints are on the roadmap. |
+| Sleep with memory | macOS instances suspend in 3 to 4 s and resume in 5 to 11 s with every process intact and the same pids. Firecracker (`vm`) instances pause and snapshot their memory on sleep and resume it on wake, processes and pids intact (timings not yet measured). gVisor (`default`) instances keep their disk across sleep; their memory checkpoints are on the roadmap. |
 | Fork, backup, restore, resize | Copy an instance with its disk, take backups without stopping, restore, grow the disk or change the shape. On macOS forks and backups are APFS clones: instant, sharing blocks until writes diverge. |
 | Two guests per Mac | Apple's limit, enforced before anything is cloned: a third macOS instance answers `409 host_capacity_reached`. Sleeping frees a slot, so a Mac serves many instances two at a time. |
 | One URL per instance | `https://<id>.<base>/` reaches the default port, `https://<id>-<port>.<base>/` any port. WebSockets pass through; signed URLs let browsers in without the key. |
@@ -93,7 +93,7 @@ Every crate depends on `warren-core` and nothing else in the workspace; `warrend
 - **Linux `default` type** is exercised end to end in CI under Docker. **`vm` (Firecracker)** is experimental and tested on one machine.
 - **macOS Phase 1 is verified on one Mac**: a MacBook Pro (Apple silicon, 16 GiB) running `scripts/mac/e2e.sh` on 2026-11-19, twice in a row: create, exec, sleep and wake with processes intact, daemon restart with the VM adopted, fork, guest isolation, host capacity, delete. The numbers and their method are in [docs/benchmarks.md](docs/benchmarks.md). It has not run on a second Mac, a Mac mini, or any other macOS host version.
 - **New in this release and not yet exercised beyond the development machines**: `warren up`, `warren connect` and `warren run`; the egress allowlist and secret broker; the install path in [docs/install.md](docs/install.md). Treat them as fresh.
-- **Not done**: a screen for macOS instances, host-side egress enforcement for macOS guests (the guest applies its own policy with `pf`), memory checkpoints for Linux, TLS in the daemon (use a proxy), an audit log. The complete list is [docs/limits.md](docs/limits.md).
+- **Not done**: a screen for macOS instances, host-side egress enforcement for macOS guests (the guest applies its own policy with `pf`), memory checkpoints for gVisor (`default`) instances, TLS in the daemon (use a proxy), an audit log. The complete list is [docs/limits.md](docs/limits.md).
 
 ## Documentation
 
@@ -102,7 +102,7 @@ Every crate depends on `warren-core` and nothing else in the workspace; `warrend
 ## Roadmap
 
 - **Screen for macOS instances**: noVNC through the edge, then a screenshot and input API for agents that need to see.
-- **Memory checkpoints for Linux**: gVisor checkpoint/restore and Firecracker snapshots so sleep keeps processes and memory on every type (`mac` already does through Lume suspend). The API does not change.
+- **Memory checkpoints for `default`**: gVisor checkpoint/restore so sleep keeps processes and memory on every type (`mac` does through Lume suspend, `vm` through Firecracker snapshots). The API does not change.
 - **Linux guests on Mac hosts**, outside the two-guest limit, as cheap extra capacity on the same machine.
 - **Harden the Mac host**: host-side `pf` egress drops for the NAT subnet (today each guest enforces its own policy), one `lume serve` per instance, and in time a runtime on Virtualization.framework without Lume.
 - **Secrets at rest**: encrypt instance env and brokered secrets with a key kept outside the data directory.

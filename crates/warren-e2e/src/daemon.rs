@@ -272,6 +272,12 @@ impl Daemon {
             if let Some(fc) = fc_bin {
                 cmd.args(["--firecracker-bin", &fc]);
             }
+            if let Some(jailer) = std::env::var("WARREN_E2E_FIRECRACKER_JAILER")
+                .ok()
+                .filter(|j| !j.trim().is_empty())
+            {
+                cmd.args(["--firecracker-jailer", &jailer]);
+            }
         }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::from(log))

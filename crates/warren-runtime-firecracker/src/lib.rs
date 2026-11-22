@@ -17,27 +17,45 @@
 //! image's own `Entrypoint + Cmd` is recorded in `/etc/warren.wrap.json`
 //! ([`WRAP_FILE`]) for the gateway to supervise while it serves the API.
 //!
+//! Sleep keeps the memory: the guest is paused and Firecracker writes a full
+//! snapshot (`vm/snapshot/{vmstate,mem}`, the memory file as large as the
+//! guest's RAM) before the process is killed and the tap removed; the next
+//! `start` recreates the tap, starts a fresh process and loads the snapshot,
+//! so every process in the guest continues with its pid. A snapshot is used
+//! once; `stop` discards it; a missing, corrupt, resized or
+//! other-Firecracker-version snapshot falls back to a cold boot with a
+//! warning ([`snapshot`]). Firecracker is driven over its API socket
+//! ([`api`]); with `--firecracker-jailer` it runs inside the jailer's chroot
+//! as an unprivileged uid ([`jail`]); each shape gets token-bucket limits on
+//! its disk and NIC unless `--firecracker-no-rate-limits` ([`limits`]).
+//!
 //! Layout under `<instances_dir>/<id>/vm/`: `rootfs.ext4`, `config.json`, `ip`,
-//! `pid`, `console.log`.
+//! `pid`, `console.log`, `firecracker.sock` while running outside the jailer,
+//! `snapshot/` while asleep with memory.
 //!
 //! Needs root and `/dev/kvm`; [`Runtime::ready`] says exactly what is missing.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod api;
 mod host;
 mod image;
 mod inject;
+mod jail;
+mod limits;
 mod net;
 mod paths;
 mod process;
 mod rootfs;
+mod snapshot;
 #[cfg(test)]
 mod testutil;
 mod vmconfig;
 
 use std::{
     collections::{BTreeMap, HashMap},
+    ffi::OsString,
     net::Ipv4Addr,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -51,8 +69,11 @@ use warren_core::{
 };
 
 pub use inject::WRAP_FILE;
+pub use jail::{API_SOCK as JAIL_API_SOCK, JAIL_SUBDIR, JailConfig};
+pub use limits::{RateLimits, for_shape as rate_limits_for_shape};
 pub use net::{BRIDGE, HOST_IP, SUBNET, tap_name};
 pub use paths::VmPaths;
+pub use snapshot::{Assessment as SnapshotAssessment, Meta as SnapshotMeta};
 pub use vmconfig::{GUEST_INIT, VmConfig, boot_args, boot_args_with_init};
 
 use paths::VmPaths as Paths;
@@ -65,6 +86,8 @@ pub const BOOT_TIMEOUT: Duration = Duration::from_secs(120);
 const CONSOLE_TAIL_BYTES: u64 = 4 << 20;
 /// Time allowed for a SIGKILLed VM to disappear.
 const KILL_WAIT: Duration = Duration::from_secs(5);
+/// Time allowed for `sync` inside the guest before a snapshot.
+const GUEST_SYNC_TIMEOUT_SECS: u32 = 30;
 
 /// How a root filesystem gets the gateway that serves the Warren API. The
 /// daemon decides through the template's scope; see [`inject`].
@@ -78,6 +101,25 @@ enum GatewayPlan {
         /// `Config.Entrypoint` followed by `Config.Cmd` of the image.
         command: Vec<String>,
     },
+}
+
+/// What one firecracker process is told and where the host finds the same
+/// things: directly in the instance's `vm` directory, or through the
+/// jailer's chroot where every path is jail-relative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Launch {
+    jail: Option<jail::Jail>,
+    /// Host path of the API socket.
+    api_sock: PathBuf,
+    /// `--api-sock` as firecracker is told.
+    fc_api_sock: PathBuf,
+    /// `--config-file` as firecracker is told.
+    fc_config: PathBuf,
+    /// Snapshot files as firecracker is told.
+    fc_vmstate: PathBuf,
+    fc_mem: PathBuf,
+    /// Where on the host the files firecracker writes a snapshot to appear.
+    host_snapshot_dir: PathBuf,
 }
 
 /// Firecracker-backed [`Runtime`].
@@ -132,15 +174,72 @@ impl FirecrackerRuntime {
         })
     }
 
-    /// The string that identifies a VM's firecracker process on its command line.
-    fn marker(p: &Paths) -> String {
-        p.config().to_string_lossy().into_owned()
+    /// The jailer configuration, when the daemon launches microVMs through it.
+    pub fn jail_config(&self) -> Option<JailConfig> {
+        self.cfg
+            .firecracker_jailer
+            .as_ref()
+            .map(|jailer| JailConfig {
+                jailer: jailer.clone(),
+                firecracker: self.cfg.firecracker_bin.clone(),
+                base: self.cfg.firecracker_jail_dir(),
+                uid: self.cfg.firecracker_jail_uid,
+                gid: self.cfg.firecracker_jail_gid,
+            })
+    }
+
+    fn jail_for(&self, inst: &Instance) -> Option<jail::Jail> {
+        self.jail_config().map(|c| jail::Jail::new(c, &inst.id))
+    }
+
+    /// Refuse a jailer setup that cannot work: a missing binary, uid or gid
+    /// 0 (the jail would be pointless), or a base directory on another
+    /// filesystem than the instances (the jail hard-links their files).
+    /// Creates the base directory.
+    fn check_jail_config(&self) -> Result<()> {
+        let Some(jc) = self.jail_config() else {
+            return Ok(());
+        };
+        if !host::is_executable(&jc.jailer) {
+            return Err(Error::not_supported(format!(
+                "jailer binary {} is missing or not executable",
+                jc.jailer.display()
+            )));
+        }
+        if jc.uid == 0 || jc.gid == 0 {
+            return Err(Error::not_supported(
+                "--firecracker-jail-uid and --firecracker-jail-gid must not be 0",
+            ));
+        }
+        let instances = self.cfg.instances_dir();
+        for dir in [&instances, &jc.base] {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| Error::internal(format!("mkdir {}: {e}", dir.display())))?;
+        }
+        if !jail::same_filesystem(&jc.base, &instances) {
+            return Err(Error::not_supported(format!(
+                "the jail directory {} and the instances directory {} are on different filesystems; the jailer hard-links instance files into the chroot",
+                jc.base.display(),
+                instances.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The string that identifies a VM's firecracker process on its command
+    /// line: the instance's `vm` directory (part of `--config-file` and
+    /// `--api-sock`), or the instance id the jailer passes as `--id`.
+    fn marker(&self, inst: &Instance, p: &Paths) -> String {
+        match self.jail_for(inst) {
+            Some(j) => j.marker(),
+            None => p.vm.to_string_lossy().into_owned(),
+        }
     }
 
     /// Pid of the live firecracker process for this VM, if any.
-    fn running_pid(&self, p: &Paths) -> Result<Option<i32>> {
+    fn running_pid(&self, inst: &Instance, p: &Paths) -> Result<Option<i32>> {
         match process::read_pid(&p.pid())? {
-            Some(pid) if process::is_alive(pid, &Self::marker(p)) => Ok(Some(pid)),
+            Some(pid) if process::is_alive(pid, &self.marker(inst, p)) => Ok(Some(pid)),
             _ => Ok(None),
         }
     }
@@ -177,17 +276,39 @@ impl FirecrackerRuntime {
             .or_else(|| Self::recorded_ip(p))
     }
 
-    /// Render and write `config.json` from the instance's current shape.
-    fn write_config(&self, inst: &Instance, p: &Paths, ip: Ipv4Addr) -> Result<VmConfig> {
-        let kernel = self.kernel()?;
+    /// The rate limits for a shape, unless the daemon turned them off.
+    fn rate_limits(&self, shape: Shape) -> Option<RateLimits> {
+        self.cfg
+            .firecracker_rate_limits
+            .then(|| limits::for_shape(shape))
+    }
+
+    /// Render the VM configuration with `kernel` and `rootfs` as firecracker
+    /// should name them (host paths, or jail-relative ones).
+    fn render_config(
+        &self,
+        inst: &Instance,
+        kernel: &Path,
+        rootfs: &Path,
+        ip: Ipv4Addr,
+    ) -> VmConfig {
+        let limits = self.rate_limits(inst.shape);
         let mut cfg = vmconfig::render(
-            &kernel,
-            &p.rootfs(),
+            kernel,
+            rootfs,
             &net::tap_name(&inst.id),
             ip,
             inst.shape,
+            limits.as_ref(),
         );
         cfg.boot_source.boot_args = boot_args_with_init(ip, &self.guest_init);
+        cfg
+    }
+
+    /// Render and write `config.json` (host paths) from the instance's current shape.
+    fn write_config(&self, inst: &Instance, p: &Paths, ip: Ipv4Addr) -> Result<VmConfig> {
+        let kernel = self.kernel()?;
+        let cfg = self.render_config(inst, &kernel, &p.rootfs(), ip);
         vmconfig::write(&p.config(), &cfg)?;
         Ok(cfg)
     }
@@ -302,15 +423,20 @@ impl FirecrackerRuntime {
         result
     }
 
-    /// SIGKILL the VM and wait for it to vanish.
-    async fn kill_vm(&self, p: &Paths, pid: i32) {
-        tracing::warn!(pid, dir = %p.root.display(), "killing firecracker");
+    /// SIGKILL the process and wait for it to vanish.
+    async fn terminate(&self, pid: i32, marker: &str) {
         if let Err(e) = process::signal(pid, nix::sys::signal::Signal::SIGKILL) {
             tracing::warn!(pid, error = %e, "cannot kill firecracker");
         }
-        if !process::wait_exit(pid, &Self::marker(p), KILL_WAIT).await {
+        if !process::wait_exit(pid, marker, KILL_WAIT).await {
             tracing::error!(pid, "firecracker survived SIGKILL");
         }
+    }
+
+    /// Kill a VM that did not stop or start as it should.
+    async fn kill_vm(&self, p: &Paths, pid: i32, marker: &str) {
+        tracing::warn!(pid, dir = %p.root.display(), "killing firecracker");
+        self.terminate(pid, marker).await;
     }
 
     /// Delete the tap and any per-guest egress rule. Unprivileged daemons never
@@ -321,6 +447,324 @@ impl FirecrackerRuntime {
             && let Some(ip) = ip
         {
             host::set_egress(ip, true).await?;
+        }
+        Ok(())
+    }
+
+    /// Everything a stopped VM leaves on the host: the network, the jail and
+    /// the API socket file.
+    async fn teardown(&self, inst: &Instance, ip: Option<Ipv4Addr>) -> Result<()> {
+        let net = self.teardown_network(inst, ip).await;
+        if let Some(j) = self.jail_for(inst)
+            && let Err(e) = j.remove()
+        {
+            tracing::warn!(instance = %inst.id, error = %e, "cannot remove the jail directory");
+        }
+        let _ = std::fs::remove_file(self.paths(inst).api_sock());
+        net
+    }
+
+    /// Bridge, tap (owned by the jail user when jailed) and the egress rule
+    /// for a boot or a restore. Returns the tap name.
+    async fn bring_up_network(&self, inst: &Instance, ip: Ipv4Addr) -> Result<String> {
+        host::ensure_network(self.cfg.allow_private_egress, self.broker_port()).await?;
+        let tap = net::tap_name(&inst.id);
+        let owner = self.jail_config().map(|c| (c.uid, c.gid));
+        host::tap_create_owned(&tap, owner).await?;
+        if let Err(e) = host::set_egress(ip, inst.network == NetworkMode::AllowAll).await {
+            let _ = host::tap_delete(&tap).await;
+            return Err(e);
+        }
+        Ok(tap)
+    }
+
+    /// Where this VM's process finds its files and socket.
+    fn launch(&self, inst: &Instance, p: &Paths) -> Launch {
+        match self.jail_for(inst) {
+            Some(j) => Launch {
+                api_sock: j.api_sock(),
+                fc_api_sock: PathBuf::from(jail::API_SOCK),
+                fc_config: PathBuf::from(jail::CONFIG),
+                fc_vmstate: Path::new(jail::SNAPSHOT_DIR).join(snapshot::VMSTATE),
+                fc_mem: Path::new(jail::SNAPSHOT_DIR).join(snapshot::MEM),
+                host_snapshot_dir: j.snapshot_dir(),
+                jail: Some(j),
+            },
+            None => Launch {
+                jail: None,
+                api_sock: p.api_sock(),
+                fc_api_sock: p.api_sock(),
+                fc_config: p.config(),
+                fc_vmstate: p.snapshot_vmstate(),
+                fc_mem: p.snapshot_mem(),
+                host_snapshot_dir: p.snapshot_dir(),
+            },
+        }
+    }
+
+    /// The program to spawn and its arguments: `firecracker --api-sock ...`
+    /// with `--config-file` for a boot (a restore configures itself through
+    /// `PUT /snapshot/load`), wrapped in the jailer's command line when
+    /// jailed.
+    fn command(&self, l: &Launch, boot: bool) -> (PathBuf, Vec<OsString>) {
+        let mut fc_args: Vec<OsString> =
+            vec!["--api-sock".into(), l.fc_api_sock.clone().into_os_string()];
+        if boot {
+            fc_args.push("--config-file".into());
+            fc_args.push(l.fc_config.clone().into_os_string());
+        }
+        match &l.jail {
+            Some(j) => j.command(&fc_args),
+            None => (self.cfg.firecracker_bin.clone(), fc_args),
+        }
+    }
+
+    /// Put in place what the process needs: outside the jailer only a clean
+    /// socket path; inside it the chroot with the kernel, the root
+    /// filesystem, a jail-relative config and, for a restore, the snapshot
+    /// files.
+    fn prepare_launch(
+        &self,
+        inst: &Instance,
+        p: &Paths,
+        l: &Launch,
+        ip: Ipv4Addr,
+        restore: bool,
+    ) -> Result<()> {
+        if let Err(e) = std::fs::remove_file(&l.api_sock)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(Error::internal(format!(
+                "remove stale socket {}: {e}",
+                l.api_sock.display()
+            )));
+        }
+        if let Some(j) = &l.jail {
+            let cfg =
+                self.render_config(inst, Path::new(jail::KERNEL), Path::new(jail::ROOTFS), ip);
+            let json = vmconfig::to_json(&cfg)?;
+            let (vmstate, mem) = (p.snapshot_vmstate(), p.snapshot_mem());
+            let snap = restore.then_some((vmstate.as_path(), mem.as_path()));
+            j.prepare(&self.kernel()?, &p.rootfs(), &json, snap)?;
+        }
+        Ok(())
+    }
+
+    /// Spawn the process with the console redirected to the log.
+    async fn spawn_vm(&self, l: &Launch, p: &Paths, boot: bool) -> Result<i32> {
+        let (program, args) = self.command(l, boot);
+        process::spawn(&program, &args, &p.console()).await
+    }
+
+    /// A start that did not reach the gateway: kill the process, drop the
+    /// network and the jail, and attach the console tail to the error.
+    async fn abandon_start(
+        &self,
+        inst: &Instance,
+        p: &Paths,
+        pid: i32,
+        marker: &str,
+        ip: Ipv4Addr,
+        mut e: Error,
+    ) -> Error {
+        let console = process::tail(&p.console(), 40, 64 << 10).unwrap_or_default();
+        self.kill_vm(p, pid, marker).await;
+        process::clear_pid(&p.pid());
+        let _ = self.teardown(inst, Some(ip)).await;
+        let mut details = e.details.take().unwrap_or_else(|| serde_json::json!({}));
+        details["console_tail"] = serde_json::Value::String(console);
+        e.details = Some(details);
+        e
+    }
+
+    /// Cold boot: network, launch files, the process with its config, then
+    /// the gateway port.
+    async fn boot_vm(&self, inst: &Instance, p: &Paths, ip: Ipv4Addr) -> Result<()> {
+        let l = self.launch(inst, p);
+        let marker = self.marker(inst, p);
+        let tap = self.bring_up_network(inst, ip).await?;
+        if let Err(e) = self.prepare_launch(inst, p, &l, ip, false) {
+            let _ = self.teardown(inst, Some(ip)).await;
+            return Err(e);
+        }
+        Self::append_console_marker(p, "boot");
+        let pid = match self.spawn_vm(&l, p, true).await {
+            Ok(pid) => pid,
+            Err(e) => {
+                let _ = self.teardown(inst, Some(ip)).await;
+                return Err(e);
+            }
+        };
+        process::write_pid(&p.pid(), pid)?;
+        tracing::info!(instance = %inst.id, pid, ip = %ip, tap, jailed = l.jail.is_some(), "firecracker started; waiting for the gateway");
+        if let Err(e) = warren_gateway_client::wait_for_port(ip, GATEWAY_PORT, BOOT_TIMEOUT, || {
+            process::is_alive(pid, &marker)
+        })
+        .await
+        {
+            return Err(self.abandon_start(inst, p, pid, &marker, ip, e).await);
+        }
+        self.forget_cpu(&inst.id);
+        Ok(())
+    }
+
+    /// Wake from the saved memory: the same tap as before, a fresh process
+    /// without a config, `PUT /snapshot/load` with `resume_vm`, then the
+    /// gateway port. On success the snapshot files are removed: a snapshot is
+    /// single-use (the restored process keeps the memory file mapped until it
+    /// exits, so the space is released then). On failure the files stay for a
+    /// retry unless Firecracker itself rejected them, which the caller reads
+    /// from [`api::is_fault`].
+    async fn restore_vm(
+        &self,
+        inst: &Instance,
+        p: &Paths,
+        ip: Ipv4Addr,
+        meta: &snapshot::Meta,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let l = self.launch(inst, p);
+        let marker = self.marker(inst, p);
+        let tap = self.bring_up_network(inst, ip).await?;
+        if let Err(e) = self.prepare_launch(inst, p, &l, ip, true) {
+            let _ = self.teardown(inst, Some(ip)).await;
+            return Err(e);
+        }
+        Self::append_console_marker(p, "resume");
+        let pid = match self.spawn_vm(&l, p, false).await {
+            Ok(pid) => pid,
+            Err(e) => {
+                let _ = self.teardown(inst, Some(ip)).await;
+                return Err(e);
+            }
+        };
+        process::write_pid(&p.pid(), pid)?;
+        tracing::info!(
+            instance = %inst.id, pid, ip = %ip, tap, jailed = l.jail.is_some(),
+            firecracker = %meta.firecracker_version, slept_at = meta.created_at, mem_mib = meta.mem_size_mib,
+            "firecracker started; loading the snapshot"
+        );
+        let fc = api::Api::new(&l.api_sock);
+        let result = async {
+            fc.wait_ready(api::SOCKET_TIMEOUT, || process::is_alive(pid, &marker))
+                .await?;
+            fc.load_snapshot(&l.fc_vmstate, &l.fc_mem).await?;
+            warren_gateway_client::wait_for_port(ip, GATEWAY_PORT, BOOT_TIMEOUT, || {
+                process::is_alive(pid, &marker)
+            })
+            .await
+        }
+        .await;
+        if let Err(e) = result {
+            return Err(self.abandon_start(inst, p, pid, &marker, ip, e).await);
+        }
+        if let Err(e) = snapshot::discard(&p.snapshot_dir()) {
+            tracing::warn!(instance = %inst.id, error = %e, "cannot remove the used snapshot");
+        }
+        if l.jail.is_some() {
+            for f in [snapshot::VMSTATE, snapshot::MEM] {
+                let _ = std::fs::remove_file(l.host_snapshot_dir.join(f));
+            }
+        }
+        self.forget_cpu(&inst.id);
+        tracing::info!(instance = %inst.id, pid, elapsed_ms = started.elapsed().as_millis() as u64, "VM resumed from its snapshot");
+        Ok(())
+    }
+
+    /// Best-effort `sync` inside the guest, so the disk is consistent with
+    /// the memory about to be saved (for forks and backups taken while
+    /// asleep, and for a cold boot should the snapshot become unusable).
+    async fn sync_guest(&self, inst: &Instance, ip: Ipv4Addr) {
+        let req = ExecRequest {
+            command: "sync".into(),
+            timeout_seconds: GUEST_SYNC_TIMEOUT_SECS,
+            ..Default::default()
+        };
+        match warren_gateway_client::exec(&self.http, ip, &inst.instance_token, &req).await {
+            Ok(r) if r.exit_code == 0 => {
+                tracing::debug!(instance = %inst.id, "guest disk synced before the snapshot")
+            }
+            Ok(r) => {
+                tracing::warn!(instance = %inst.id, exit_code = r.exit_code, stderr = %r.stderr.trim(), "sync in the guest failed; its disk may lag the saved memory")
+            }
+            Err(e) => {
+                tracing::warn!(instance = %inst.id, error = %e, "cannot sync the guest disk before the snapshot")
+            }
+        }
+    }
+
+    /// Pause the running VM and write its memory and state into the
+    /// instance's snapshot directory with a meta file; the VM is left paused.
+    /// On error it is resumed so the caller can stop it the normal way.
+    async fn snapshot_vm(
+        &self,
+        inst: &Instance,
+        p: &Paths,
+        ip: Option<Ipv4Addr>,
+    ) -> Result<snapshot::Meta> {
+        let ip = ip
+            .ok_or_else(|| Error::internal(format!("instance {} has no guest address", inst.id)))?;
+        let l = self.launch(inst, p);
+        let fc = api::Api::new(&l.api_sock);
+        let info = fc.info().await?;
+        let version = snapshot::parse_version(&info.vmm_version).unwrap_or(info.vmm_version);
+        self.sync_guest(inst, ip).await;
+        snapshot::discard(&p.snapshot_dir())?;
+        std::fs::create_dir_all(&l.host_snapshot_dir).map_err(|e| {
+            Error::internal(format!("mkdir {}: {e}", l.host_snapshot_dir.display()))
+        })?;
+        fc.pause().await?;
+        let result = async {
+            fc.create_snapshot(&l.fc_vmstate, &l.fc_mem).await?;
+            if let Some(j) = &l.jail {
+                j.take_snapshot_files(&p.snapshot_dir())?;
+            }
+            let meta = snapshot::Meta {
+                firecracker_version: version,
+                created_at: Self::now_unix(),
+                shape: inst.shape,
+                ip,
+                tap: net::tap_name(&inst.id),
+                mem_size_mib: inst.shape.memory.saturating_mul(1024),
+            };
+            snapshot::write_meta(&p.snapshot_dir(), &meta)?;
+            Ok(meta)
+        }
+        .await;
+        if result.is_err()
+            && let Err(e) = fc.resume().await
+        {
+            tracing::warn!(instance = %inst.id, error = %e, "cannot resume the VM after a failed snapshot");
+        }
+        result
+    }
+
+    /// What `start` should do about a saved snapshot, given the host's
+    /// Firecracker version (`None` when unknown).
+    fn assess_snapshot(
+        &self,
+        inst: &Instance,
+        p: &Paths,
+        ip: Ipv4Addr,
+        firecracker_version: Option<&str>,
+    ) -> snapshot::Assessment {
+        let tap = net::tap_name(&inst.id);
+        snapshot::assess(
+            &p.snapshot_dir(),
+            &snapshot::Expect {
+                shape: inst.shape,
+                ip,
+                tap: &tap,
+                firecracker_version,
+            },
+        )
+    }
+
+    /// Drop a snapshot that can no longer be used, saying why.
+    fn discard_snapshot(&self, inst: &Instance, p: &Paths, why: &str) -> Result<()> {
+        if snapshot::exists(&p.snapshot_dir()) {
+            tracing::info!(instance = %inst.id, why, "discarding the saved memory; the next start boots cold");
+            snapshot::discard(&p.snapshot_dir())?;
         }
         Ok(())
     }
@@ -367,6 +811,12 @@ impl FirecrackerRuntime {
             let _ = writeln!(f, "--- warren: {text} at {} ---", Self::now_unix());
         }
     }
+
+    /// Bytes on disk: the root filesystem plus any saved memory.
+    fn storage_bytes(p: &Paths) -> Result<i64> {
+        Ok(rootfs::allocated_bytes(&p.rootfs())?
+            .saturating_add(snapshot::allocated_bytes(&p.snapshot_dir())?))
+    }
 }
 
 impl FirecrackerRuntime {
@@ -409,6 +859,7 @@ impl Runtime for FirecrackerRuntime {
                 kernel.display()
             )));
         }
+        self.check_jail_config()?;
         // Not a hard failure: system templates work without it.
         match &self.cfg.gateway_bin {
             Some(bin) if !bin.is_file() => {
@@ -439,7 +890,19 @@ impl Runtime for FirecrackerRuntime {
         std::fs::create_dir_all(&dir)
             .map_err(|e| Error::internal(format!("mkdir {}: {e}", dir.display())))?;
         host::ensure_network(self.cfg.allow_private_egress, self.broker_port()).await?;
-        tracing::info!(firecracker = %bin.display(), kernel = %kernel.display(), bridge = BRIDGE, "firecracker runtime ready");
+        match self.jail_config() {
+            Some(jc) => tracing::info!(
+                firecracker = %bin.display(), kernel = %kernel.display(), bridge = BRIDGE,
+                jailer = %jc.jailer.display(), jail_dir = %jc.base.display(), uid = jc.uid, gid = jc.gid,
+                rate_limits = self.cfg.firecracker_rate_limits,
+                "firecracker runtime ready (jailed)"
+            ),
+            None => tracing::info!(
+                firecracker = %bin.display(), kernel = %kernel.display(), bridge = BRIDGE,
+                rate_limits = self.cfg.firecracker_rate_limits,
+                "firecracker runtime ready"
+            ),
+        }
         Ok(())
     }
 
@@ -500,9 +963,9 @@ impl Runtime for FirecrackerRuntime {
         }
         let ip = self.ensure_ip(&p).await?;
         let runtime_ref = format!("fc-{}", inst.id);
-        let marker = Self::marker(&p);
+        let marker = self.marker(inst, &p);
 
-        if let Some(pid) = self.running_pid(&p)? {
+        if let Some(pid) = self.running_pid(inst, &p)? {
             tracing::info!(instance = %inst.id, pid, "VM already running; adopting it");
             warren_gateway_client::wait_for_port(ip, GATEWAY_PORT, BOOT_TIMEOUT, || {
                 process::is_alive(pid, &marker)
@@ -517,40 +980,51 @@ impl Runtime for FirecrackerRuntime {
         }
 
         self.write_config(inst, &p, ip)?;
-        host::ensure_network(self.cfg.allow_private_egress, self.broker_port()).await?;
-        let tap = net::tap_name(&inst.id);
-        host::tap_create(&tap).await?;
-        if let Err(e) = host::set_egress(ip, inst.network == NetworkMode::AllowAll).await {
-            let _ = host::tap_delete(&tap).await;
-            return Err(e);
-        }
-        Self::append_console_marker(&p, "boot");
-        let pid = match process::spawn(&self.cfg.firecracker_bin, &p.config(), &p.console()).await {
-            Ok(pid) => pid,
-            Err(e) => {
-                let _ = self.teardown_network(inst, Some(ip)).await;
-                return Err(e);
+        if snapshot::exists(&p.snapshot_dir()) {
+            let version = process::version(&self.cfg.firecracker_bin).await;
+            match self.assess_snapshot(inst, &p, ip, version.as_deref()) {
+                snapshot::Assessment::Restore(meta) => {
+                    match self.restore_vm(inst, &p, ip, &meta).await {
+                        Ok(()) => {
+                            inst.ip = ip.to_string();
+                            inst.runtime_ref = runtime_ref.clone();
+                            inst.runtime = RUNTIME_NAME.to_string();
+                            return Ok(RunInfo {
+                                ip: inst.ip.clone(),
+                                runtime_ref,
+                            });
+                        }
+                        Err(e) if api::is_fault(&e) => {
+                            tracing::error!(
+                                instance = %inst.id, error = %e, fault = api::fault_message(&e).unwrap_or_default(),
+                                "firecracker rejected the snapshot; discarding it and booting cold (processes from before the sleep are lost)"
+                            );
+                            snapshot::discard(&p.snapshot_dir())?;
+                        }
+                        Err(mut e) => {
+                            tracing::error!(
+                                instance = %inst.id, error = %e, dir = %p.snapshot_dir().display(),
+                                "restore failed; the snapshot is kept for the next start (stop the instance to discard it)"
+                            );
+                            let mut details =
+                                e.details.take().unwrap_or_else(|| serde_json::json!({}));
+                            details["snapshot_kept"] = serde_json::Value::String(
+                                p.snapshot_dir().to_string_lossy().into_owned(),
+                            );
+                            e.details = Some(details);
+                            return Err(e);
+                        }
+                    }
+                }
+                snapshot::Assessment::Unusable(reason) => {
+                    tracing::warn!(instance = %inst.id, reason, "the saved memory cannot be restored; booting cold (processes from before the sleep are lost)");
+                    snapshot::discard(&p.snapshot_dir())?;
+                }
+                snapshot::Assessment::None => {}
             }
-        };
-        process::write_pid(&p.pid(), pid)?;
-        tracing::info!(instance = %inst.id, pid, ip = %ip, tap, "firecracker started; waiting for the gateway");
-
-        if let Err(mut e) =
-            warren_gateway_client::wait_for_port(ip, GATEWAY_PORT, BOOT_TIMEOUT, || {
-                process::is_alive(pid, &marker)
-            })
-            .await
-        {
-            let console = process::tail(&p.console(), 40, 64 << 10).unwrap_or_default();
-            self.kill_vm(&p, pid).await;
-            process::clear_pid(&p.pid());
-            let _ = self.teardown_network(inst, Some(ip)).await;
-            let mut details = e.details.take().unwrap_or_else(|| serde_json::json!({}));
-            details["console_tail"] = serde_json::Value::String(console);
-            e.details = Some(details);
-            return Err(e);
         }
-        self.forget_cpu(&inst.id);
+
+        self.boot_vm(inst, &p, ip).await?;
         inst.ip = ip.to_string();
         inst.runtime_ref = runtime_ref.clone();
         inst.runtime = RUNTIME_NAME.to_string();
@@ -563,8 +1037,9 @@ impl Runtime for FirecrackerRuntime {
     async fn stop(&self, inst: &Instance, grace: Duration) -> Result<()> {
         let p = self.paths(inst);
         let ip = Self::guest_ip(inst, &p);
-        if let Some(pid) = self.running_pid(&p)? {
+        if let Some(pid) = self.running_pid(inst, &p)? {
             host::require_root("stop a microVM")?;
+            let marker = self.marker(inst, &p);
             if let Some(ip) = ip {
                 match warren_gateway_client::shutdown(&self.http, ip, &inst.instance_token).await {
                     Ok(()) => tracing::debug!(instance = %inst.id, "shutdown requested"),
@@ -573,15 +1048,54 @@ impl Runtime for FirecrackerRuntime {
                     }
                 }
             }
-            if !process::wait_exit(pid, &Self::marker(&p), grace).await {
+            if !process::wait_exit(pid, &marker, grace).await {
                 tracing::warn!(instance = %inst.id, pid, "VM did not power off within {}s", grace.as_secs());
-                self.kill_vm(&p, pid).await;
+                self.kill_vm(&p, pid, &marker).await;
             }
             Self::append_console_marker(&p, "stopped");
         }
         process::clear_pid(&p.pid());
         self.forget_cpu(&inst.id);
-        self.teardown_network(inst, ip).await
+        // A stop, unlike a sleep, forgets the memory: the next start boots cold.
+        self.discard_snapshot(inst, &p, "stop")?;
+        self.teardown(inst, ip).await
+    }
+
+    /// Sleep with memory: `sync` in the guest, pause, full snapshot into
+    /// `vm/snapshot/`, then the process is killed and the tap removed. When
+    /// the snapshot cannot be taken the VM is stopped instead (disk kept, as
+    /// before) with a warning. A VM that is not running is only torn down;
+    /// an existing snapshot stays (the instance is already asleep).
+    async fn sleep(&self, inst: &Instance, grace: Duration) -> Result<()> {
+        let p = self.paths(inst);
+        let ip = Self::guest_ip(inst, &p);
+        let Some(pid) = self.running_pid(inst, &p)? else {
+            process::clear_pid(&p.pid());
+            self.forget_cpu(&inst.id);
+            return self.teardown(inst, ip).await;
+        };
+        host::require_root("sleep a microVM")?;
+        let marker = self.marker(inst, &p);
+        let started = Instant::now();
+        match self.snapshot_vm(inst, &p, ip).await {
+            Ok(meta) => {
+                tracing::info!(
+                    instance = %inst.id, pid, mem_mib = meta.mem_size_mib, firecracker = %meta.firecracker_version,
+                    dir = %p.snapshot_dir().display(), elapsed_ms = started.elapsed().as_millis() as u64,
+                    "memory saved; stopping the paused VM"
+                );
+                Self::append_console_marker(&p, "slept");
+                self.terminate(pid, &marker).await;
+                process::clear_pid(&p.pid());
+                self.forget_cpu(&inst.id);
+                self.teardown(inst, ip).await
+            }
+            Err(e) => {
+                tracing::warn!(instance = %inst.id, error = %e, "snapshot failed; stopping the VM instead (this sleep keeps the disk only)");
+                let _ = snapshot::discard(&p.snapshot_dir());
+                self.stop(inst, grace).await
+            }
+        }
     }
 
     async fn destroy(&self, inst: &Instance, remove_storage: bool) -> Result<()> {
@@ -596,10 +1110,11 @@ impl Runtime for FirecrackerRuntime {
                 p.keep_dir(),
                 p.restore_dir(),
                 p.backup_dir(),
+                p.snapshot_dir(),
             ] {
                 rootfs::remove_tree(&scratch)?;
             }
-            for f in [p.config(), p.rootfs_tmp()] {
+            for f in [p.config(), p.rootfs_tmp(), p.api_sock()] {
                 if let Err(e) = std::fs::remove_file(&f)
                     && e.kind() != std::io::ErrorKind::NotFound
                 {
@@ -612,7 +1127,7 @@ impl Runtime for FirecrackerRuntime {
 
     async fn exec(&self, inst: &Instance, req: &ExecRequest) -> Result<ExecResult> {
         let p = self.paths(inst);
-        if self.running_pid(&p)?.is_none() {
+        if self.running_pid(inst, &p)?.is_none() {
             return Err(Error::conflict(format!(
                 "instance {} is not running",
                 inst.id
@@ -641,7 +1156,7 @@ impl Runtime for FirecrackerRuntime {
 
     async fn stats(&self, inst: &Instance) -> Result<Stats> {
         let p = self.paths(inst);
-        let (cpu_percent, memory_bytes) = match self.running_pid(&p)? {
+        let (cpu_percent, memory_bytes) = match self.running_pid(inst, &p)? {
             Some(pid) => (
                 self.sample_cpu(&inst.id, pid),
                 process::rss_bytes(pid).unwrap_or(0),
@@ -656,14 +1171,27 @@ impl Runtime for FirecrackerRuntime {
             cpu_percent,
             memory_bytes,
             memory_limit_bytes: i64::from(inst.shape.memory).saturating_mul(rootfs::GIB as i64),
-            disk_bytes: rootfs::allocated_bytes(&p.rootfs())?,
+            disk_bytes: Self::storage_bytes(&p)?,
         })
     }
 
+    /// Whether the firecracker process is alive. A sleeping VM has none (its
+    /// memory is on disk), so this is false while asleep.
+    async fn is_running(&self, inst: &Instance) -> Result<bool> {
+        let p = self.paths(inst);
+        Ok(self.running_pid(inst, &p)?.is_some())
+    }
+
+    /// Grow the disk and rewrite the config. A saved snapshot is discarded
+    /// when the shape changes: it holds the old vCPU and memory layout, and
+    /// resizing the filesystem under a suspended guest would corrupt it.
     async fn resize(&self, inst: &mut Instance, shape: Shape) -> Result<()> {
         let p = self.paths(inst);
-        if self.running_pid(&p)?.is_some() {
+        if self.running_pid(inst, &p)?.is_some() {
             return Err(errors::requires_restart());
+        }
+        if shape != inst.shape {
+            self.discard_snapshot(inst, &p, "resize")?;
         }
         if p.rootfs().is_file() {
             let current = rootfs::size_gb(&p.rootfs())?;
@@ -687,12 +1215,14 @@ impl Runtime for FirecrackerRuntime {
 
     async fn recreate(&self, inst: &mut Instance, tpl: &Template) -> Result<()> {
         let p = self.paths(inst);
-        if self.running_pid(&p)?.is_some() {
+        if self.running_pid(inst, &p)?.is_some() {
             return Err(Error::conflict(format!(
                 "instance {} must be stopped before it is recreated",
                 inst.id
             )));
         }
+        // A new root filesystem cannot continue the old memory.
+        self.discard_snapshot(inst, &p, "recreate")?;
         let env = inst.effective_env(&tpl.env);
         let keep = p.keep_dir();
         rootfs::remove_tree(&keep)?;
@@ -720,6 +1250,11 @@ impl Runtime for FirecrackerRuntime {
         Ok(())
     }
 
+    /// Copy the source's disk only. A saved snapshot is never copied: the
+    /// memory holds the source's address, hostname, instance token and open
+    /// connections, so a restored clone would be the source under another
+    /// id. The clone boots fresh from the copied disk (which `sleep` synced
+    /// before saving the memory); `create` then gives it its own identity.
     async fn clone_storage(&self, src: &Instance, dst: &mut Instance) -> Result<()> {
         let sp = self.paths(src);
         if !sp.rootfs().is_file() {
@@ -728,11 +1263,14 @@ impl Runtime for FirecrackerRuntime {
                 src.id
             )));
         }
-        if self.running_pid(&sp)?.is_some() {
+        if self.running_pid(src, &sp)?.is_some() {
             return Err(Error::conflict(format!(
                 "instance {} must be stopped or sleeping before it is forked",
                 src.id
             )));
+        }
+        if snapshot::exists(&sp.snapshot_dir()) {
+            tracing::info!(src = %src.id, dst = %dst.id, "source sleeps with its memory saved; the copy takes the disk only and boots fresh");
         }
         let dp = Paths::new(self.cfg.instances_dir().join(&dst.id));
         std::fs::create_dir_all(&dp.vm)
@@ -791,7 +1329,7 @@ impl Runtime for FirecrackerRuntime {
 
     async fn restore_storage(&self, inst: &Instance, src_path: &Path) -> Result<()> {
         let p = self.paths(inst);
-        if self.running_pid(&p)?.is_some() {
+        if self.running_pid(inst, &p)?.is_some() {
             return Err(Error::conflict(format!(
                 "instance {} must be stopped before it is restored",
                 inst.id
@@ -805,6 +1343,8 @@ impl Runtime for FirecrackerRuntime {
                 "this template has no mount path to restore into",
             ));
         };
+        // A rebuilt root filesystem cannot continue the old memory.
+        self.discard_snapshot(inst, &p, "restore")?;
         // The current image remembers what the instance record alone does not:
         // its env file carries the template defaults, and its wrap file marks a
         // workspace image whose gateway the daemon injected.
@@ -846,8 +1386,10 @@ impl Runtime for FirecrackerRuntime {
         Ok(())
     }
 
+    /// The root filesystem plus the saved memory of a sleeping VM (as large
+    /// as the guest's RAM while it sleeps).
     async fn disk_usage(&self, inst: &Instance) -> Result<i64> {
-        rootfs::allocated_bytes(&self.paths(inst).rootfs())
+        Self::storage_bytes(&self.paths(inst))
     }
 }
 
@@ -1384,7 +1926,10 @@ mod tests {
         assert_eq!(run.ip, "172.30.0.2");
         assert_eq!(run.runtime_ref, "fc-fcsmoke001");
         assert!(host::link_exists(&tap_name(&inst.id)));
-        let pid = rt.running_pid(&p).unwrap().expect("firecracker is running");
+        let pid = rt
+            .running_pid(&inst, &p)
+            .unwrap()
+            .expect("firecracker is running");
         let stats = rt.stats(&inst).await.unwrap();
         assert!(stats.memory_bytes > 0);
         let logs = rt
@@ -1395,7 +1940,7 @@ mod tests {
         assert!(logs.contains("IP-Config: Complete"), "{logs}");
         // Starting again adopts the running VM.
         rt.start(&mut inst).await.unwrap();
-        assert_eq!(rt.running_pid(&p).unwrap(), Some(pid));
+        assert_eq!(rt.running_pid(&inst, &p).unwrap(), Some(pid));
         let err = rt
             .resize(
                 &mut inst,
@@ -1410,7 +1955,7 @@ mod tests {
         assert!(errors::is_requires_restart(&err));
 
         rt.stop(&inst, Duration::from_secs(2)).await.unwrap();
-        assert_eq!(rt.running_pid(&p).unwrap(), None);
+        assert_eq!(rt.running_pid(&inst, &p).unwrap(), None);
         assert!(!host::link_exists(&tap_name(&inst.id)));
         rt.destroy(&inst, true).await.unwrap();
         assert!(!p.root.exists());
@@ -1649,5 +2194,339 @@ mod tests {
             r.destroy(i, true).await.unwrap();
         }
         assert!(!p.root.exists() && !dp.root.exists() && !sp.root.exists() && !bp.root.exists());
+    }
+
+    /// A runtime configured for the jailer, dropping to the test's own ids so
+    /// `chown` works without root.
+    fn jailed_config(data_dir: &Path) -> Config {
+        let mut cfg = test_config(data_dir);
+        cfg.firecracker_jailer = Some(PathBuf::from("/usr/local/bin/jailer"));
+        cfg.firecracker_jail_uid = nix::unistd::geteuid().as_raw();
+        cfg.firecracker_jail_gid = nix::unistd::getegid().as_raw();
+        cfg
+    }
+
+    /// A fake snapshot in the instance's vm dir: meta for `inst`, a small
+    /// vmstate and a memory file as large as the guest's RAM (sparse).
+    fn fake_snapshot(rt: &FirecrackerRuntime, inst: &Instance) -> PathBuf {
+        let p = rt.paths(inst);
+        let dir = p.snapshot_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(p.snapshot_vmstate(), b"state").unwrap();
+        let f = std::fs::File::create(p.snapshot_mem()).unwrap();
+        f.set_len(u64::from(inst.shape.memory) << 30).unwrap();
+        snapshot::write_meta(
+            &dir,
+            &SnapshotMeta {
+                firecracker_version: "1.18.0".into(),
+                created_at: 1,
+                shape: inst.shape,
+                ip: Ipv4Addr::new(172, 30, 0, 2),
+                tap: tap_name(&inst.id),
+                mem_size_mib: inst.shape.memory * 1024,
+            },
+        )
+        .unwrap();
+        dir
+    }
+
+    fn strings(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn launch_paths_and_command_lines() {
+        let tmp = TempDir::new("fc-launch");
+        let rt = FirecrackerRuntime::new(test_config(tmp.path()))
+            .await
+            .unwrap();
+        let inst = instance("ab12cd34ef", &template("alpine:3.20"));
+        let p = rt.paths(&inst);
+
+        // Plain: host paths everywhere, the vm directory as the marker.
+        let l = rt.launch(&inst, &p);
+        assert_eq!(l.jail, None);
+        assert_eq!(l.api_sock, p.vm.join("firecracker.sock"));
+        assert_eq!(l.fc_api_sock, l.api_sock);
+        assert_eq!(l.fc_config, p.config());
+        assert_eq!(l.fc_vmstate, p.vm.join("snapshot/vmstate"));
+        assert_eq!(l.fc_mem, p.vm.join("snapshot/mem"));
+        assert_eq!(l.host_snapshot_dir, p.snapshot_dir());
+        assert_eq!(rt.marker(&inst, &p), p.vm.to_string_lossy().to_string());
+        let (program, args) = rt.command(&l, true);
+        assert_eq!(program, PathBuf::from("/usr/local/bin/firecracker"));
+        assert_eq!(
+            strings(&args),
+            [
+                "--api-sock",
+                &l.api_sock.to_string_lossy(),
+                "--config-file",
+                &p.config().to_string_lossy()
+            ]
+        );
+        assert!(
+            strings(&args).iter().all(|a| !a.contains("--no-api")),
+            "the API stays on for sleep"
+        );
+        let (_, args) = rt.command(&l, false);
+        assert_eq!(
+            strings(&args),
+            ["--api-sock", &l.api_sock.to_string_lossy()]
+        );
+        for a in strings(&args) {
+            if a.starts_with('/') {
+                assert!(a.contains(&rt.marker(&inst, &p)), "{a}");
+            }
+        }
+
+        // Jailed: jail-relative paths, the id as the marker, the jailer in front.
+        let jrt = FirecrackerRuntime::new(jailed_config(tmp.path()))
+            .await
+            .unwrap();
+        let jl = jrt.launch(&inst, &p);
+        let jail = jl.jail.clone().expect("jailed");
+        assert_eq!(
+            jail.root(),
+            tmp.path()
+                .join("firecracker/jail/firecracker/ab12cd34ef/root")
+        );
+        assert_eq!(jl.api_sock, jail.root().join("run/firecracker.socket"));
+        assert_eq!(jl.fc_api_sock, PathBuf::from("/run/firecracker.socket"));
+        assert_eq!(jl.fc_config, PathBuf::from("/config.json"));
+        assert_eq!(jl.fc_vmstate, PathBuf::from("/snapshot/vmstate"));
+        assert_eq!(jl.fc_mem, PathBuf::from("/snapshot/mem"));
+        assert_eq!(jl.host_snapshot_dir, jail.root().join("snapshot"));
+        assert_eq!(jrt.marker(&inst, &p), "ab12cd34ef");
+        let (program, args) = jrt.command(&jl, true);
+        assert_eq!(program, PathBuf::from("/usr/local/bin/jailer"));
+        let args = strings(&args);
+        assert_eq!(args[..2], ["--id", "ab12cd34ef"]);
+        assert_eq!(
+            args[args.len() - 5..],
+            [
+                "--",
+                "--api-sock",
+                "/run/firecracker.socket",
+                "--config-file",
+                "/config.json"
+            ]
+        );
+        let base = args.iter().position(|a| a == "--chroot-base-dir").unwrap();
+        assert_eq!(
+            args[base + 1],
+            tmp.path().join("firecracker/jail").to_string_lossy()
+        );
+        let uid = args.iter().position(|a| a == "--uid").unwrap();
+        assert_eq!(args[uid + 1], nix::unistd::geteuid().as_raw().to_string());
+        let (_, args) = jrt.command(&jl, false);
+        assert_eq!(
+            strings(&args)[args.len() - 3..],
+            ["--", "--api-sock", "/run/firecracker.socket"]
+        );
+    }
+
+    #[tokio::test]
+    async fn jailed_launch_prepares_the_chroot_with_jail_relative_paths() {
+        let tmp = TempDir::new("fc-jailed");
+        let kernel = tmp.path().join("vmlinux");
+        std::fs::write(&kernel, "kernel").unwrap();
+        let mut cfg = jailed_config(tmp.path());
+        cfg.kernel_image = Some(kernel.clone());
+        let rt = FirecrackerRuntime::new(cfg).await.unwrap();
+        let inst = instance("ab12cd34ef", &template("alpine:3.20"));
+        let p = rt.paths(&inst);
+        std::fs::create_dir_all(&p.vm).unwrap();
+        std::fs::write(p.rootfs(), "rootfs").unwrap();
+        let ip = Ipv4Addr::new(172, 30, 0, 2);
+
+        let l = rt.launch(&inst, &p);
+        rt.prepare_launch(&inst, &p, &l, ip, false).unwrap();
+        let jail = l.jail.as_ref().unwrap();
+        assert!(jail.root().join("vmlinux").is_file());
+        assert!(jail.root().join("rootfs.ext4").is_file());
+        let jcfg = vmconfig::read(&jail.root().join("config.json")).unwrap();
+        assert_eq!(jcfg.boot_source.kernel_image_path, "/vmlinux");
+        assert_eq!(jcfg.drives[0].path_on_host, "/rootfs.ext4");
+        assert!(
+            jcfg.drives[0].rate_limiter.is_some(),
+            "limits on by default"
+        );
+        assert!(jcfg.network_interfaces[0].rx_rate_limiter.is_some());
+        assert!(jcfg.network_interfaces[0].tx_rate_limiter.is_some());
+        assert_eq!(jcfg.network_interfaces[0].host_dev_name, "tap-ab12cd34");
+        assert!(jcfg.boot_source.boot_args.contains("ip=172.30.0.2::"));
+        assert_eq!(jcfg.machine_config.mem_size_mib, 4096);
+        assert!(jail.snapshot_dir().is_dir());
+        assert!(!jail.snapshot_dir().join("mem").exists());
+
+        // The host-side config keeps host paths and the same limits.
+        let host_cfg = rt.write_config(&inst, &p, ip).unwrap();
+        assert_eq!(
+            host_cfg.drives[0].path_on_host,
+            p.rootfs().to_string_lossy()
+        );
+        assert_eq!(host_cfg.drives[0].rate_limiter, jcfg.drives[0].rate_limiter);
+        assert_eq!(
+            host_cfg.drives[0].rate_limiter,
+            Some(limits::for_shape(inst.shape).drive())
+        );
+
+        // A restore links the snapshot files in.
+        fake_snapshot(&rt, &inst);
+        rt.prepare_launch(&inst, &p, &l, ip, true).unwrap();
+        assert!(jail.snapshot_dir().join("mem").is_file());
+        assert!(jail.snapshot_dir().join("vmstate").is_file());
+
+        // Teardown (no tap to delete when unprivileged) removes the jail.
+        rt.teardown(&inst, None).await.unwrap();
+        assert!(!jail.dir().exists());
+        assert!(p.rootfs().is_file() && p.snapshot_mem().is_file());
+
+        // Rate limits off: no limiter keys at all.
+        let mut cfg = jailed_config(tmp.path());
+        cfg.firecracker_rate_limits = false;
+        cfg.kernel_image = Some(kernel);
+        let rt = FirecrackerRuntime::new(cfg).await.unwrap();
+        assert_eq!(rt.rate_limits(inst.shape), None);
+        let l = rt.launch(&inst, &p);
+        rt.prepare_launch(&inst, &p, &l, ip, false).unwrap();
+        let jcfg = vmconfig::read(&l.jail.as_ref().unwrap().root().join("config.json")).unwrap();
+        assert_eq!(jcfg.drives[0].rate_limiter, None);
+        assert_eq!(jcfg.network_interfaces[0].rx_rate_limiter, None);
+        assert_eq!(jcfg.network_interfaces[0].tx_rate_limiter, None);
+    }
+
+    #[tokio::test]
+    async fn jail_config_is_validated() {
+        let tmp = TempDir::new("fc-jail-cfg");
+        let rt = FirecrackerRuntime::new(test_config(tmp.path()))
+            .await
+            .unwrap();
+        assert!(rt.jail_config().is_none());
+        rt.check_jail_config().unwrap();
+
+        let mut cfg = jailed_config(tmp.path());
+        let rt = FirecrackerRuntime::new(cfg.clone()).await.unwrap();
+        let err = rt.check_jail_config().unwrap_err();
+        assert_eq!(err.code, CODE_NOT_SUPPORTED);
+        assert!(err.message.contains("jailer binary"), "{}", err.message);
+
+        let fake_jailer = tmp.path().join("jailer");
+        std::fs::write(&fake_jailer, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&fake_jailer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cfg.firecracker_jailer = Some(fake_jailer);
+        let mut zero = cfg.clone();
+        zero.firecracker_jail_gid = 0;
+        let err = FirecrackerRuntime::new(zero)
+            .await
+            .unwrap()
+            .check_jail_config()
+            .unwrap_err();
+        assert!(err.message.contains("must not be 0"), "{}", err.message);
+
+        let rt = FirecrackerRuntime::new(cfg).await.unwrap();
+        rt.check_jail_config().unwrap();
+        assert!(tmp.path().join("firecracker/jail").is_dir());
+        let jc = rt.jail_config().unwrap();
+        assert_eq!(jc.base, tmp.path().join("firecracker/jail"));
+        assert_eq!(jc.firecracker, PathBuf::from("/usr/local/bin/firecracker"));
+    }
+
+    /// The decisions `start` takes about a saved snapshot, on this instance's
+    /// files, without root: restore when everything matches, cold boot (with
+    /// the reason) otherwise.
+    #[tokio::test]
+    async fn start_assesses_the_snapshot_against_the_instance() {
+        let tmp = TempDir::new("fc-assess");
+        let rt = FirecrackerRuntime::new(test_config(tmp.path()))
+            .await
+            .unwrap();
+        let mut inst = instance("ab12cd34ef", &template("alpine:3.20"));
+        let p = rt.paths(&inst);
+        let ip = Ipv4Addr::new(172, 30, 0, 2);
+        assert_eq!(
+            rt.assess_snapshot(&inst, &p, ip, Some("1.18.0")),
+            SnapshotAssessment::None
+        );
+        fake_snapshot(&rt, &inst);
+        assert!(matches!(
+            rt.assess_snapshot(&inst, &p, ip, Some("Firecracker v1.18.0")),
+            SnapshotAssessment::Restore(_)
+        ));
+        assert!(matches!(
+            rt.assess_snapshot(&inst, &p, ip, None),
+            SnapshotAssessment::Restore(_)
+        ));
+        assert!(matches!(
+            rt.assess_snapshot(&inst, &p, ip, Some("Firecracker v1.19.0")),
+            SnapshotAssessment::Unusable(_)
+        ));
+        assert!(matches!(
+            rt.assess_snapshot(&inst, &p, Ipv4Addr::new(172, 30, 0, 3), Some("1.18.0")),
+            SnapshotAssessment::Unusable(_)
+        ));
+        inst.shape = Shape {
+            cpu: 4,
+            memory: 8,
+            disk: 1,
+        };
+        let SnapshotAssessment::Unusable(why) = rt.assess_snapshot(&inst, &p, ip, Some("1.18.0"))
+        else {
+            panic!("a resized instance cannot load its old memory");
+        };
+        assert!(why.contains("4 vCPU / 8 GB"), "{why}");
+    }
+
+    /// Without a running VM and without root: sleep leaves an existing
+    /// snapshot alone, is_running is false, disk usage counts the snapshot,
+    /// a resize to another shape, a stop and a destroy discard it.
+    #[tokio::test]
+    async fn snapshot_lifecycle_without_a_vm() {
+        let tmp = TempDir::new("fc-snap-life");
+        let rt = FirecrackerRuntime::new(test_config(tmp.path()))
+            .await
+            .unwrap();
+        let mut inst = instance("ab12cd34ef", &template("alpine:3.20"));
+        let p = rt.paths(&inst);
+        let dir = fake_snapshot(&rt, &inst);
+        std::fs::write(p.snapshot_vmstate(), vec![1u8; 8192]).unwrap();
+        assert!(!rt.is_running(&inst).await.unwrap());
+        let usage = rt.disk_usage(&inst).await.unwrap();
+        assert!(usage >= 8192, "{usage}");
+        assert_eq!(rt.stats(&inst).await.unwrap().disk_bytes, usage);
+
+        rt.sleep(&inst, Duration::from_secs(1)).await.unwrap();
+        assert!(
+            snapshot::exists(&dir),
+            "sleeping an instance that is already asleep keeps its memory"
+        );
+        let same = inst.shape;
+        rt.resize(&mut inst, same).await.unwrap();
+        assert!(snapshot::exists(&dir), "the same shape keeps it");
+        rt.resize(
+            &mut inst,
+            Shape {
+                cpu: 4,
+                memory: 8,
+                disk: 1,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!snapshot::exists(&dir), "another shape discards it");
+
+        fake_snapshot(&rt, &inst);
+        rt.stop(&inst, Duration::from_secs(1)).await.unwrap();
+        assert!(!snapshot::exists(&dir), "stop discards the saved memory");
+        assert_eq!(rt.disk_usage(&inst).await.unwrap(), 0);
+
+        fake_snapshot(&rt, &inst);
+        rt.destroy(&inst, false).await.unwrap();
+        assert!(!snapshot::exists(&dir) && p.vm.is_dir());
+        fake_snapshot(&rt, &inst);
+        rt.destroy(&inst, true).await.unwrap();
+        assert!(!p.root.exists());
     }
 }
