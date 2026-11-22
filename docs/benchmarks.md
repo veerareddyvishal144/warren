@@ -39,10 +39,10 @@ Not yet measured. [vm-instances.md](vm-instances.md) describes a container start
 
 | Operation | `default` (gVisor) | `vm` (Firecracker) |
 |---|---|---|
-| Create to `running` (image already pulled) | not yet measured | not yet measured |
+| Create to `running` (image already pulled) | not yet measured | about 17 s on the Azure VM (rootfs built from the image, kernel boot, gateway up) |
 | Wake from sleep (fresh boot, disk intact) | not yet measured | not applicable: `vm` wakes from a snapshot (a cold boot only when the snapshot is unusable) |
-| Sleep with memory (pause, full snapshot: a memory file as large as the guest's RAM) | not applicable | not yet measured |
-| Wake from the snapshot (processes and pids kept) | not applicable | not yet measured |
+| Sleep with memory (pause, full snapshot: a memory file as large as the guest's RAM) | not applicable | 24 to 25 s for a 4 GB guest on the Azure VM (writing the 4 GB memory file dominates) |
+| Wake from the snapshot (processes and pids kept) | not applicable | 0.2 s to a reachable gateway (204 and 227 ms measured); the marker process kept its pid |
 | Fork | not yet measured | not yet measured |
 | Exec round trip (`true`) | not yet measured | not yet measured |
 | Host memory per idle instance | not yet measured | not yet measured |
