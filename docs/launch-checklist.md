@@ -6,20 +6,20 @@ What has to be true before Warren is announced, the announcement itself, and the
 
 ### Versions and tags
 
-- [ ] Decide the release version. The plan says **v0.2.0**; `Cargo.toml` says `0.1.0` and `CHANGELOG.md` has both an `[Unreleased]` section and a `[0.1.0] - Unreleased` section. Make `Cargo.toml`, `CHANGELOG.md`, the README's Status section and the docs agree before tagging.
-- [ ] Move the `[Unreleased]` changelog entries under the release heading with the date; add the compare links at the bottom.
-- [ ] Tag the release and push the tag.
+- [x] Decide the release version (v0.2.0, tagged 2026-11-22). The plan said **v0.2.0**; `Cargo.toml` says `0.1.0` and `CHANGELOG.md` has both an `[Unreleased]` section and a `[0.1.0] - Unreleased` section. Make `Cargo.toml`, `CHANGELOG.md`, the README's Status section and the docs agree before tagging.
+- [x] Move the `[Unreleased]` changelog entries under the release heading with the date; add the compare links at the bottom.
+- [x] Tag the release and push the tag.
 
 ### Release assets
 
-- [ ] Add a release workflow. The repository has only `ci.yml` today (fmt, clippy, unit tests, images, end to end on Linux; a `macos-14` job that type-checks). The release workflow should build and attach, with SHA-256 checksums:
+- [x] Add a release workflow. The repository has only `ci.yml` today (fmt, clippy, unit tests, images, end to end on Linux; a `macos-14` job that type-checks). The release workflow should build and attach, with SHA-256 checksums:
   - `warren`, `warrend`, `warren-gateway` (static musl) and `warren-mcp` for `x86_64-unknown-linux-gnu`;
   - `warren`, `warrend`, `warren-gateway` and `warren-mcp` for `aarch64-apple-darwin`;
   - the template images pushed to a registry, or the instructions to build them.
-- [ ] Create the Homebrew tap repository (`homebrew-warren`) with a formula that points at the release assets, and check `brew install <owner>/warren/warren` on a Mac that has never had Warren.
+- [x] Create the Homebrew tap repository (`homebrew-warren`) with a formula that points at the release assets, and check `brew install <owner>/warren/warren` on a Mac that has never had Warren.
 - [ ] Check every asset on a **clean Mac** (Apple silicon, fresh user account): install per [install.md](install.md), install Lume, build the base image with `scripts/mac/build-base.sh`, `warren up`, `warren connect claude`, `warren run -- claude`; then `scripts/mac/e2e.sh --skip-build` against the installed binaries, green.
 - [ ] Check every asset on a **clean Linux VM** (Debian 12 and Ubuntu 24.04): install per [install.md](install.md), `scripts/install-gvisor.sh`, `warren up`, create an instance, exec, open the terminal, sleep and wake; then `scripts/e2e.sh`, green.
-- [ ] Decide what to say about `vm` (Firecracker): run `scripts/e2e.sh --vm` on a KVM host, or state plainly in the release notes that it is experimental and tested on one machine.
+- [x] Decide what to say about `vm` (Firecracker): run `scripts/e2e.sh --vm` on a KVM host, or state plainly in the release notes that it is experimental and tested on one machine.
 - [ ] Re-run the macOS numbers in [benchmarks.md](benchmarks.md) with the release build and update the table if they moved.
 
 ### Documentation
@@ -28,7 +28,7 @@ What has to be true before Warren is announced, the announcement itself, and the
 - [ ] Every link in [index.md](index.md) resolves, including the pages written for this release: [install.md](install.md), [quickstart.md](quickstart.md), [run.md](run.md), [templates.md](templates.md), [compare.md](compare.md), [limits.md](limits.md), [security-model.md](security-model.md), [benchmarks.md](benchmarks.md).
 - [ ] `warren up`, `warren connect` and `warren run` in the README and in [run.md](run.md) match the shipped binary's `--help` output exactly.
 - [ ] The egress allowlist and secret broker have landed with their flags and fields in [API.md](API.md) and [security.md](security.md), and the five checks in [security-model.md](security-model.md) pass on the clean Mac and the clean Linux VM. If they do not, the README's Status section and [compare.md](compare.md) must say so.
-- [ ] [SECURITY.md](../SECURITY.md): enable GitHub private vulnerability reporting and replace the email placeholder; remove the two OWNER TODO comments.
+- [x] [SECURITY.md](../SECURITY.md): enable GitHub private vulnerability reporting and replace the email placeholder; remove the two OWNER TODO comments.
 - [ ] Issue templates (bug, feature, macOS host report with Lume version and `sw_vers`), labels including `good first issue`, Discussions enabled.
 
 ### Demo
