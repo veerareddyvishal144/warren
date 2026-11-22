@@ -14,12 +14,7 @@ Warren is pre-1.0 (0.1.0 is not yet tagged at the time of writing). Until 1.0, e
 
 ## How to report
 
-Use one of these two channels. Do not open a public issue, pull request or discussion for a vulnerability, and do not post about it before a fix is available.
-
-1. **GitHub private vulnerability reporting** (preferred): [github.com/veerareddyvishal144/warren/security/advisories/new](https://github.com/veerareddyvishal144/warren/security/advisories/new).
-   <!-- OWNER TODO before release: enable "Private vulnerability reporting" under Settings > Code security in the repository, or this link answers 404. -->
-2. **Email**: `security@REPLACE-ME.example`
-   <!-- OWNER TODO before release: replace the placeholder above with a real, monitored address and remove this comment. A PGP key, if you publish one, goes here too. -->
+Report through **GitHub private vulnerability reporting**: [github.com/veerareddyvishal144/warren/security/advisories/new](https://github.com/veerareddyvishal144/warren/security/advisories/new). It opens a private thread with the maintainer; nothing is visible to others until an advisory is published. Do not open a public issue, pull request or discussion for a vulnerability, and do not post about it before a fix is available.
 
 Include what you can of: the version or commit you tested, the host (OS, Docker and gVisor versions, Firecracker or Lume version), the instance type, steps to reproduce, the impact you believe it has, and whether you have seen it exploited. A minimal proof of concept is more useful than a long description.
 
