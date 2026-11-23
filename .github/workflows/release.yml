@@ -170,7 +170,7 @@ jobs:
           retention-days: 7
       - name: Publish the GitHub Release
         if: needs.version.outputs.publish == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           name: Warren ${{ needs.version.outputs.version }}
