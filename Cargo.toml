@@ -73,7 +73,7 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 # .gitignore-aware directory walks for `warren sync`.
 ignore = "0.4"
 # VNC authentication (DES on the challenge) and PNG screenshots of mac instances.
-des = "0.8"
+des = "0.9"
 png = "0.18"
 
 [profile.release]
