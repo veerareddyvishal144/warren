@@ -11,7 +11,7 @@
 # platform, each followed by its `sha256 "..."` line. For every url line the
 # script substitutes the new version into the URL and replaces the following
 # sha256 with the digest SHA256SUMS records for that tarball; the `version
-# "..."` line is updated too. A platform missing from SHA256SUMS is an error
+# "..."` line is updated too when the formula has one. A platform missing from SHA256SUMS is an error
 # unless --allow-missing is given (its sha256 is then left as it was).
 #
 # Typical flow after the release workflow has run:

@@ -15,7 +15,7 @@ Prebuilt binaries exist for three platforms. Every release ships one tarball per
 |---|---|
 | `warren-<version>-darwin-arm64.tar.gz` | macOS on Apple silicon (macOS 14 or newer). No Intel build: the `mac` instance type needs Apple silicon, so Intel Macs [build from source](#from-source). |
 | `warren-<version>-linux-x86_64.tar.gz` | Linux x86_64 with glibc 2.35 or newer: Ubuntu 22.04, Debian 12, Fedora 36 and newer. `warren-gateway` in it is a fully static musl binary. |
-| `warren-<version>-linux-arm64.tar.gz` | Linux arm64 (aarch64), same glibc floor. |
+| `warren-<version>-linux-arm64.tar.gz` | Linux arm64 (aarch64), same glibc floor. The 0.2.0 tarball is cross-built on the x86_64 builder (gateway with a musl cross toolchain) and was only smoke-tested under emulation, not on arm64 hardware; please report what you find. |
 
 Alpine and other musl-based distributions are not covered by the tarballs (only the gateway is static); use the [Docker image](#docker-image) or build from source there.
 

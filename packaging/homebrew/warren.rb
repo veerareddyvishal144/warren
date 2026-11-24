@@ -6,21 +6,27 @@
 #
 # The formula installs the prebuilt release tarballs, so there is no Rust
 # toolchain involved. The url and sha256 lines are rewritten for each release by
-# scripts/release/update-formula.sh from the release's SHA256SUMS; the values
-# below are placeholders until the first release is cut. How the tap is created
-# and updated is in docs/install.md.
+# scripts/release/update-formula.sh from the release's SHA256SUMS. How the tap
+# is created and updated is in docs/install.md. Homebrew 5 and newer ask users
+# to trust a third-party tap once: `brew trust veerareddyvishal144/warren`.
 class Warren < Formula
-  desc "Self-hosted agent sandboxes: persistent Linux and macOS computers behind one API"
+  desc "Self-hosted sandboxes for coding agents: Linux and macOS VMs, one API"
   homepage "https://github.com/veerareddyvishal144/warren"
-  version "0.2.0"
   license "Apache-2.0"
+
+  livecheck do
+    url :stable
+    strategy :github_latest
+  end
 
   on_macos do
     # Apple silicon only: the macOS build hosts `mac` instances through
     # Virtualization.framework, and no Intel binaries are published.
     depends_on arch: :arm64
-    url "https://github.com/veerareddyvishal144/warren/releases/download/v0.2.0/warren-0.2.0-darwin-arm64.tar.gz"
-    sha256 "3c9cbe2432f4c8db3ec009b6eff261dcaef409d741bc23ecbdf8b232153b0f40"
+    on_arm do
+      url "https://github.com/veerareddyvishal144/warren/releases/download/v0.2.0/warren-0.2.0-darwin-arm64.tar.gz"
+      sha256 "3c9cbe2432f4c8db3ec009b6eff261dcaef409d741bc23ecbdf8b232153b0f40"
+    end
   end
 
   on_linux do
@@ -30,7 +36,7 @@ class Warren < Formula
     end
     on_arm do
       url "https://github.com/veerareddyvishal144/warren/releases/download/v0.2.0/warren-0.2.0-linux-arm64.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "94467d4ef8d465f16cec1c2c35a1bd7b3ce15082ebba9541f6307ceb02b3f206"
     end
   end
 
@@ -58,12 +64,14 @@ class Warren < Formula
   def caveats
     <<~EOS
       Next steps:
-        warren up                 start the daemon on this machine
-        warren mac init           (macOS) prepare this Mac for macOS instances
-        warren connect claude     add the Warren MCP server to Claude Code
+        warren up                       start the daemon on this machine and create your key
+        warren mac init --with-agents   (macOS) build the base macOS VM, once; needs Lume
+        warren connect claude           add the Warren MCP server to Claude Code
+        warren run -- claude            Claude Code inside a fresh instance bound to this directory
+        warren doctor                   check the host and print a fix for anything missing
 
       Or run the daemon as a service: brew services start warren
-      Documentation: https://github.com/veerareddyvishal144/warren/blob/main/docs/install.md
+      Documentation: https://github.com/veerareddyvishal144/warren/blob/main/docs/quickstart.md
     EOS
   end
 
