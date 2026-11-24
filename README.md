@@ -1,5 +1,7 @@
 # Warren
 
+<p align="center"><img src="docs/assets/warren-demo.gif" alt="Warren demo: a macOS instance created from the terminal, its screen captured and clicked by the agent" width="960"></p>
+
 **Sandboxes for coding agents, on hardware you own.** One daemon gives Claude Code, Codex, Cursor, Caret or any MCP client persistent computers to work in: Linux containers (gVisor), Linux microVMs (Firecracker) and real macOS virtual machines (Apple silicon), all behind one API, one CLI and one MCP server. Each instance has a shell, a home that survives sleep and restarts, a files API, a URL for every port and, on macOS, a screen the agent can look at and click. Apache-2.0, no account, nothing leaves your machine.
 
 ## 1. Install
